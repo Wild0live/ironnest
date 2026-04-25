@@ -133,7 +133,7 @@ services:
     command:
       - sh
       - -c
-      - 'exec ttyd --port=7681 --writable --credential "$${TTYD_USERNAME}:$${TTYD_PASSWORD}" bash'
+      - 'if [ -n "$${TTYD_USERNAME:-}" ] && [ -n "$${TTYD_PASSWORD:-}" ]; then exec ttyd --port=7681 --writable --credential "$${TTYD_USERNAME}:$${TTYD_PASSWORD}" bash; else exec ttyd --port=7681 --writable bash; fi'
     env_file:
       - path: ./.env
       - path: ./secrets-runtime/.env
