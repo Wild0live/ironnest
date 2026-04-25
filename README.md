@@ -10,6 +10,25 @@ Socket Isolation → Observability → DNS Filtering → Egress Control → SIEM
 
 ---
 
+## Platform in action
+
+**Dozzle — real-time logs across all 14 containers**
+![Dozzle showing openclaw-gateway live logs](assets/dozzle-logs.png)
+
+**OpenClaw browser terminal — run CLI commands from your browser**
+![ttyd browser terminal at 127.0.0.1:7681](assets/ttyd-terminal.png)
+
+**AdGuard Home — DNS filtering dashboard**
+![AdGuard DNS filter dashboard showing container queries](assets/adguard-dashboard.png)
+
+**Infisical — self-hosted secrets vault**
+![Infisical secrets overview showing API keys in Development environment](assets/infisical-secrets.png)
+
+**Wazuh — SIEM dashboard monitoring host and containers**
+![Wazuh security dashboard showing 0 critical alerts](assets/wazuh-dashboard.png)
+
+---
+
 ## What is OpenClaw and why does it need a security platform?
 
 [OpenClaw](https://github.com/openclaw/openclaw) is a self-hosted AI gateway that lets you run conversations with Anthropic Claude, OpenAI GPT, and other AI providers through a single local interface. Think of it as a private, self-contained AI assistant that you fully control.
