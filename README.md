@@ -1,12 +1,50 @@
 # IronNest
 
-A security-hardened, modular 14-container platform running on **Rancher Desktop (WSL2 / Windows 11)**. Each capability lives in its own Docker Compose project — restart or reset one stack without touching the rest.
+**IronNest** is a production-grade, security-first AI workload platform built for Windows 11 developers who want enterprise-level container security without enterprise infrastructure. It runs entirely on your local machine using Rancher Desktop (WSL2) and wraps an AI gateway in seven layers of automated defense — from DNS filtering and egress control to secrets management, SIEM alerting, and vulnerability scanning.
+
+Every capability is an independent Docker Compose project. One stack crashing or being reset cannot cascade to the others. OpenClaw (the AI workload) has zero access to the Docker socket, zero internet bypass, and zero knowledge of the surrounding security stack — it just sees a proxy and a secrets file.
 
 ```
 Socket Isolation → Observability → DNS Filtering → Egress Control → SIEM → Image Scanning → Secrets → AI Core
 ```
 
+**Who this is for:** Developers and security-conscious teams who want to self-host an AI gateway locally, with Infisical managing secrets, Wazuh watching the host, Squid enforcing an egress allowlist, and everything auditable from a single Dozzle log view.
+
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, network diagram, and security rationale.
+
+---
+
+## System Requirements
+
+IronNest runs 14 containers simultaneously. Wazuh's OpenSearch indexer is the most memory-intensive component — size your machine accordingly.
+
+| Component | Minimum | Recommended |
+|---|---|---|
+| **OS** | Windows 11 (22H2+) | Windows 11 (latest) |
+| **RAM** | 16 GB | 32 GB |
+| **CPU** | 4 cores / 8 threads | 8+ cores |
+| **System drive (C:)** | 60 GB free | 100 GB free |
+| **Docker storage** | 40 GB free (separate drive recommended) | 100 GB free |
+| **Backup target** | 50 GB free | 100 GB free |
+| **Virtualization** | Hyper-V or VT-x/AMD-V enabled in BIOS | — |
+
+**Container memory budget (configured limits):**
+
+| Stack | Containers | Memory limit |
+|---|---|---|
+| Wazuh (manager + indexer + dashboard) | 3 | 5 GB |
+| OpenClaw gateway + ttyd | 2 | 4.1 GB |
+| Infisical + Postgres + Redis | 3 | 1.8 GB |
+| Trivy, Squid, AdGuard, Dozzle, socket-proxy | 5 | 1.2 GB |
+| **Total** | **14** | **~12.1 GB** |
+
+> Windows + WSL2 overhead adds ~2–4 GB on top. On a 16 GB machine, leave Wazuh indexer's memory limit lower (`OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx1g`) if you hit pressure.
+
+**Storage breakdown:**
+- Docker images: ~8 GB on first pull (Wazuh images are large)
+- Wazuh indexer data: grows with log volume — plan for 10–20 GB over time
+- Trivy CVE DB: ~1 GB (regenerable, not backed up)
+- Backups: ~500 MB per daily snapshot × 14-day retention ≈ 7 GB minimum
 
 ---
 
