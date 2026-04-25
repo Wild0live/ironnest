@@ -1,0 +1,2 @@
+FROM infisical/cli@sha256:dba406b35e5819632412c561bfa46e6185e04c6d76175dc82bf97c4ff53745d7
+RUN apk update && apk upgrade --no-cache

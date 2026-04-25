@@ -1,0 +1,51 @@
+# Dozzle — real-time container logs UI.
+# Talks to the read-only socket-proxy at tcp://socket-proxy:2375 — never touches
+# /var/run/docker.sock directly. No ability to start/stop/exec anything.
+
+name: dozzle
+
+networks:
+  platform-net:
+    external: true          # reach socket-proxy
+  ingress:
+    driver: bridge          # local bridge so host can publish 8888
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  dozzle:
+    image: amir20/dozzle:v10.4.1
+    container_name: dozzle
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      DOZZLE_NO_ANALYTICS: "true"
+      # Talk to the socket proxy instead of the raw socket.
+      DOCKER_HOST: "tcp://socket-proxy:2375"
+      # Read-only mode — UI hides any action that would require write access.
+      DOZZLE_MODE: "server"
+    ports:
+      - "127.0.0.1:8888:8080"
+    networks:
+      - platform-net
+      - ingress
+    dns:
+      - 172.30.0.10
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "/dozzle", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

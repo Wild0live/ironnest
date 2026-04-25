@@ -1,0 +1,190 @@
+# Wazuh single-node — manager + indexer + dashboard.
+# Adapted from the official wazuh-docker 4.14.4 single-node for this platform.
+#
+# Exposed ports on 127.0.0.1:
+#   1514  — agent → manager comms (for the Windows agent on this host)
+#   1515  — agent enrollment
+#   8443  — dashboard UI
+#
+# Run `./init-certs.sh` once before `docker compose up -d`.
+
+name: wazuh
+
+networks:
+  platform-net:
+    external: true              # reach socket-proxy for the Docker listener
+  platform-egress:
+    external: true              # raw TCP threat feeds / package updates
+  wazuh-internal:
+    driver: bridge
+    internal: true              # indexer/manager/dashboard private mesh
+  ingress:
+    driver: bridge              # for port publishing (dashboard + manager agent ports)
+
+volumes:
+  wazuh_api_configuration:
+  wazuh_etc:
+  wazuh_logs:
+  wazuh_queue:
+  wazuh_var_multigroups:
+  wazuh_integrations:
+  wazuh_active_response:
+  wazuh_agentless:
+  wazuh_wodles:
+  filebeat_etc:
+  filebeat_var:
+  wazuh-indexer-data:
+  wazuh-dashboard-config:
+  wazuh-dashboard-custom:
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ── Wazuh manager ────────────────────────────────────────────────────────────
+  wazuh.manager:
+    image: wazuh/wazuh-manager:4.14.4
+    container_name: wazuh.manager
+    hostname: wazuh.manager
+    restart: unless-stopped
+    logging: *default-logging
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile:  { soft: 655360, hard: 655360 }
+    ports:
+      - "127.0.0.1:1514:1514"    # host agent ↔ manager
+      - "127.0.0.1:1515:1515"    # host agent enrollment
+    environment:
+      INDEXER_URL: "https://wazuh.indexer:9200"
+      INDEXER_USERNAME: "admin"
+      INDEXER_PASSWORD: "${WAZUH_INDEXER_PASSWORD:-SecretPassword}"
+      FILEBEAT_SSL_VERIFICATION_MODE: "full"
+      SSL_CERTIFICATE_AUTHORITIES: "/etc/ssl/root-ca.pem"
+      SSL_CERTIFICATE: "/etc/ssl/filebeat.pem"
+      SSL_KEY: "/etc/ssl/filebeat.key"
+      API_USERNAME: "wazuh-wui"
+      API_PASSWORD: "${WAZUH_API_PASSWORD:-MyS3cr37P450r.*-}"
+      DOCKER_HOST: "tcp://socket-proxy:2375"
+    volumes:
+      - wazuh_api_configuration:/var/ossec/api/configuration
+      - wazuh_etc:/var/ossec/etc
+      - wazuh_logs:/var/ossec/logs
+      - wazuh_queue:/var/ossec/queue
+      - wazuh_var_multigroups:/var/ossec/var/multigroups
+      - wazuh_integrations:/var/ossec/integrations
+      - wazuh_active_response:/var/ossec/active-response/bin
+      - wazuh_agentless:/var/ossec/agentless
+      - wazuh_wodles:/var/ossec/wodles
+      - filebeat_etc:/etc/filebeat
+      - filebeat_var:/var/lib/filebeat
+      - ./config/wazuh_indexer_ssl_certs/root-ca-manager.pem:/etc/ssl/root-ca.pem:ro
+      - ./config/wazuh_indexer_ssl_certs/wazuh.manager.pem:/etc/ssl/filebeat.pem:ro
+      - ./config/wazuh_indexer_ssl_certs/wazuh.manager-key.pem:/etc/ssl/filebeat.key:ro
+      - ./config/wazuh_cluster/wazuh_manager.conf:/wazuh-config-mount/etc/ossec.conf:ro
+      - ./config/wodles/DockerListener.py:/var/ossec/wodles/docker/DockerListener.py:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk -o /dev/null -w '%{http_code}' https://localhost:55000/ | grep -qE '(200|401)'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    networks:
+      - wazuh-internal           # → indexer
+      - platform-net             # → socket-proxy (Docker listener)
+      - platform-egress          # → threat-intel feeds over raw TCP
+      - ingress                  # host can publish 1514/1515
+    dns:
+      - 172.30.0.10              # AdGuard
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  # ── Wazuh indexer (OpenSearch) ───────────────────────────────────────────────
+  wazuh.indexer:
+    image: wazuh/wazuh-indexer:4.14.4
+    container_name: wazuh.indexer
+    hostname: wazuh.indexer
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      OPENSEARCH_JAVA_OPTS: "-Xms1g -Xmx1g"
+      WAZUH_INDEXER_PASSWORD: "${WAZUH_INDEXER_PASSWORD:-SecretPassword}"
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile:  { soft: 65536, hard: 65536 }
+    volumes:
+      - wazuh-indexer-data:/var/lib/wazuh-indexer
+      - ./config/wazuh_indexer_ssl_certs/root-ca.pem:/usr/share/wazuh-indexer/config/certs/root-ca.pem:ro
+      - ./config/wazuh_indexer_ssl_certs/wazuh.indexer-key.pem:/usr/share/wazuh-indexer/config/certs/wazuh.indexer.key:ro
+      - ./config/wazuh_indexer_ssl_certs/wazuh.indexer.pem:/usr/share/wazuh-indexer/config/certs/wazuh.indexer.pem:ro
+      - ./config/wazuh_indexer_ssl_certs/admin.pem:/usr/share/wazuh-indexer/config/certs/admin.pem:ro
+      - ./config/wazuh_indexer_ssl_certs/admin-key.pem:/usr/share/wazuh-indexer/config/certs/admin-key.pem:ro
+      - ./config/wazuh_indexer/wazuh.indexer.yml:/usr/share/wazuh-indexer/config/opensearch.yml:ro
+      - ./config/wazuh_indexer/internal_users.yml:/usr/share/wazuh-indexer/config/opensearch-security/internal_users.yml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk -u \"admin:${WAZUH_INDEXER_PASSWORD}\" -o /dev/null -w '%{http_code}' https://localhost:9200/ | grep -q 200"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    networks:
+      - wazuh-internal           # indexer is not host-reachable
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  # ── Wazuh dashboard ──────────────────────────────────────────────────────────
+  wazuh.dashboard:
+    image: wazuh/wazuh-dashboard:4.14.4
+    container_name: wazuh.dashboard
+    hostname: wazuh.dashboard
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "127.0.0.1:8443:5601"    # dashboard UI — localhost only
+    environment:
+      INDEXER_USERNAME: "admin"
+      INDEXER_PASSWORD: "${WAZUH_INDEXER_PASSWORD:-SecretPassword}"
+      WAZUH_API_URL: "https://wazuh.manager"
+      DASHBOARD_USERNAME: "kibanaserver"
+      DASHBOARD_PASSWORD: "${WAZUH_DASHBOARD_PASSWORD:-kibanaserver}"
+      API_USERNAME: "wazuh-wui"
+      API_PASSWORD: "${WAZUH_API_PASSWORD:-MyS3cr37P450r.*-}"
+      # Node.js doesn't pick up the CA from opensearch.ssl.certificateAuthorities
+      # when the CA has no CN field; NODE_EXTRA_CA_CERTS injects it at the runtime level.
+      NODE_EXTRA_CA_CERTS: "/usr/share/wazuh-dashboard/certs/root-ca.pem"
+    volumes:
+      - ./config/wazuh_indexer_ssl_certs/wazuh.dashboard.pem:/usr/share/wazuh-dashboard/certs/wazuh-dashboard.pem:ro
+      - ./config/wazuh_indexer_ssl_certs/wazuh.dashboard-key.pem:/usr/share/wazuh-dashboard/certs/wazuh-dashboard-key.pem:ro
+      - ./config/wazuh_indexer_ssl_certs/root-ca.pem:/usr/share/wazuh-dashboard/certs/root-ca.pem:ro
+      - ./config/wazuh_dashboard/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml:ro
+      - ./config/wazuh_dashboard/wazuh.yml:/usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml:ro
+      - wazuh-dashboard-config:/usr/share/wazuh-dashboard/data/wazuh/config
+      - wazuh-dashboard-custom:/usr/share/wazuh-dashboard/plugins/wazuh/public/assets/custom
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk -o /dev/null -w '%{http_code}' https://localhost:5601/api/status | grep -qE '(200|401)'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    networks:
+      - wazuh-internal
+      - ingress                  # port publishing
+    depends_on:
+      wazuh.indexer:
+        condition: service_healthy
+      wazuh.manager:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G

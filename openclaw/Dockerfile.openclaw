@@ -1,0 +1,14 @@
+FROM ghcr.io/openclaw/openclaw:2026.4.22-1-amd64
+# Install the OpenAI Codex CLI — required by OpenClaw's codex provider harness.
+# OpenClaw spawns `codex` as a subprocess; without it every codex/* model request
+# fails with "spawn codex ENOENT".
+USER root
+RUN npm install -g @openai/codex --no-audit --no-fund \
+ && codex --version
+
+# ttyd — static binary for browser-based terminal (used by openclaw-ttyd service)
+RUN curl -fsSL https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 \
+      -o /usr/local/bin/ttyd \
+ && chmod +x /usr/local/bin/ttyd \
+ && ttyd --version
+USER node

@@ -1,0 +1,86 @@
+# Trivy — image/filesystem/config scanner.
+#
+# Two profiles:
+#   (default)  → trivy-server: always-on, keeps CVE DB fresh, serves clients.
+#   scanner    → trivy-scan:   one-shot, invoked via `docker compose run --rm scanner <args>`.
+#
+# The scanner talks to the read-only socket-proxy to list/inspect images — it
+# never has direct /var/run/docker.sock access. Scan reports land on host at
+# G:\rancher-stack-backups\trivy\ via bind mount.
+
+name: trivy
+
+networks:
+  platform-net:
+    external: true              # reach socket-proxy + DNS (adguard); CVE DB via HTTP_PROXY→squid
+
+volumes:
+  trivy-cache:                   # CVE DB cache, shared between server and scan runs
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ── Trivy server — keeps CVE DB updated, responds to scan clients ────────────
+  trivy-server:
+    image: aquasec/trivy:0.70.0
+    container_name: trivy-server
+    restart: unless-stopped
+    logging: *default-logging
+    command: ["server", "--listen", "0.0.0.0:4954", "--cache-dir", "/cache"]
+    environment:
+      TRIVY_NO_PROGRESS: "true"
+      # CVE DB hosts (ghcr.io, aquasec) must be allowlisted in Squid — we use
+      # HTTPS_PROXY to force traffic through Squid for hostname enforcement.
+      HTTP_PROXY: "http://squid:3128"
+      HTTPS_PROXY: "http://squid:3128"
+      NO_PROXY: "socket-proxy,localhost,127.0.0.1,.local"
+    volumes:
+      - trivy-cache:/cache
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4954/healthz | grep -q 'ok'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - platform-net
+    dns:
+      - 172.30.0.10
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  # ── Trivy scanner — one-shot, invoked via `docker compose run --rm scanner` ──
+  # Usage examples:
+  #   docker compose run --rm scanner image <image-ref>
+  #   docker compose run --rm scanner image --format json -o /reports/nginx.json nginx:latest
+  # Reports written to G:\rancher-stack-backups\trivy\ via bind mount.
+  scanner:
+    image: aquasec/trivy:0.70.0
+    profiles: ["scanner"]         # never starts with `up` — only `run --rm scanner`
+    environment:
+      TRIVY_SERVER: "http://trivy-server:4954"
+      TRIVY_CACHE_DIR: "/cache"
+      TRIVY_NO_PROGRESS: "true"
+      DOCKER_HOST: "tcp://socket-proxy:2375"
+      HTTP_PROXY: "http://squid:3128"
+      HTTPS_PROXY: "http://squid:3128"
+      NO_PROXY: "socket-proxy,trivy-server,localhost,127.0.0.1,.local"
+    volumes:
+      - trivy-cache:/cache
+      - G:/rancher-stack-backups/trivy:/reports
+    networks:
+      - platform-net
+    dns:
+      - 172.30.0.10

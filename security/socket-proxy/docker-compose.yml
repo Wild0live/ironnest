@@ -1,0 +1,75 @@
+# Read-only Docker socket proxy.
+# Consumers: Dozzle (containers+events+logs), Wazuh (events+containers), Trivy (images+containers).
+# Nothing else on the platform should ever touch /var/run/docker.sock directly.
+
+name: socket-proxy
+
+networks:
+  platform-net:
+    external: true
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  socket-proxy:
+    build: { context: ., dockerfile: Dockerfile.socket-proxy }
+    image: platform/socket-proxy:0.4.2-patched
+    container_name: socket-proxy
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      # Read-only endpoints only. Write endpoints (POST/DELETE) remain disabled (0).
+      CONTAINERS: "1"
+      EVENTS: "1"
+      IMAGES: "1"
+      INFO: "1"
+      NETWORKS: "1"
+      PING: "1"
+      VERSION: "1"
+      VOLUMES: "1"
+      # Everything that could mutate state stays 0.
+      EXEC: "0"
+      POST: "0"
+      BUILD: "0"
+      COMMIT: "0"
+      CONFIGS: "0"
+      NODES: "0"
+      PLUGINS: "0"
+      SERVICES: "0"
+      SESSION: "0"
+      SWARM: "0"
+      SYSTEM: "0"
+      TASKS: "0"
+      SECRETS: "0"
+      DISABLE_IPV6: "1"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - platform-net
+    read_only: true
+    tmpfs:
+      - /run
+      - /tmp
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://$(hostname -i | awk '{print $1}'):2375/_ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

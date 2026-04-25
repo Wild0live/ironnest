@@ -1,0 +1,22 @@
+# Never commit secrets — .env files are per-stack and contain DB passwords,
+# encryption keys, API keys, SMTP passwords, Infisical Universal Auth creds, etc.
+**/.env
+!**/.env.example
+
+# Infisical agent runtime secrets (written at container startup, never committed)
+**/secrets-runtime/.env
+**/secrets-runtime/agent-token
+
+# Wazuh TLS certs (generated on first run via generate-indexer-certs.yml)
+**/wazuh_indexer_ssl_certs/
+**/wazuh_indexer_ssl_certs.bak*/
+
+# Backup files
+**/.env.bak*
+**/*.bak.*
+
+# Local working dirs
+.vscode/
+.idea/
+*.swp
+*.bak

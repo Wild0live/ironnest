@@ -1,0 +1,46 @@
+# AdGuard Home — DNS filter for every internet-capable container on the platform.
+# Joins platform-net at a static IP so other services can set `dns: [172.30.0.10]`.
+# Joins platform-egress so it can reach DoH upstreams (Quad9, Cloudflare, Google).
+
+name: adguard
+
+networks:
+  platform-net:
+    external: true
+  platform-egress:
+    external: true
+
+volumes:
+  adguard-work:
+    name: rancher-stack_adguard-work      # reattach existing volume (regenerable state)
+    external: true
+  adguard-conf:
+    name: rancher-stack_adguard-conf      # reattach existing volume (admin creds, filter lists)
+    external: true
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  adguard:
+    image: adguard/adguardhome:v0.107.74
+    container_name: adguard
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "127.0.0.1:3000:80"        # admin UI — localhost only
+    volumes:
+      - adguard-work:/opt/adguardhome/work
+      - adguard-conf:/opt/adguardhome/conf
+    networks:
+      platform-net:
+        ipv4_address: 172.30.0.10  # STABLE — every other service uses this as `dns:`
+      platform-egress: {}           # outbound for DoH upstreams
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M

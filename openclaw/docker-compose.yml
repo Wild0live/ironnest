@@ -1,0 +1,170 @@
+# OpenClaw — application workload only.
+# NO docker socket. NO lifecycle control over other stacks. NO privileged caps.
+# Reaches Infisical over platform-net (service name). All outbound HTTP(S)
+# routes through Squid (HTTPS allowlist) + AdGuard (DNS filter).
+# Named volume, never a host bind-mount.
+#
+# Secrets flow:
+#   infisical-agent authenticates to Infisical (Universal Auth), renders
+#   secrets.tmpl → secrets-runtime/.env, then signals healthy.
+#   openclaw-gateway waits (depends_on: service_healthy) and loads the file
+#   via env_file. The actual API keys never touch the static .env file.
+
+name: openclaw
+
+networks:
+  platform-net:
+    external: true              # reach infisical, dns-to-adguard, egress-to-squid
+  platform-egress:
+    external: true              # infisical-agent uses this to reach Infisical (platform-net internal:true drops SYNs)
+  # Stack-local bridge needed ONLY so Docker can publish 127.0.0.1:18789 to host.
+  # Port publishing does not work on internal networks. OpenClaw still has no
+  # internet access in practice — DNS is forced to AdGuard (dns:) and HTTP/HTTPS
+  # is forced through Squid (HTTP_PROXY). This bridge only carries inbound UI traffic.
+  ingress:
+    driver: bridge
+
+volumes:
+  openclaw-home:
+    name: rancher-stack_openclaw-home
+    external: true
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ── Infisical Agent sidecar ──────────────────────────────────────────────────
+  # Authenticates to Infisical using Universal Auth (client-id/secret from .env),
+  # renders agent-config/secrets.tmpl → secrets-runtime/.env, then polls every
+  # 60 s for rotations. openclaw-gateway waits until this is healthy before starting.
+  infisical-agent:
+    build: { context: ., dockerfile: Dockerfile.infisical-cli }
+    image: platform/infisical-cli:0.43.76-patched
+    container_name: openclaw-infisical-agent
+    restart: unless-stopped
+    entrypoint: ["sh", "/agent-config/entrypoint.sh"]
+    env_file: ./.env
+    logging: *default-logging
+    volumes:
+      - ./agent-config:/agent-config:ro
+      - ./secrets-runtime:/secrets
+    tmpfs:
+      - /tmp:size=1m,mode=0700
+    networks:
+      - platform-egress          # Infisical is on platform-egress; platform-net internal:true drops SYNs
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /secrets/.env"]
+      interval: 5s
+      timeout: 3s
+      retries: 24      # up to 2 min for Infisical to respond on first boot
+      start_period: 10s
+
+  # ── OpenClaw Gateway ─────────────────────────────────────────────────────────
+  openclaw-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.openclaw
+    image: platform/openclaw:2026.4.22-1-codex
+    container_name: openclaw-gateway
+    restart: unless-stopped
+    env_file:
+      - path: ./.env                    # non-secret config: gateway token, TZ, etc.
+      - path: ./secrets-runtime/.env    # API keys injected by infisical-agent
+        required: false                 # missing before first agent write is fine
+    logging: *default-logging
+    environment:
+      # All HTTP/HTTPS egress forced through Squid, which only allows AI APIs.
+      HTTP_PROXY: "http://squid:3128"
+      HTTPS_PROXY: "http://squid:3128"
+      NO_PROXY: "infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+      # Lowercase variants — many clients look for these instead.
+      http_proxy: "http://squid:3128"
+      https_proxy: "http://squid:3128"
+      no_proxy: "infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+    ports:
+      - "127.0.0.1:18789:18789"   # UI — localhost only
+    volumes:
+      - openclaw-home:/home/node/.openclaw
+    networks:
+      - platform-net              # DNS+proxy+infisical path (internal)
+      - ingress                   # inbound-only bridge so host can reach 18789
+    dns:
+      - 172.30.0.10               # AdGuard
+    depends_on:
+      infisical-agent:
+        condition: service_healthy
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 4G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:18789/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Browser terminal (ttyd) ──────────────────────────────────────────────────
+  # Same image as openclaw-gateway → has the `openclaw` CLI binary.
+  # Same home volume → CLI sees the live gateway state/config.
+  # Accessible at http://127.0.0.1:7681 — localhost only, no auth needed.
+  openclaw-ttyd:
+    image: platform/openclaw:2026.4.22-1-codex
+    container_name: openclaw-ttyd
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - 'exec ttyd --port=7681 --writable --credential "$${TTYD_USERNAME}:$${TTYD_PASSWORD}" bash'
+    env_file:
+      - path: ./.env
+      - path: ./secrets-runtime/.env
+        required: false
+    logging: *default-logging
+    volumes:
+      - openclaw-home:/home/node/.openclaw
+    ports:
+      - "127.0.0.1:7681:7681"
+    networks:
+      - platform-net              # in case CLI talks to gateway over the network
+      - ingress                   # host port publishing
+    dns:
+      - 172.30.0.10               # AdGuard
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "curl", "-so", "/dev/null", "http://localhost:7681"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      infisical-agent:
+        condition: service_healthy
+      openclaw-gateway:
+        condition: service_healthy

@@ -1,0 +1,60 @@
+# Squid HTTP/HTTPS forward proxy with hostname allowlists.
+# Only HTTP-speaking services should point at this (OpenClaw, Trivy, Wazuh HTTP updaters).
+# Raw-TCP outbound (SMTP, some feeds) goes via platform-egress directly.
+
+name: egress-proxy
+
+networks:
+  platform-net:
+    external: true           # clients reach proxy at squid:3128 via this
+  platform-egress:
+    external: true           # squid's OWN outbound path to real internet
+
+volumes:
+  squid-cache:
+  squid-logs:
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  squid:
+    build: { context: ., dockerfile: Dockerfile.squid }
+    image: platform/squid:6.13-patched
+    container_name: egress-proxy
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - ./squid.conf:/etc/squid/squid.conf:ro
+      - squid-cache:/var/spool/squid
+      - squid-logs:/var/log/squid
+    networks:
+      - platform-net         # clients connect here
+      - platform-egress      # proxy's own outbound
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    healthcheck:
+      # squid -k check sends signal 0 to the PID — no network, no log spam.
+      test: ["CMD-SHELL", "squid -k check 2>/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

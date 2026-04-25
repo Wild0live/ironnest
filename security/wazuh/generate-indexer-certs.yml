@@ -1,0 +1,19 @@
+# Wazuh App Copyright (C) 2017, Wazuh Inc. (License GPLv2)
+version: '3'
+
+networks:
+  platform-net:
+    external: true
+
+services:
+  generator:
+    image: wazuh/wazuh-certs-generator:0.0.4
+    hostname: wazuh-certs-generator
+    environment:
+      HTTPS_PROXY: "http://squid:3128"
+      HTTP_PROXY: "http://squid:3128"
+    networks:
+      - platform-net
+    volumes:
+      - ./config/wazuh_indexer_ssl_certs/:/certificates/
+      - ./config/certs.yml:/config/certs.yml
