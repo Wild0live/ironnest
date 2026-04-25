@@ -177,6 +177,7 @@ services:
       start_period: 180s
     networks:
       - wazuh-internal
+      - platform-net             # reachable by Traefik ingress proxy
       - ingress                  # port publishing
     depends_on:
       wazuh.indexer:

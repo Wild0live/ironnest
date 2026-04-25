@@ -1,0 +1,92 @@
+name: ingress
+
+# Traefik reverse proxy — internet-facing entry point for IronNest.
+#
+# Exposes :80 (→ redirect to HTTPS) and :443 on all interfaces.
+# Dashboard at 127.0.0.1:8880 (localhost only).
+#
+# Run ./generate-certs.sh once before first `docker compose up -d`.
+# Copy .env.example → .env and fill in WAZUH_INDEXER_PASSWORD.
+
+networks:
+  traefik_ingress:
+    driver: bridge              # internet-capable, port publishing
+  platform-net:
+    external: true              # reach backend services + AdGuard DNS
+  wazuh-internal:
+    external: true
+    name: wazuh_wazuh-internal  # filebeat → wazuh.indexer:9200
+
+volumes:
+  traefik-logs:                 # JSON access logs (traefik writes, filebeat reads)
+  traefik-certs:                # TLS cert + key (populated by generate-certs.sh)
+    external: true              # created by generate-certs.sh before compose up
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ── Traefik reverse proxy ────────────────────────────────────────────────────
+  traefik:
+    image: traefik:v3.3.4
+    container_name: traefik
+    hostname: traefik
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "0.0.0.0:80:80"           # HTTP → redirect to HTTPS
+      - "0.0.0.0:443:443"         # HTTPS ingress
+      - "127.0.0.1:8880:8080"     # Traefik dashboard — localhost only
+    volumes:
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./conf:/etc/traefik/conf:ro
+      - traefik-certs:/certs:ro
+      - traefik-logs:/logs
+    networks:
+      - traefik_ingress
+      - platform-net
+    dns:
+      - 172.30.0.10               # AdGuard
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+
+  # ── Filebeat — ships Traefik access logs to Wazuh indexer ───────────────────
+  ingress-filebeat:
+    image: elastic/filebeat:8.17.4
+    container_name: ingress-filebeat
+    hostname: ingress-filebeat
+    restart: unless-stopped
+    logging: *default-logging
+    user: root                    # needed to read Traefik log volume
+    volumes:
+      - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - traefik-logs:/logs:ro
+      - ../wazuh/config/wazuh_indexer_ssl_certs/root-ca.pem:/certs/root-ca.pem:ro
+    environment:
+      WAZUH_INDEXER_PASSWORD: "${WAZUH_INDEXER_PASSWORD}"
+    networks:
+      - platform-net              # DNS resolution
+      - wazuh-internal            # reach wazuh.indexer:9200
+    dns:
+      - 172.30.0.10
+    depends_on:
+      traefik:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M

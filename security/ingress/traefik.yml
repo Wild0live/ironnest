@@ -1,0 +1,54 @@
+# Traefik v3 static configuration.
+# Dynamic routing is in conf/routers.yml; TLS settings in conf/tls.yml.
+
+api:
+  dashboard: true
+  insecure: true    # port 8880 is already bound to 127.0.0.1 — no extra auth needed
+
+ping: {}
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
+
+providers:
+  file:
+    directory: /etc/traefik/conf
+    watch: true                 # picks up changes to conf/ without restart
+
+# JSON access log — one line per request, consumed by filebeat sidecar.
+accessLog:
+  filePath: "/logs/access.log"
+  format: json
+  bufferingSize: 100
+  fields:
+    defaultMode: keep
+    names:
+      StartUTC: keep
+      Duration: keep
+      RouterName: keep
+      ServiceName: keep
+      ServiceURL: keep
+      ClientAddr: keep
+      RequestMethod: keep
+      RequestPath: keep
+      RequestProtocol: keep
+      DownstreamStatus: keep
+      DownstreamContentSize: keep
+    headers:
+      defaultMode: drop
+      names:
+        User-Agent: keep
+        X-Forwarded-For: keep
+
+log:
+  level: INFO
+  format: json

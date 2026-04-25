@@ -12,6 +12,9 @@ Socket Isolation → Observability → DNS Filtering → Egress Control → SIEM
 
 ## Platform in action
 
+**OpenClaw — AI gateway overview**
+![OpenClaw gateway overview at 127.0.0.1:18789](assets/OpenClaw.png)
+
 **Dozzle — real-time logs across all 14 containers**
 ![Dozzle showing openclaw-gateway live logs](assets/dozzle-logs.png)
 

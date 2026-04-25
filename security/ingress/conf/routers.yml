@@ -1,0 +1,82 @@
+# Dynamic routing configuration — Traefik watches this file for changes.
+#
+# Hostnames use *.ironnest.local by default (self-signed cert, local DNS or
+# /etc/hosts entries). Swap in your real domain and cert resolver when ready.
+#
+# Add new routes by duplicating a router + service block. Traefik reloads
+# automatically — no container restart needed.
+#
+# Backend URLs use container hostnames on platform-net (internal Docker DNS).
+
+http:
+
+  routers:
+
+    # ── AdGuard Home ────────────────────────────────────────────────────────────
+    adguard:
+      rule: "Host(`adguard.ironnest.local`)"
+      entryPoints: [websecure]
+      service: adguard
+      tls: {}
+
+    # ── Infisical secrets vault ──────────────────────────────────────────────────
+    infisical:
+      rule: "Host(`infisical.ironnest.local`)"
+      entryPoints: [websecure]
+      service: infisical
+      tls: {}
+
+    # ── Dozzle log viewer ────────────────────────────────────────────────────────
+    dozzle:
+      rule: "Host(`dozzle.ironnest.local`)"
+      entryPoints: [websecure]
+      service: dozzle
+      tls: {}
+
+    # ── Wazuh SIEM dashboard ─────────────────────────────────────────────────────
+    wazuh:
+      rule: "Host(`wazuh.ironnest.local`)"
+      entryPoints: [websecure]
+      service: wazuh
+      tls: {}
+
+    # ── OpenClaw AI gateway (on-demand) ──────────────────────────────────────────
+    openclaw:
+      rule: "Host(`openclaw.ironnest.local`)"
+      entryPoints: [websecure]
+      service: openclaw
+      tls: {}
+
+  services:
+
+    adguard:
+      loadBalancer:
+        servers:
+          - url: "http://adguard:80"
+
+    infisical:
+      loadBalancer:
+        servers:
+          - url: "http://infisical:8090"
+
+    dozzle:
+      loadBalancer:
+        servers:
+          - url: "http://dozzle:8080"
+
+    # Wazuh dashboard speaks HTTPS internally; skip server-side cert verification
+    # since it uses the platform's self-signed CA.
+    wazuh:
+      loadBalancer:
+        serversTransport: skip-tls-verify
+        servers:
+          - url: "https://wazuh.dashboard:5601"
+
+    openclaw:
+      loadBalancer:
+        servers:
+          - url: "http://openclaw-gateway:18789"
+
+  serversTransports:
+    skip-tls-verify:
+      insecureSkipVerify: true

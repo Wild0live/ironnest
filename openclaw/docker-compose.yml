@@ -138,6 +138,12 @@ services:
       - path: ./.env
       - path: ./secrets-runtime/.env
         required: false
+    environment:
+      # Point the openclaw CLI at the gateway container (not loopback, which is this container).
+      OPENCLAW_GATEWAY_URL: "ws://openclaw-gateway:18789"
+      # Allow CLI→gateway over Docker private network (ws:// to non-loopback).
+      # Safe: traffic stays within the Docker bridge, never leaves the host.
+      OPENCLAW_ALLOW_INSECURE_PRIVATE_WS: "1"
     logging: *default-logging
     volumes:
       - openclaw-home:/home/node/.openclaw
@@ -155,8 +161,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.25"
-          memory: 128M
+          cpus: "0.50"
+          memory: 512M
     healthcheck:
       test: ["CMD", "curl", "-so", "/dev/null", "http://localhost:7681"]
       interval: 30s

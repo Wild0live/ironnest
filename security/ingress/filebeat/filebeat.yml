@@ -1,0 +1,46 @@
+# Filebeat — ships Traefik JSON access logs to the Wazuh indexer (OpenSearch).
+# Runs as a sidecar in the ingress stack; shares the traefik-logs volume.
+#
+# Logs land in index traefik-access-YYYY.MM.DD.
+# Create an index pattern traefik-access-* in the Wazuh/OpenSearch dashboard
+# to query them (Stack Management → Index Patterns).
+
+filebeat.inputs:
+  - type: filestream
+    id: traefik-access
+    enabled: true
+    paths:
+      - /logs/access.log
+    parsers:
+      - ndjson:
+          target: ""
+          overwrite_keys: true
+          add_error_key: true
+
+processors:
+  - add_fields:
+      target: ""
+      fields:
+        log_source: traefik-ingress
+        platform: ironnest
+
+output.elasticsearch:
+  hosts: ["https://wazuh.indexer:9200"]
+  username: "admin"
+  password: "${WAZUH_INDEXER_PASSWORD}"
+  ssl:
+    certificate_authorities: ["/certs/root-ca.pem"]
+    verification_mode: certificate
+  index: "traefik-access-%{+yyyy.MM.dd}"
+  # OpenSearch is wire-compatible with ES 7.x; allow_older_versions
+  # lets Filebeat 8.x connect without the ES 8 version gate.
+  allow_older_versions: true
+
+setup.ilm.enabled: false
+setup.template.enabled: true
+setup.template.name: "traefik-access"
+setup.template.pattern: "traefik-access-*"
+setup.template.overwrite: false
+
+logging.level: info
+logging.to_files: false
