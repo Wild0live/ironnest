@@ -26,7 +26,6 @@ providers:
 
 # JSON access log — one line per request, consumed by filebeat sidecar.
 accessLog:
-  filePath: "/logs/access.log"
   format: json
   bufferingSize: 100
   fields:

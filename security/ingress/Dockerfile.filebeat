@@ -1,5 +1,6 @@
 FROM elastic/filebeat:8.17.4
 COPY filebeat/filebeat.yml /usr/share/filebeat/filebeat.yml
+COPY filebeat/root-ca.pem  /certs/root-ca.pem
 USER root
 RUN chown root:filebeat /usr/share/filebeat/filebeat.yml && chmod 0640 /usr/share/filebeat/filebeat.yml
 USER filebeat

@@ -18,9 +18,9 @@ networks:
     name: wazuh_wazuh-internal  # filebeat → wazuh.indexer:9200
 
 volumes:
-  traefik-logs:                 # JSON access logs (traefik writes, filebeat reads)
   traefik-certs:                # TLS cert + key (populated by generate-certs.sh)
-    external: true              # created by generate-certs.sh before compose up
+    external: true
+    name: ingress_traefik-certs # created by generate-certs.sh before compose up
 
 x-logging: &default-logging
   driver: json-file
@@ -45,7 +45,6 @@ services:
       - ./traefik.yml:/etc/traefik/traefik.yml:ro
       - ./conf:/etc/traefik/conf:ro
       - traefik-certs:/certs:ro
-      - traefik-logs:/logs
     networks:
       - traefik_ingress
       - platform-net
@@ -65,16 +64,17 @@ services:
 
   # ── Filebeat — ships Traefik access logs to Wazuh indexer ───────────────────
   ingress-filebeat:
-    image: elastic/filebeat:8.17.4
+    build:
+      context: .
+      dockerfile: Dockerfile.filebeat
+    image: platform/ingress-filebeat:2026.4.25-1
     container_name: ingress-filebeat
     hostname: ingress-filebeat
     restart: unless-stopped
     logging: *default-logging
-    user: root                    # needed to read Traefik log volume
+    user: root
     volumes:
-      - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
-      - traefik-logs:/logs:ro
-      - ../wazuh/config/wazuh_indexer_ssl_certs/root-ca.pem:/certs/root-ca.pem:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
     environment:
       WAZUH_INDEXER_PASSWORD: "${WAZUH_INDEXER_PASSWORD}"
     networks:
@@ -82,6 +82,12 @@ services:
       - wazuh-internal            # reach wazuh.indexer:9200
     dns:
       - 172.30.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:5066/ | grep -q '\"beat\"'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     depends_on:
       traefik:
         condition: service_healthy

@@ -2,7 +2,7 @@
 
 ## Overview
 
-**IronNest** is a security-hardened, modular 14-container platform running on Rancher Desktop (WSL2/Windows 11). It hosts an AI application workload (OpenClaw) surrounded by a layered security perimeter: secrets management, DNS filtering, HTTP egress control, SIEM monitoring, image scanning, and observability — each in its own isolated Compose project.
+**IronNest** is a security-hardened, modular 16-container platform running on Rancher Desktop (WSL2/Windows 11). It hosts an AI application workload (OpenClaw) surrounded by a layered security perimeter: ingress proxy, secrets management, DNS filtering, HTTP egress control, SIEM monitoring, image scanning, and observability — each in its own isolated Compose project.
 
 **Platform root:** `D:\claude-workspace\platform\`  
 **Docker storage:** `F:\wsl\rancher-desktop-data\ext4.vhdx`  
@@ -30,7 +30,7 @@ Every service sets `dns: 172.30.0.10` (AdGuard). DNS-layer blocking is the first
 ### 5. Allowlist-only HTTP egress
 Outbound HTTP/HTTPS is routed through Squid (`HTTP_PROXY=http://squid:3128`). Squid enforces a hostname allowlist — destinations not explicitly named are denied. Raw TCP (SMTP, threat feeds) bypasses Squid but is restricted to `platform-egress` network members only.
 
-OpenClaw has an extra non-internal `openclaw_ingress` bridge solely so Docker can publish `127.0.0.1:18789` to Windows. Because that bridge can create a default route, `openclaw/start.sh` runs `ops/fix-openclaw-egress.sh` after startup. The script inserts an idempotent `DOCKER-USER` rule that drops NEW outbound connections initiated from the `openclaw_ingress` bridge, preventing `curl --noproxy`-style direct internet bypasses while preserving localhost UI access and Squid-mediated egress.
+OpenClaw has an extra non-internal `openclaw_ingress` bridge solely so Docker can publish `127.0.0.1:18789` to Windows. Because that bridge can create a default route, `openclaw/start.sh` runs `ops/fix-openclaw-egress.sh` after startup. The script inserts idempotent `DOCKER-USER` rules that allow intra-bridge traffic, log direct-egress attempts with prefix `IRONNEST_OPENCLAW_EGRESS_DROP`, then drop NEW outbound connections initiated from the `openclaw_ingress` bridge. This prevents `curl --noproxy`-style direct internet bypasses while preserving localhost UI access and Squid-mediated egress.
 
 ### 6. Network segmentation by trust level
 - `platform-net` (internal) — inter-service comms, no internet exit.
@@ -45,7 +45,7 @@ Per-stack `.env` files hold credentials. All `.env` files are gitignored; only `
 `bootstrap.sh` brings stacks up in hard-wired dependency order so every service finds its upstream already healthy:
 
 ```
-socket-proxy → adguard → egress-proxy → secrets → dozzle → wazuh → trivy → openclaw
+socket-proxy → adguard → egress-proxy → secrets → dozzle → wazuh → trivy → ingress → openclaw
 ```
 
 OpenClaw is last because it depends on DNS (AdGuard), HTTP proxy (Squid), and optionally Infisical — all of which must be ready first.
@@ -71,16 +71,19 @@ Every service has explicit `cpus` and `memory` limits. This prevents a runaway c
 | dozzle | `observability/dozzle/` | always-on | 127.0.0.1:8888 |
 | wazuh | `security/wazuh/` | always-on | 127.0.0.1:8443 |
 | trivy | `security/trivy/` | always-on (server) / on-demand (scanner) | — |
+| ingress | `security/ingress/` | always-on | 127.0.0.1:8880 (dashboard) |
 | openclaw | `openclaw/` | on-demand | 127.0.0.1:18789, 127.0.0.1:7681 (ttyd) |
 
 ---
 
 ## Container Profile
 
-All 14 containers across 8 stacks, as reported by `docker ps`.
+All 16 containers across 9 stacks, as reported by `docker ps`.
 
 | Container | Role | Stack | Image | Host Port |
 |-----------|------|-------|-------|-----------|
+| `traefik` | Reverse proxy / ingress | ingress | `traefik:v3.3.4` | `0.0.0.0:80/443`, `127.0.0.1:8880` |
+| `ingress-filebeat` | Ships Traefik access logs → Wazuh | ingress | `platform/ingress-filebeat:2026.4.25-1` | — |
 | `openclaw-gateway` | AI app workload | openclaw | `platform/openclaw:2026.4.22-1-codex` | `127.0.0.1:18789` |
 | `openclaw-ttyd` | Browser terminal sidecar | openclaw | `platform/openclaw:2026.4.22-1-codex` | `127.0.0.1:7681` |
 | `openclaw-infisical-agent` | Secrets sidecar | openclaw | `platform/infisical-cli:0.43.76-patched` | — |
@@ -98,7 +101,7 @@ All 14 containers across 8 stacks, as reported by `docker ps`.
 
 **Functional layers (outermost → core):**
 ```
-Socket Isolation → Observability → DNS Filtering → Egress Control → SIEM → Image Scanning → Secrets → AI Core
+Ingress Proxy → Socket Isolation → Observability → DNS Filtering → Egress Control → SIEM → Image Scanning → Secrets → AI Core
 ```
 
 ### Image Version Pins
@@ -107,6 +110,8 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 
 | Image (compose / built tag) | Dockerfile `FROM` pin | Upstream version | Pin method |
 |---|---|---|---|
+| `traefik:v3.3.4` | — (used directly) | v3.3.4 | Semver tag |
+| `platform/ingress-filebeat:2026.4.25-1` | `elastic/filebeat:8.17.4` | 8.17.4 | Semver tag |
 | `ghcr.io/openclaw/openclaw:2026.4.22-1-amd64` | — (external, set via `$OPENCLAW_IMAGE`) | 2026.4.22-1 | Calendar semver |
 | `platform/infisical-cli:0.43.76-patched` | `infisical/cli@sha256:dba406b3…` | 0.43.76 (binary) | Digest |
 | `platform/infisical:pg-36438985-patched` | `infisical/infisical@sha256:36438985…` | unknown (floating upstream) | Digest |
@@ -141,6 +146,19 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 ## Network Architecture
 
 ```
+                      Internet / Host PC
+                              │
+                    ┌─────────▼──────────┐
+                    │      Traefik        │  0.0.0.0:80  → redirect HTTPS
+                    │   (ingress stack)   │  0.0.0.0:443 → routes by Host header
+                    │                     │  127.0.0.1:8880 → dashboard
+                    │  IP allowlist        │
+                    │  Rate limiting       │
+                    │  TLS termination     │
+                    │  Access log→stdout   │
+                    └─────────┬───────────┘
+                              │  platform-net
+                              ▼
                           ┌─────────────────────────────────────────┐
                           │            platform-net (internal)       │
                           │              172.30.0.0/24               │
@@ -171,7 +189,8 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 
 ### Stack-private networks (not shown above)
 - `secrets-internal` — Postgres + Redis reachable only by Infisical
-- `wazuh-internal` — manager + indexer + dashboard mesh
+- `wazuh-internal` — manager + indexer + dashboard mesh; also joined by `ingress-filebeat` to reach `wazuh.indexer:9200`
+- `traefik_ingress` — internet-capable bridge for Traefik port publishing (`:80`/`:443`)
 - `ingress` bridges on OpenClaw, Dozzle, Wazuh — used only for localhost port publishing
 - `openclaw_ingress` — non-internal because Windows port publishing requires it; direct outbound NEW connections from its Linux bridge are dropped by `ops/fix-openclaw-egress.sh`
 
@@ -181,6 +200,8 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 
 | Service | CPUs | Memory |
 |---------|------|--------|
+| Traefik | 0.5 | 128 MB |
+| ingress-filebeat | 0.25 | 128 MB |
 | Postgres | 1.0 | 512 MB |
 | Redis | 0.5 | 256 MB |
 | Infisical | 2.0 | 1 GB |
@@ -201,6 +222,10 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 
 | Consumer | Provider | Transport |
 |----------|----------|-----------|
+| Browser / internet | Traefik | HTTPS `:443`; HTTP `:80` → redirect |
+| Traefik | Backend services | HTTP/HTTPS on platform-net by container hostname |
+| ingress-filebeat | Traefik | Docker stdout log files (`/var/lib/docker/containers/*/*.log`) |
+| ingress-filebeat | wazuh.indexer | HTTPS `wazuh.indexer:9200` on `wazuh-internal`; basic auth + root-ca.pem |
 | Dozzle | socket-proxy | `DOCKER_HOST=tcp://socket-proxy:2375` |
 | Wazuh manager | socket-proxy | `DOCKER_HOST=tcp://socket-proxy:2375` |
 | Trivy scanner | socket-proxy | `DOCKER_HOST=tcp://socket-proxy:2375` |
@@ -214,7 +239,7 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 | wazuh.indexer healthcheck | wazuh.indexer | `curl -sk -u admin:$WAZUH_INDEXER_PASSWORD https://localhost:9200/` → 200 |
 | openclaw-gateway (`openai` provider) | api.openai.com | HTTPS via Squid — key from Infisical |
 | openclaw-gateway (`codex` provider) | chatgpt.com/backend-api/v1 | HTTPS via Squid — JWT token, manual refresh |
-| openclaw-gateway direct internet bypass | Docker `DOCKER-USER` firewall | NEW outbound traffic from `openclaw_ingress` is dropped by `ops/fix-openclaw-egress.sh` |
+| openclaw-gateway direct internet bypass | Docker `DOCKER-USER` firewall | NEW outbound traffic from `openclaw_ingress` is logged with prefix `IRONNEST_OPENCLAW_EGRESS_DROP`, then dropped by `ops/fix-openclaw-egress.sh` |
 | openclaw-ttyd | browser (host) | HTTP Basic Auth via ttyd `--credential`; credentials `TTYD_USERNAME`/`TTYD_PASSWORD` injected from Infisical |
 
 ---
@@ -388,6 +413,73 @@ The `codex` provider calls `chatgpt.com/backend-api/v1`; Squid explicitly allowl
 docker exec openclaw-gateway curl --noproxy "*" -m 5 -sf https://example.com -o /dev/null \
   && echo "BAD: direct egress reachable" \
   || echo "OK: direct egress blocked"
+```
+
+---
+
+## Traefik Ingress Stack
+
+### Overview
+
+`security/ingress/` is the single internet-facing entry point for IronNest. All external traffic — including traffic from the host PC — passes through Traefik before reaching any backend service.
+
+```
+security/ingress/
+├── docker-compose.yml       # traefik + ingress-filebeat
+├── traefik.yml              # static config (entrypoints, access log, ping)
+├── conf/
+│   ├── routers.yml          # dynamic routing + middleware (hot-watched)
+│   └── tls.yml              # TLS cert binding + cipher config
+├── filebeat/
+│   ├── filebeat.yml         # reads Docker stdout logs → wazuh.indexer
+│   └── root-ca.pem          # Wazuh CA baked into image at build time
+├── Dockerfile.filebeat      # bakes filebeat.yml + root-ca.pem into image
+├── generate-certs.sh        # one-time self-signed cert generator
+└── .env.example             # WAZUH_INDEXER_PASSWORD (copy wazuh/.env value)
+```
+
+### Routing Rules
+
+Defined in `conf/routers.yml`. Traefik watches this file — **no restart needed** after edits, except on Windows where inotify doesn't propagate through WSL2 bind mounts (`docker restart traefik` required).
+
+| Hostname | Backend | Middlewares |
+|---|---|---|
+| `adguard.ironnest.local` | `adguard:80` | trusted-networks, strict-rate-limit |
+| `infisical.ironnest.local` | `infisical:8090` | rate-limit |
+| `dozzle.ironnest.local` | `dozzle:8080` | trusted-networks, strict-rate-limit |
+| `wazuh.ironnest.local` | `wazuh.dashboard:5601` | trusted-networks, strict-rate-limit |
+| `openclaw.ironnest.local` | `openclaw-gateway:18789` | rate-limit |
+
+### Middlewares
+
+| Middleware | Config | Applied to |
+|---|---|---|
+| `rate-limit` | 100 req/s avg, burst 50 | Infisical, OpenClaw |
+| `strict-rate-limit` | 20 req/s avg, burst 10 | Wazuh, Dozzle, AdGuard |
+| `trusted-networks` | RFC1918 + loopback allowlist | Wazuh, Dozzle, AdGuard |
+
+To add a remote IP (VPN, static home IP) to `trusted-networks`, append to `sourceRange` in `conf/routers.yml` then `docker restart traefik`.
+
+### Access Log → Dozzle + Wazuh
+
+Traefik writes JSON access logs to **stdout**. This means:
+- **Dozzle** (`127.0.0.1:8888`) shows live traffic by selecting the `traefik` container
+- **ingress-filebeat** reads from Docker's captured stdout (`/var/lib/docker/containers/*/*.log`), filters to the `traefik` container, and ships to `wazuh.indexer:9200`
+- Wazuh indexes traffic under `traefik-access-YYYY.MM.DD` — create index pattern `traefik-access-*` in Stack Management to query it
+
+Key access log fields: `ClientAddr`, `RequestMethod`, `RequestPath`, `RouterName`, `DownstreamStatus`, `Duration`.
+
+### TLS
+
+Self-signed cert generated by `./generate-certs.sh` into the `ingress_traefik-certs` named volume. The cert covers `ironnest.local` and `*.ironnest.local` (3650-day validity). To replace with Let's Encrypt: see comments at the top of `conf/tls.yml`.
+
+### First-Time Setup
+
+```bash
+cd platform/security/ingress
+./generate-certs.sh          # creates ingress_traefik-certs volume
+cp .env.example .env         # fill in WAZUH_INDEXER_PASSWORD
+docker compose up -d
 ```
 
 ---

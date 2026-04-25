@@ -10,40 +10,84 @@
 
 http:
 
+  middlewares:
+
+    # ── Rate limiting ────────────────────────────────────────────────────────────
+    # Applied to all routers. Protects against scraping and brute-force.
+    rate-limit:
+      rateLimit:
+        average: 100        # sustained req/s per source IP
+        burst: 50           # short spike allowance
+
+    # Tighter limit for sensitive admin UIs (Wazuh, Dozzle, AdGuard).
+    strict-rate-limit:
+      rateLimit:
+        average: 20
+        burst: 10
+
+    # ── IP allowlist ─────────────────────────────────────────────────────────────
+    # Applied to sensitive services. Covers:
+    #   127.0.0.1/32      — loopback (host browser direct)
+    #   ::1/128           — IPv6 loopback
+    #   10.0.0.0/8        — RFC1918 + all Docker bridge ranges (10.x)
+    #   172.16.0.0/12     — RFC1918 + Docker default bridges (172.17–172.31.x.x)
+    #   192.168.0.0/16    — RFC1918 home/office LAN
+    #
+    # To also allow a remote IP (e.g. VPN or home static IP), add it here:
+    #   - "203.0.113.0/32"
+    trusted-networks:
+      ipAllowList:
+        sourceRange:
+          - "127.0.0.1/32"
+          - "::1/128"
+          - "10.0.0.0/8"
+          - "172.16.0.0/12"
+          - "192.168.0.0/16"
+
   routers:
 
-    # ── AdGuard Home ────────────────────────────────────────────────────────────
+    # ── AdGuard Home ─────────────────────────────────────────────────────────────
+    # Sensitive: controls DNS for the whole platform.
     adguard:
       rule: "Host(`adguard.ironnest.local`)"
       entryPoints: [websecure]
+      middlewares: [trusted-networks, strict-rate-limit]
       service: adguard
       tls: {}
 
-    # ── Infisical secrets vault ──────────────────────────────────────────────────
+    # ── Infisical secrets vault ───────────────────────────────────────────────────
+    # Has its own auth — rate-limit only to slow credential stuffing.
     infisical:
       rule: "Host(`infisical.ironnest.local`)"
       entryPoints: [websecure]
+      middlewares: [rate-limit]
       service: infisical
       tls: {}
 
-    # ── Dozzle log viewer ────────────────────────────────────────────────────────
+    # ── Dozzle log viewer ─────────────────────────────────────────────────────────
+    # Sensitive: exposes all container logs. No built-in auth.
     dozzle:
       rule: "Host(`dozzle.ironnest.local`)"
       entryPoints: [websecure]
+      middlewares: [trusted-networks, strict-rate-limit]
       service: dozzle
       tls: {}
 
-    # ── Wazuh SIEM dashboard ─────────────────────────────────────────────────────
+    # ── Wazuh SIEM dashboard ──────────────────────────────────────────────────────
+    # Sensitive: full security event visibility.
     wazuh:
       rule: "Host(`wazuh.ironnest.local`)"
       entryPoints: [websecure]
+      middlewares: [trusted-networks, strict-rate-limit]
       service: wazuh
       tls: {}
 
-    # ── OpenClaw AI gateway (on-demand) ──────────────────────────────────────────
+    # ── OpenClaw AI gateway (on-demand) ───────────────────────────────────────────
+    # Has its own auth — rate-limit only to prevent API key abuse.
     openclaw:
       rule: "Host(`openclaw.ironnest.local`)"
       entryPoints: [websecure]
+      middlewares: [rate-limit]
       service: openclaw
       tls: {}
 
