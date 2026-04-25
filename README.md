@@ -1,14 +1,26 @@
 # IronNest
 
-**IronNest** is a production-grade, security-first AI workload platform built for Windows 11 developers who want enterprise-level container security without enterprise infrastructure. It runs entirely on your local machine using Rancher Desktop (WSL2) and wraps an AI gateway in seven layers of automated defense — from DNS filtering and egress control to secrets management, SIEM alerting, and vulnerability scanning.
+**The secure local platform for running AI workloads on Windows.**
 
-Every capability is an independent Docker Compose project. One stack crashing or being reset cannot cascade to the others. OpenClaw (the AI workload) has zero access to the Docker socket, zero internet bypass, and zero knowledge of the surrounding security stack — it just sees a proxy and a secrets file.
+IronNest wraps [OpenClaw](https://github.com/openclaw/openclaw) — a self-hosted AI gateway supporting Anthropic Claude, OpenAI, and other providers — in seven independent security layers, so your AI workload runs with production-grade controls on your local machine. No cloud infrastructure required.
 
 ```
 Socket Isolation → Observability → DNS Filtering → Egress Control → SIEM → Image Scanning → Secrets → AI Core
 ```
 
-**Who this is for:** Developers and security-conscious teams who want to self-host an AI gateway locally, with Infisical managing secrets, Wazuh watching the host, Squid enforcing an egress allowlist, and everything auditable from a single Dozzle log view.
+### The core idea
+
+Running an AI gateway locally means managing real API keys, real outbound connections, and a real attack surface. IronNest treats OpenClaw as an untrusted workload and enforces that boundary in hardware:
+
+- **API keys never touch the filesystem or git** — injected at runtime by a self-hosted Infisical vault
+- **All outbound traffic goes through an allowlist proxy** — OpenClaw can only reach AI provider APIs; nothing else
+- **Direct internet bypass is impossible** — blocked at the kernel level by a `DOCKER-USER` firewall rule
+- **The host OS is monitored** — Wazuh watches for intrusion, file integrity changes, and anomalous behaviour
+- **OpenClaw cannot see or control other containers** — zero Docker socket access, zero lifecycle privileges
+
+OpenClaw is the default AI workload, but the platform is designed to host **any containerized AI workload** in the same security envelope. Swap out the `openclaw/` stack and the surrounding layers remain unchanged.
+
+**Who this is for:** Developers and security-conscious teams who want to self-host an AI gateway with Infisical managing secrets, Wazuh watching the host, Squid enforcing an egress allowlist, and everything auditable from a single Dozzle log view — all on a Windows 11 machine.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design, network diagram, and security rationale.
 
