@@ -2,10 +2,10 @@
 
 **The secure local platform for running AI workloads on Windows.**
 
-IronNest gives you a production-grade security envelope for running [OpenClaw](https://github.com/openclaw/openclaw) — a self-hosted AI gateway — on your Windows 11 machine. It bundles seven independent security layers around the AI workload so that your API keys, outbound traffic, host OS, and container runtime are all protected, monitored, and auditable, without needing cloud infrastructure.
+IronNest gives you a production-grade security envelope for running AI workloads — [OpenClaw](https://github.com/openclaw/openclaw) (self-hosted AI gateway) and [Hermes Agent](https://github.com/NousResearch/hermes-agent) (autonomous AI agent with Telegram gateway) — on your Windows 11 machine. It wraps every workload in nine independent security layers so that your API keys, outbound traffic, host OS, and container runtime are all protected, monitored, and auditable, without needing cloud infrastructure.
 
 ```
-Socket Isolation → Observability → DNS Filtering → Egress Control → SIEM → Image Scanning → Secrets → AI Core
+Socket Isolation → DNS Filtering → Egress Control → Secrets → Ingress/TLS → SIEM → Image Scanning → Observability → AI Workloads
 ```
 
 ---
@@ -30,11 +30,17 @@ Socket Isolation → Observability → DNS Filtering → Egress Control → SIEM
 **Wazuh — SIEM dashboard monitoring host and containers**
 ![Wazuh security dashboard showing 0 critical alerts](assets/wazuh-dashboard.png)
 
+**Hermes Agent — autonomous AI agent TUI with tools and skills**
+![Hermes Agent v0.11.0 TUI at 127.0.0.1:7682 showing available tools and skills](assets/hermes_Cli.jpg)
+
+**Hermes Agent — analytics dashboard (95.2M tokens, 93 sessions)**
+![Hermes analytics at 127.0.0.1:9119 showing GPT-5.4 usage breakdown](assets/hermes_ui.jpg)
+
 ---
 
 ## What is OpenClaw and why does it need a security platform?
 
-[OpenClaw](https://github.com/openclaw/openclaw) is a self-hosted AI gateway that lets you run conversations with Anthropic Claude, OpenAI GPT, and other AI providers through a single local interface. Think of it as a private, self-contained AI assistant that you fully control.
+[OpenClaw](https://github.com/openclaw/openclaw) is a self-hosted AI gateway that lets you run conversations with Anthropic Claude, OpenAI GPT, Google Gemini, and other AI providers through a single local interface. Think of it as a private, self-contained AI assistant that you fully control.
 
 Running OpenClaw locally sounds simple — pull a Docker image, set an API key, done. But that surface is deceptively dangerous:
 
@@ -43,9 +49,9 @@ Running OpenClaw locally sounds simple — pull a Docker image, set an API key, 
 - **Your Windows host is part of the attack surface.** The container engine, shared volumes, and host networking all represent potential paths from a container to your machine.
 - **Secrets in `.env` files get committed.** It happens constantly — developers paste API keys into compose files, commit them, and push to GitHub.
 
-IronNest solves all of this. It treats OpenClaw as a zero-trust workload: it gets exactly the access it needs to do its job (reach AI provider APIs, read injected secrets) and nothing more.
+IronNest solves all of this. It treats every AI workload as a zero-trust tenant: each one gets exactly the access it needs to do its job (reach AI provider APIs, read injected secrets) and nothing more.
 
-> OpenClaw is the default AI workload, but the platform is workload-agnostic. Swap out the `openclaw/` stack for any containerized AI application and the surrounding seven security layers remain unchanged.
+> IronNest currently ships two AI workloads — OpenClaw (AI gateway) and Hermes Agent (autonomous agent + Telegram gateway). The surrounding security layers are workload-agnostic: swap either stack for any containerised AI application and the perimeter remains unchanged.
 
 ---
 
@@ -96,23 +102,26 @@ Trivy checks every running image against its CVE database and produces a report.
 ### 7. Secrets Manager — `secrets/`
 **Infisical** is a self-hosted secrets management platform (think HashiCorp Vault, but simpler). IronNest uses it as the single source of truth for all sensitive values — AI API keys, gateway tokens, browser terminal credentials.
 
-The `openclaw/` stack includes an **Infisical Agent sidecar** that authenticates to Infisical using a Machine Identity (not a user account), fetches secrets, and writes them to a runtime `.env` file every 60 seconds. OpenClaw reads this file at startup. Your API keys never appear in `docker-compose.yml`, never in a `.env` committed to git, never in the container image.
+Both `openclaw/` and `hermes/` stacks include an **Infisical Agent sidecar** that authenticates using a Machine Identity, fetches secrets, and writes them to a runtime `.env` file every 60 seconds. API keys never appear in `docker-compose.yml`, never in a `.env` committed to git, never in a container image.
 
-### AI Core — `openclaw/`
-OpenClaw runs inside the `openclaw/` stack with strict isolation:
+### AI Workloads — `openclaw/` and `hermes/`
 
-- No Docker socket access
-- No capability to start, stop, or inspect other containers
-- All outbound traffic forced through Squid
-- All secrets injected at runtime by the Infisical agent sidecar
-- `cap_drop: ALL` and `no-new-privileges: true`
-- A browser terminal (`ttyd`) at `http://127.0.0.1:7681` for running CLI commands like `openclaw security audit` directly from your browser
+Both workloads run with strict isolation — no Docker socket access, no capability to control other containers, all outbound traffic forced through Squid, secrets injected at runtime.
+
+**OpenClaw** (`openclaw/`) — self-hosted AI gateway:
+- Supports Anthropic Claude, OpenAI GPT, Google Gemini, Codex (ChatGPT subscription), and other providers
+- Browser terminal (`ttyd`) at `http://127.0.0.1:7681` for running `openclaw security audit` and similar CLI commands
+
+**Hermes Agent** (`hermes/`) — autonomous AI agent running GPT-5.4 via OpenRouter:
+- Interactive TUI accessible at `http://127.0.0.1:7682` — over 30 skills across browser, code execution, media, research, social, and more
+- Persistent Telegram gateway (`hermes-gateway` container) that survives terminal closes
+- Analytics dashboard at `http://127.0.0.1:9119/analytics` — per-model token usage, session counts, skill rankings
 
 ---
 
 ## System Requirements
 
-IronNest runs 14 containers simultaneously. Wazuh's OpenSearch indexer is the most memory-intensive component — plan your hardware accordingly before starting.
+IronNest runs 18 containers in always-on mode. Wazuh's OpenSearch indexer is the most memory-intensive component — plan your hardware accordingly before starting.
 
 | Component | Minimum | Recommended |
 |---|---|---|
