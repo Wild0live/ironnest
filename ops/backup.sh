@@ -23,8 +23,11 @@ export PATH="/c/Program Files/Rancher Desktop/resources/resources/win32/bin:$PAT
 
 to_win() { echo "$1" | sed -E 's|^/([a-zA-Z])/|\U\1:/|'; }
 
-PLATFORM_DIR="/d/claude-workspace/platform"
-BACKUP_ROOT="/g/rancher-stack-backups"
+# Override either variable via environment to match your install paths:
+#   IRONNEST_PLATFORM_DIR=/d/my-clone/platform bash ops/backup.sh
+#   IRONNEST_BACKUP_ROOT=/e/backups bash ops/backup.sh
+PLATFORM_DIR="${IRONNEST_PLATFORM_DIR:-/d/claude-workspace/platform}"
+BACKUP_ROOT="${IRONNEST_BACKUP_ROOT:-/g/rancher-stack-backups}"
 RETENTION_DAYS=14
 STAMP="$(date +%Y-%m-%d_%H%M%S)"
 DEST="$BACKUP_ROOT/$STAMP"

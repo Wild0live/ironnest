@@ -7,6 +7,9 @@
 **/secrets-runtime/.env
 **/secrets-runtime/agent-token
 
+# Infisical secrets template — contains your project UUID; copy from secrets.tmpl.example
+**/agent-config/secrets.tmpl
+
 # Wazuh TLS certs (generated on first run via generate-indexer-certs.yml)
 **/wazuh_indexer_ssl_certs/
 **/wazuh_indexer_ssl_certs.bak*/

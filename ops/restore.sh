@@ -7,15 +7,17 @@ set -euo pipefail
 export PATH="/c/Program Files/Rancher Desktop/resources/resources/win32/bin:$PATH"
 to_win() { echo "$1" | sed -E 's|^/([a-zA-Z])/|\U\1:/|'; }
 
+PLATFORM_DIR="${IRONNEST_PLATFORM_DIR:-/d/claude-workspace/platform}"
+BACKUP_ROOT="${IRONNEST_BACKUP_ROOT:-/g/rancher-stack-backups}"
+
 SRC="${1:-}"
 if [[ -z "$SRC" || ! -d "$SRC" ]]; then
   echo "Usage: $0 <backup-dir>"
+  echo "  Override paths: IRONNEST_BACKUP_ROOT=/e/backups $0 <backup-dir>"
   echo "Available:"
-  ls -1 /g/rancher-stack-backups/ 2>/dev/null | grep -E '^[0-9]{4}-' || true
+  ls -1 "$BACKUP_ROOT/" 2>/dev/null | grep -E '^[0-9]{4}-' || true
   exit 1
 fi
-
-PLATFORM_DIR="/d/claude-workspace/platform"
 cd "$PLATFORM_DIR"
 
 echo "Restoring from: $SRC"

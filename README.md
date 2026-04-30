@@ -15,7 +15,7 @@ Socket Isolation → Observability → DNS Filtering → Egress Control → SIEM
 **OpenClaw — AI gateway overview**
 ![OpenClaw gateway overview at 127.0.0.1:18789](assets/OpenClaw.png)
 
-**Dozzle — real-time logs across all 14 containers**
+**Dozzle — real-time logs across all containers**
 ![Dozzle showing openclaw-gateway live logs](assets/dozzle-logs.png)
 
 **OpenClaw browser terminal — run CLI commands from your browser**
@@ -67,14 +67,11 @@ Every container in IronNest has its DNS server hard-coded to `172.30.0.10` — t
 AdGuard blocks known malicious domains, ad networks, and tracking endpoints before any TCP connection is even attempted. If OpenClaw or any dependency tries to resolve a blocked domain, the query is dropped at the DNS level.
 
 ### 4. Egress Control — `security/egress-proxy/`
-All outbound HTTP and HTTPS traffic is routed through **Squid**, a forward proxy with a strict hostname allowlist. OpenClaw is configured with `HTTP_PROXY=http://squid:3128` — it cannot make a direct internet connection.
+All outbound HTTP and HTTPS traffic is routed through **Squid**, a forward proxy. OpenClaw and Hermes are configured with `HTTP_PROXY=http://squid:3128` — they cannot make a direct internet connection.
 
-The allowlist for OpenClaw permits only:
-- `.anthropic.com` — Claude API
-- `.openai.com`, `.chatgpt.com` — OpenAI / Codex
-- Other explicitly named AI provider endpoints
+Squid uses an **allow-by-default / blocklist** model: all destinations are permitted unless they appear on a live threat feed. A companion `blocklist-updater` container fetches **Spamhaus DROP/EDROP**, **Emerging Threats C2**, and **Feodo Tracker** every 6 hours and reloads Squid without a restart. This means known-malicious IPs and domains are blocked at the TCP level, while legitimate new AI provider endpoints work without manual config changes.
 
-Any destination not on the allowlist is denied with a `403 Forbidden`. On top of this, `openclaw/start.sh` inserts a `DOCKER-USER` firewall rule at the kernel level that drops any NEW outbound TCP connection that tries to bypass the proxy entirely (`curl --noproxy`-style). The proxy is not optional — it is enforced at two layers.
+On top of this, `openclaw/start.sh` and `hermes/start.sh` each insert a `DOCKER-USER` firewall rule at the kernel level that drops any NEW outbound TCP connection that tries to bypass the proxy entirely (`curl --noproxy`-style). The proxy is not optional — it is enforced at two independent layers: Squid blocklist + kernel firewall.
 
 ### 5. SIEM — `security/wazuh/`
 **Wazuh** is an open-source Security Information and Event Management system. IronNest runs a full Wazuh stack: manager, OpenSearch indexer, and dashboard. A Windows host agent is installed on the PC itself (not just inside containers), so Wazuh monitors:
@@ -134,10 +131,13 @@ IronNest runs 14 containers simultaneously. Wazuh's OpenSearch indexer is the mo
 | Stack | Containers | Memory limit |
 |---|---|---|
 | Wazuh (manager + indexer + dashboard) | 3 | 5.0 GB |
-| OpenClaw gateway + ttyd | 2 | 4.1 GB |
+| OpenClaw gateway + ttyd + Infisical agent | 3 | 5.1 GB |
 | Infisical + Postgres + Redis | 3 | 1.8 GB |
-| Trivy, Squid, AdGuard, Dozzle, socket-proxy | 5 | 1.2 GB |
-| **Total** | **14** | **~12.1 GB** |
+| Traefik + Filebeat | 2 | 0.3 GB |
+| Trivy, Squid + blocklist-updater, AdGuard, Dozzle, socket-proxy | 7 | 1.3 GB |
+| **Always-on total** | **18** | **~13.5 GB** |
+| Hermes Agent (ttyd + gateway + Infisical agent) | 3 | 2.5 GB |
+| **All running total** | **21** | **~16 GB** |
 
 > Windows itself plus WSL2 overhead adds ~2–4 GB on top. On a 16 GB machine, if you experience memory pressure, reduce Wazuh's indexer heap: add `OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx1g` to `security/wazuh/.env`.
 
@@ -151,16 +151,18 @@ IronNest runs 14 containers simultaneously. Wazuh's OpenSearch indexer is the mo
 
 ## What's included
 
-| Stack | Path | Purpose | Local UI |
-|---|---|---|---|
-| Socket proxy | `security/socket-proxy/` | Read-only Docker API for Dozzle / Wazuh / Trivy | — |
-| DNS filter | `security/adguard/` | AdGuard Home — DNS-layer blocking for all containers | `127.0.0.1:3000` |
-| Egress proxy | `security/egress-proxy/` | Squid — hostname-allowlisted HTTPS egress | — |
-| SIEM | `security/wazuh/` | Wazuh manager + indexer + dashboard | `127.0.0.1:8443` |
-| Image scanner | `security/trivy/` | CVE database server + on-demand scanner | — |
-| Secrets manager | `secrets/` | Infisical + Postgres + Redis | `127.0.0.1:8090` |
-| Log viewer | `observability/dozzle/` | Real-time container log viewer | `127.0.0.1:8888` |
-| AI workload | `openclaw/` | OpenClaw gateway + ttyd browser terminal | `127.0.0.1:18789`, `127.0.0.1:7681` |
+| Stack | Path | Startup | Purpose | Local UI |
+|---|---|---|---|---|
+| Socket proxy | `security/socket-proxy/` | bootstrap | Read-only Docker API for Dozzle / Wazuh / Trivy | — |
+| DNS filter | `security/adguard/` | bootstrap | AdGuard Home — DNS-layer blocking for all containers | `127.0.0.1:3000` |
+| Egress proxy | `security/egress-proxy/` | bootstrap | Squid + blocklist-updater — allow-by-default with threat blocklists | — |
+| SIEM | `security/wazuh/` | bootstrap | Wazuh manager + indexer + dashboard | `127.0.0.1:8443` |
+| Image scanner | `security/trivy/` | bootstrap | CVE database server + on-demand scanner | — |
+| Ingress | `security/ingress/` | bootstrap | Traefik reverse proxy — TLS termination, single internet entry point | `127.0.0.1:8880` (dashboard) |
+| Secrets manager | `secrets/` | bootstrap | Infisical + Postgres + Redis | `127.0.0.1:18090` |
+| Log viewer | `observability/dozzle/` | bootstrap | Real-time container log viewer | `127.0.0.1:8888` |
+| AI workload | `openclaw/` | on-demand | OpenClaw gateway + ttyd browser terminal | `127.0.0.1:18789`, `127.0.0.1:7681` |
+| Hermes Agent | `hermes/` | on-demand | Hermes Agent TUI + Telegram gateway | `127.0.0.1:7682` |
 
 ---
 
@@ -297,7 +299,15 @@ This creates `security/wazuh/config/wazuh_indexer_ssl_certs/` containing the CA,
 
 ### Step 5 — Bootstrap the platform
 
-Run bootstrap to create the shared networks and start all always-on stacks:
+First, run the pre-flight checker to catch common problems before they cause confusing errors mid-bootstrap:
+
+```bash
+bash ops/check-prereqs.sh
+```
+
+All checks should show `[PASS]`. Fix any `[FAIL]` items before continuing.
+
+Then run bootstrap to create the shared networks and start all always-on stacks:
 
 ```bash
 bash bootstrap.sh
@@ -325,7 +335,7 @@ Infisical is your self-hosted secrets vault. You need to complete its first-run 
 
 **Open Infisical:**
 
-Navigate to `http://127.0.0.1:8090` in your browser. Complete the sign-up form to create your admin account.
+Navigate to `http://127.0.0.1:18090` in your browser. Complete the sign-up form to create your admin account.
 
 **Create a project:**
 
@@ -361,20 +371,13 @@ INFISICAL_CLIENT_SECRET=<same Client Secret>
 
 **Update the secrets template with your project ID:**
 
-Your Infisical project has a UUID visible in the browser URL when you're inside the project (e.g. `http://127.0.0.1:8090/project/63d75eb0-ef3a-4ce3-908d-46360b922fa8/...`). Copy that UUID and replace the placeholder in:
+Your Infisical project has a UUID visible in the browser URL when you're inside the project (e.g. `http://127.0.0.1:18090/project/63d75eb0-ef3a-4ce3-908d-46360b922fa8/...`). Copy that UUID, then:
 
-```
-openclaw/agent-config/secrets.tmpl
+```bash
+cp openclaw/agent-config/secrets.tmpl.example openclaw/agent-config/secrets.tmpl
 ```
 
-Change:
-```
-{{- range secret "<YOUR_INFISICAL_PROJECT_ID>" "dev" "/" }}
-```
-To:
-```
-{{- range secret "your-actual-uuid-here" "dev" "/" }}
-```
+Open the file and replace `<YOUR_INFISICAL_PROJECT_UUID>` with your actual project UUID. The file is gitignored so your UUID stays off git.
 
 ---
 
@@ -400,7 +403,7 @@ bash openclaw/start.sh
 | OpenClaw UI | `http://127.0.0.1:18789` | Main AI gateway interface |
 | Browser terminal | `http://127.0.0.1:7681` | Login with `TTYD_USERNAME` / `TTYD_PASSWORD` |
 | Dozzle logs | `http://127.0.0.1:8888` | All container logs in real time |
-| Infisical | `http://127.0.0.1:8090` | Secrets management |
+| Infisical | `http://127.0.0.1:18090` | Secrets management |
 | AdGuard | `http://127.0.0.1:3000` | DNS filter dashboard |
 | Wazuh | `https://127.0.0.1:8443` | SIEM dashboard |
 
@@ -412,6 +415,55 @@ Open `http://127.0.0.1:7681`, log in, then:
 openclaw security audit
 openclaw security audit --deep
 openclaw security audit --fix
+```
+
+---
+
+### Step 7b — (Optional) Start Hermes Agent
+
+Hermes Agent is a second AI workload that adds a Telegram messaging gateway and an interactive TUI alongside OpenClaw. It is fully isolated in its own stack and does not affect OpenClaw in any way.
+
+**Set up Infisical secrets for Hermes** (same pattern as Step 6):
+
+1. In Infisical, create a new project called `hermes`
+2. Add these secrets in the `dev` environment at path `/`:
+
+| Secret name | Value |
+|---|---|
+| `OPENROUTER_API_KEY` | Your API key from [openrouter.ai](https://openrouter.ai) |
+| `HERMES_TTYD_USERNAME` | A username for the Hermes browser terminal |
+| `HERMES_TTYD_PASSWORD` | A strong password for the Hermes browser terminal |
+| `TELEGRAM_BOT_TOKEN` | *(optional)* Token from [@BotFather](https://t.me/BotFather) on Telegram |
+
+3. Create a Machine Identity named `hermes-gateway` (Access Control → Machine Identities), assign it Viewer role on the hermes project, and copy the Client ID + Client Secret into `hermes/.env`
+
+4. Copy and configure the secrets template:
+
+```bash
+cp hermes/agent-config/secrets.tmpl.example hermes/agent-config/secrets.tmpl
+```
+
+Replace `<YOUR_INFISICAL_PROJECT_UUID>` with your hermes project UUID (visible in the Infisical URL).
+
+**Start Hermes:**
+
+```bash
+bash hermes/start.sh
+```
+
+The first build downloads ~1 GB of dependencies — allow 20 minutes. Subsequent starts are fast.
+
+**Access Hermes:**
+
+| Interface | URL |
+|---|---|
+| Browser terminal | `http://127.0.0.1:7682` |
+| Via Traefik | `https://hermes.ironnest.local` |
+
+**First-run setup** (from the browser terminal):
+
+```bash
+hermes setup
 ```
 
 ---
@@ -473,14 +525,17 @@ The agent appears in the Wazuh dashboard at `https://127.0.0.1:8443` within a mi
 ## Day-to-day operations
 
 ```bash
+# Pre-flight check (run before bootstrap after a fresh clone)
+bash ops/check-prereqs.sh
+
 # Check status of all stacks
-./ops/status.sh
+bash ops/status.sh
 
 # View live logs for all containers
 # → open http://127.0.0.1:8888 in your browser
 
 # Run a CVE scan across all running images
-./security/trivy/scan.sh all
+bash security/trivy/scan.sh all
 
 # Restart a single stack without touching others
 cd secrets && docker compose restart
@@ -494,6 +549,12 @@ bash openclaw/start.sh
 # Run an OpenClaw security audit (from browser terminal at http://127.0.0.1:7681)
 openclaw security audit
 openclaw security audit --fix
+
+# Start Hermes Agent (on-demand)
+bash hermes/start.sh
+
+# Stop Hermes when not in use
+cd hermes && docker compose stop
 ```
 
 ---
@@ -513,10 +574,18 @@ Never use bare `docker compose up -d` to start stacks after a restart — the DN
 
 ## Backup and restore
 
-IronNest includes a backup script that snapshots all persistent volumes to a directory of your choice:
+IronNest includes a backup script that snapshots all persistent volumes. By default it writes to `G:\rancher-stack-backups` — override with an environment variable if your drive letter differs:
 
 ```bash
-# Edit ops/backup.sh to set your backup destination path, then:
+# Use defaults (G:\rancher-stack-backups):
+bash ops/backup.sh
+
+# Override the backup destination:
+IRONNEST_BACKUP_ROOT=/e/my-backups bash ops/backup.sh
+
+# Override both platform root and backup destination:
+IRONNEST_PLATFORM_DIR=/d/ironnest/platform \
+IRONNEST_BACKUP_ROOT=/e/my-backups \
 bash ops/backup.sh
 ```
 
@@ -598,6 +667,50 @@ docker compose -p <stack-name> logs <service-name>
 ```
 
 Or view it in Dozzle at `http://127.0.0.1:8888`. Most issues after a fresh bootstrap are Wazuh indexer startup time — give it 2–3 minutes.
+
+**bootstrap.sh appears to hang after starting the secrets stack**
+
+PostgreSQL takes 15–30 seconds to initialise on first run. The script polls until it is ready. If it hangs beyond 2 minutes, check:
+
+```bash
+docker compose -p secrets logs infisical-postgres
+```
+
+A permission error on the data volume means the volume was created with the wrong ownership — run `docker volume rm rancher-stack_postgres-data` and re-run bootstrap.
+
+**Infisical is unreachable at `http://127.0.0.1:18090`**
+
+Rancher Desktop's `sshPortForwarder` may have injected DNAT rules that intercept port traffic. Run:
+
+```bash
+bash ops/fix-nat-prerouting.sh
+```
+
+**Hermes browser terminal (`http://127.0.0.1:7682`) asks for credentials but rejects them**
+
+Same cause as the OpenClaw ttyd issue above — Infisical agent may not have rendered yet. Check:
+
+```bash
+docker exec hermes-infisical-agent cat /secrets/.env | grep HERMES_TTYD
+```
+
+If empty, restart the agent and wait 15 seconds, then restart ttyd:
+
+```bash
+docker restart hermes-infisical-agent
+sleep 15
+cd hermes && docker compose restart hermes-ttyd
+```
+
+**`ops/check-prereqs.sh` reports a FAIL for secrets.tmpl**
+
+Copy the example template and replace the UUID placeholder:
+
+```bash
+cp openclaw/agent-config/secrets.tmpl.example openclaw/agent-config/secrets.tmpl
+# Edit the file — replace <YOUR_INFISICAL_PROJECT_UUID> with your real project UUID
+# (visible in the Infisical browser URL for your project)
+```
 
 ---
 
