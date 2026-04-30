@@ -2,7 +2,7 @@
 
 ## Overview
 
-**IronNest** is a security-hardened, modular 16-container platform running on Rancher Desktop (WSL2/Windows 11). It hosts an AI application workload (OpenClaw) surrounded by a layered security perimeter: ingress proxy, secrets management, DNS filtering, HTTP egress control, SIEM monitoring, image scanning, and observability — each in its own isolated Compose project.
+**IronNest** is a security-hardened, modular 19-container platform running on Rancher Desktop (WSL2/Windows 11). It hosts AI application workloads (OpenClaw and Hermes Agent) surrounded by a layered security perimeter: ingress proxy, secrets management, DNS filtering, HTTP egress control, SIEM monitoring, image scanning, and observability — each in its own isolated Compose project.
 
 **Platform root:** `D:\claude-workspace\platform\`  
 **Docker storage:** `F:\wsl\rancher-desktop-data\ext4.vhdx`  
@@ -30,12 +30,12 @@ Every service sets `dns: 172.30.0.10` (AdGuard). DNS-layer blocking is the first
 ### 5. Allowlist-only HTTP egress
 Outbound HTTP/HTTPS is routed through Squid (`HTTP_PROXY=http://squid:3128`). Squid enforces a hostname allowlist — destinations not explicitly named are denied. Raw TCP (SMTP, threat feeds) bypasses Squid but is restricted to `platform-egress` network members only.
 
-OpenClaw has an extra non-internal `openclaw_ingress` bridge solely so Docker can publish `127.0.0.1:18789` to Windows. Because that bridge can create a default route, `openclaw/start.sh` runs `ops/fix-openclaw-egress.sh` after startup. The script inserts idempotent `DOCKER-USER` rules that allow intra-bridge traffic, log direct-egress attempts with prefix `IRONNEST_OPENCLAW_EGRESS_DROP`, then drop NEW outbound connections initiated from the `openclaw_ingress` bridge. This prevents `curl --noproxy`-style direct internet bypasses while preserving localhost UI access and Squid-mediated egress.
+OpenClaw and Hermes each have an extra non-internal ingress bridge solely so Docker can publish localhost-only ports to Windows. Because those bridges can create default routes, their start scripts run `ops/fix-openclaw-egress.sh` and `ops/fix-hermes-egress.sh` after startup. These scripts insert idempotent `DOCKER-USER` rules that allow intra-bridge traffic, log direct-egress attempts with prefixes such as `IRONNEST_OPENCLAW_EGRESS_DROP` / `IRONNEST_HERMES_EGRESS_DROP`, then drop NEW outbound connections initiated from the workload ingress bridges. This prevents `curl --noproxy`-style direct internet bypasses while preserving localhost UI access and Squid-mediated egress.
 
 ### 6. Network segmentation by trust level
 - `platform-net` (internal) — inter-service comms, no internet exit.
 - `platform-egress` — internet-capable, only for services that genuinely need raw TCP.
-- Stack-private `ingress` bridges — used solely for localhost port publishing; keeps internal networks from leaking host-facing ports to the wrong services. OpenClaw's ingress bridge is additionally blocked from initiating direct outbound internet traffic by a `DOCKER-USER` firewall rule.
+- Stack-private `ingress` bridges — used solely for localhost port publishing; keeps internal networks from leaking host-facing ports to the wrong services. OpenClaw and Hermes ingress bridges are additionally blocked from initiating direct outbound internet traffic by `DOCKER-USER` firewall rules.
 - Stack-private internal networks (e.g. `secrets-internal`, `wazuh-internal`) — database/index tiers that should never be reachable from other stacks.
 
 ### 7. Secrets out of images and out of git
@@ -51,6 +51,8 @@ socket-proxy → adguard → egress-proxy → secrets → dozzle → wazuh → t
 OpenClaw is last because it depends on DNS (AdGuard), HTTP proxy (Squid), and optionally Infisical — all of which must be ready first.
 
 Use `openclaw/start.sh` instead of bare `docker compose up -d` for OpenClaw. It repairs Rancher Desktop NAT, verifies `platform-egress` routing, starts the stack, applies the `openclaw_ingress` direct-egress firewall rule, registers injected API keys, and verifies that direct no-proxy egress is blocked.
+
+Hermes is also on-demand and is intentionally not added to `bootstrap.sh`. Use `hermes/start.sh` instead of bare `docker compose up -d`; it repairs Rancher Desktop NAT, starts/builds the Hermes Agent image, applies the `hermes_ingress` direct-egress firewall rule, and verifies direct no-proxy egress is blocked.
 
 ### 9. Backup completeness and verifiability
 Every backup run produces a `SHA256SUMS` file. `restore.sh` verifies checksums before touching anything. Fourteen-day retention with automatic pruning.
@@ -73,12 +75,13 @@ Every service has explicit `cpus` and `memory` limits. This prevents a runaway c
 | trivy | `security/trivy/` | always-on (server) / on-demand (scanner) | — |
 | ingress | `security/ingress/` | always-on | 127.0.0.1:8880 (dashboard) |
 | openclaw | `openclaw/` | on-demand | 127.0.0.1:18789, 127.0.0.1:7681 (ttyd) |
+| hermes | `hermes/` | on-demand | 127.0.0.1:7682 (ttyd) |
 
 ---
 
 ## Container Profile
 
-All 16 containers across 9 stacks, as reported by `docker ps`.
+All 19 containers across 10 stacks, as reported by `docker ps` when OpenClaw and Hermes are both running.
 
 | Container | Role | Stack | Image | Host Port |
 |-----------|------|-------|-------|-----------|
@@ -87,6 +90,9 @@ All 16 containers across 9 stacks, as reported by `docker ps`.
 | `openclaw-gateway` | AI app workload | openclaw | `platform/openclaw:2026.4.22-1-codex` | `127.0.0.1:18789` |
 | `openclaw-ttyd` | Browser terminal sidecar | openclaw | `platform/openclaw:2026.4.22-1-codex` | `127.0.0.1:7681` |
 | `openclaw-infisical-agent` | Secrets sidecar | openclaw | `platform/infisical-cli:0.43.76-patched` | — |
+| `hermes-ttyd` | Hermes Agent browser terminal | hermes | `platform/hermes-agent:v2026.4.23-patched` | `127.0.0.1:7682` |
+| `hermes-gateway` | Hermes messaging gateway (Telegram, etc.) | hermes | `platform/hermes-agent:v2026.4.23-patched` | — |
+| `hermes-infisical-agent` | Hermes secrets sidecar | hermes | `platform/infisical-cli:0.43.76-patched` | — |
 | `infisical` | Secrets manager UI/API | secrets | `platform/infisical:pg-36438985-patched` | `127.0.0.1:18090` |
 | `infisical-postgres` | Infisical database | secrets | `platform/postgres:16.13-alpine-patched` | — |
 | `infisical-redis` | Infisical cache | secrets | `platform/redis:7.4.8-alpine-patched` | — |
@@ -113,6 +119,7 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 | `traefik:v3.3.4` | — (used directly) | v3.3.4 | Semver tag |
 | `platform/ingress-filebeat:2026.4.25-1` | `elastic/filebeat:8.17.4` | 8.17.4 | Semver tag |
 | `ghcr.io/openclaw/openclaw:2026.4.22-1-amd64` | — (external, set via `$OPENCLAW_IMAGE`) | 2026.4.22-1 | Calendar semver |
+| `platform/hermes-agent:v2026.4.23-patched` | `debian:13.4` + `NousResearch/hermes-agent` tag `v2026.4.23` | v2026.4.23 | Semver tag + helper digests |
 | `platform/infisical-cli:0.43.76-patched` | `infisical/cli@sha256:dba406b3…` | 0.43.76 (binary) | Digest |
 | `platform/infisical:pg-36438985-patched` | `infisical/infisical@sha256:36438985…` | unknown (floating upstream) | Digest |
 | `platform/postgres:16.13-alpine-patched` | `postgres:16.13-alpine` | PostgreSQL 16.13 | Semver tag |
@@ -192,7 +199,8 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 - `wazuh-internal` — manager + indexer + dashboard mesh; also joined by `ingress-filebeat` to reach `wazuh.indexer:9200`
 - `traefik_ingress` — internet-capable bridge for Traefik port publishing (`:80`/`:443`)
 - `ingress` bridges on OpenClaw, Dozzle, Wazuh — used only for localhost port publishing
-- `openclaw_ingress` — non-internal because Windows port publishing requires it; direct outbound NEW connections from its Linux bridge are dropped by `ops/fix-openclaw-egress.sh`
+- `openclaw_ingress` — non-internal because Windows port publishing requires it; direct outbound NEW connections from its Linux bridge are logged and dropped by `ops/fix-openclaw-egress.sh`
+- `hermes_ingress` — non-internal because Windows port publishing requires it; direct outbound NEW connections from its Linux bridge are logged and dropped by `ops/fix-hermes-egress.sh`
 
 ---
 
@@ -206,7 +214,10 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 | Redis | 0.5 | 256 MB |
 | Infisical | 2.0 | 1 GB |
 | OpenClaw gateway | 4.0 | 4 GB |
-| openclaw-ttyd | 0.25 | 128 MB |
+| openclaw-ttyd | 0.50 | 1 GB |
+| hermes-ttyd | 2.0 | 2 GB |
+| hermes-gateway | 0.50 | 512 MB |
+| hermes-infisical-agent | 0.25 | 64 MB |
 | AdGuard | 0.5 | 256 MB |
 | socket-proxy | 0.25 | 64 MB |
 | Squid | 0.5 | 256 MB |
@@ -240,7 +251,12 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 | openclaw-gateway (`openai` provider) | api.openai.com | HTTPS via Squid — key from Infisical |
 | openclaw-gateway (`codex` provider) | chatgpt.com/backend-api/v1 | HTTPS via Squid — JWT token, manual refresh |
 | openclaw-gateway direct internet bypass | Docker `DOCKER-USER` firewall | NEW outbound traffic from `openclaw_ingress` is logged with prefix `IRONNEST_OPENCLAW_EGRESS_DROP`, then dropped by `ops/fix-openclaw-egress.sh` |
-| openclaw-ttyd | browser (host) | HTTP Basic Auth via ttyd `--credential`; credentials `TTYD_USERNAME`/`TTYD_PASSWORD` injected from Infisical |
+| openclaw-ttyd | browser (host) | ttyd at `127.0.0.1:7681`; uses HTTP Basic Auth only when `TTYD_USERNAME`/`TTYD_PASSWORD` are present |
+| hermes-ttyd | browser (host) | ttyd shell at `127.0.0.1:7682`; `hermes` CLI is on `PATH` and `TERMINAL_ENV=local` |
+| hermes-ttyd | OpenRouter / Ollama / NousResearch | HTTPS via Squid — API keys injected from Infisical |
+| hermes-ttyd (`openai-codex` provider) | chatgpt.com/backend-api/codex + auth.openai.com | HTTPS via Squid — ChatGPT OAuth tokens stored in `hermes-data` |
+| hermes-gateway | Telegram Bot API | HTTPS via Squid — `TELEGRAM_*` values injected from Infisical runtime env, not `/opt/data/.env` |
+| hermes-ttyd direct internet bypass | Docker `DOCKER-USER` firewall | NEW outbound traffic from `hermes_ingress` is logged with prefix `IRONNEST_HERMES_EGRESS_DROP`, then dropped by `ops/fix-hermes-egress.sh` |
 
 ---
 
@@ -249,6 +265,7 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 | Consumer | Allowed destinations |
 |----------|---------------------|
 | OpenClaw | `.anthropic.com`, `.openai.com`, `.chatgpt.com`, `.cohere.ai`, `.mistral.ai`, `registry.npmjs.org` |
+| Hermes | `openrouter.ai`, `ollama.com`, `.ollama.ai`, `nousresearch.com`, `.chatgpt.com`, `.openai.com` |
 | Wazuh | `.wazuh.com`, `.cve.mitre.org`, `.nvd.nist.gov`, `.github.com`, `packages.wazuh.com` |
 | Trivy | `ghcr.io`, `.githubusercontent.com`, `aquasecurity.github.io`, `.aquasec.com`, `mirror.gcr.io`, `storage.googleapis.com`, `*.docker.io`, `production.cloudflare.docker.com` |
 | AdGuard | `.quad9.net`, `.cloudflare-dns.com`, `dns.google` |
@@ -317,7 +334,7 @@ OpenClaw does not receive secrets via environment variables at container creatio
 
 **Design:** Uses the same image as `openclaw-gateway` (`platform/openclaw:2026.4.22-1-codex`) — this gives it the `openclaw` CLI binary without a separate installation. The shared `openclaw-home` volume means the CLI reads live gateway state, so `openclaw security audit` reflects the running gateway's configuration.
 
-**Authentication:** ttyd's `--credential` flag enforces HTTP Basic Auth. Credentials are sourced from Infisical (`TTYD_USERNAME`, `TTYD_PASSWORD`, dev env, root path `/`) and injected via the same `secrets-runtime/.env` that the gateway uses.
+**Authentication:** ttyd's `--credential` flag enforces HTTP Basic Auth when both `TTYD_USERNAME` and `TTYD_PASSWORD` are present. If either value is missing, the localhost-only terminal starts without the broken empty credential gate.
 
 **Healthcheck:** Uses `CMD` format (not `CMD-SHELL`) calling `curl -so /dev/null http://localhost:7681`. The `-so` flag discards output and accepts any HTTP response including 401, so the healthcheck passes even when auth is enforced.
 
@@ -327,6 +344,59 @@ OpenClaw does not receive secrets via environment variables at container creatio
 openclaw security audit
 openclaw security audit --deep
 openclaw security audit --fix
+```
+
+---
+
+## Hermes Agent Stack
+
+Hermes is an on-demand AI agent workload based on `NousResearch/hermes-agent` tag `v2026.4.23`, with a ttyd browser terminal at `http://127.0.0.1:7682`.
+
+```
+┌─────────────────────────────────────────────────────┐
+│  hermes stack                                        │
+│                                                      │
+│  ┌──────────────────┐     shared file render         │
+│  │ hermes-infisical │ ──► secrets-runtime/.env       │
+│  │ agent            │                               │
+│  └──────────────────┘                               │
+│           │ Universal Auth                           │
+│           ▼                                          │
+│     Infisical :8090                                  │
+│                                                      │
+│  ┌──────────────────┐     named volume               │
+│  │   hermes-ttyd    │◄──► hermes-data                │
+│  │  ttyd :7682      │     /opt/data                  │
+│  └──────────────────┘           ▲                    │
+│                                 │                    │
+│  ┌──────────────────┐           │                    │
+│  │ hermes-gateway   │───────────┘                    │
+│  │ Telegram/etc.    │                                │
+│  └──────────────────┘                                │
+└─────────────────────────────────────────────────────┘
+```
+
+**Design:** `hermes-ttyd` opens a shell with `/opt/hermes/.venv/bin` on `PATH`, so the browser terminal can run setup/auth commands (`hermes auth add ...`) and then launch the Hermes TUI with `hermes`. It sets `TERMINAL_ENV=local`, so shell/tool execution happens inside the Hermes container itself. No Docker socket is mounted, and the container does not get host lifecycle control.
+
+**Gateway:** `hermes-gateway` runs `hermes gateway run` as a Compose-managed service for Telegram and other messaging adapters. This keeps messaging alive across ttyd terminal closes and container restarts; do not run a second manual `hermes gateway run` inside ttyd unless the Compose service is stopped.
+
+**Secrets:** Hermes uses its own Infisical project and sidecar. `hermes/agent-config/secrets.tmpl` renders `HERMES_TTYD_USERNAME`, `HERMES_TTYD_PASSWORD`, `OPENROUTER_API_KEY`, and optional `TELEGRAM_*` values into `hermes/secrets-runtime/.env`. `hermes-ttyd` and `hermes-gateway` receive updated rendered values after container recreation because Compose `env_file` values are read at container creation time. `/opt/data/.env` is not the IronNest source of truth for Telegram secrets; check `hermes status` or the runtime environment instead. If `TELEGRAM_HOME_CHANNEL` is absent, the Hermes containers derive it from the single configured `TELEGRAM_ALLOWED_USERS` value at startup, keeping the default direct-chat target out of git.
+
+**Networking:** `hermes-ttyd` joins `platform-net` for AdGuard DNS and Squid proxy access, plus `hermes_ingress` solely for localhost port publishing. `hermes-gateway` joins only `platform-net` and reaches Telegram through Squid. Direct no-proxy internet egress from `hermes_ingress` is logged and dropped by `ops/fix-hermes-egress.sh`; HTTP(S) provider and Telegram calls must go through Squid.
+
+**Provider egress:** Squid allowlists `openrouter.ai`, `ollama.com`, `.ollama.ai`, `nousresearch.com`, `.chatgpt.com`, and `.openai.com` for Hermes. Live verification showed OpenRouter reachable through Squid and direct no-proxy egress blocked.
+
+**ChatGPT Plus / Codex OAuth:** Hermes supports ChatGPT subscription auth through provider id `openai-codex`. This is distinct from the standard OpenAI API-key provider. Run `hermes auth add openai-codex --type oauth` inside the Hermes ttyd terminal and complete the browser/device-code login. Tokens are stored in the persistent `hermes-data` volume, not in git or static `.env` files.
+
+**Startup:**
+```bash
+bash hermes/start.sh
+```
+
+**First-run inside ttyd:**
+```bash
+hermes setup
+hermes claw migrate
 ```
 
 ---
@@ -449,6 +519,7 @@ Defined in `conf/routers.yml`. Traefik watches this file — **no restart needed
 | `dozzle.ironnest.local` | `dozzle:8080` | trusted-networks, strict-rate-limit |
 | `wazuh.ironnest.local` | `wazuh.dashboard:5601` | trusted-networks, strict-rate-limit |
 | `openclaw.ironnest.local` | `openclaw-gateway:18789` | rate-limit |
+| `hermes.ironnest.local` | `hermes-ttyd:7682` | trusted-networks, strict-rate-limit |
 
 ### Middlewares
 

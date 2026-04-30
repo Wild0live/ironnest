@@ -91,6 +91,17 @@ http:
       service: openclaw
       tls: {}
 
+    # ── Hermes browser terminal (on-demand) ───────────────────────────────────────
+    # ttyd wrapping the NousResearch hermes-agent TUI. Protected by ttyd HTTP
+    # Basic Auth (credentials injected from Infisical). trusted-networks +
+    # strict-rate-limit because this is a privileged interactive terminal.
+    hermes:
+      rule: "Host(`hermes.ironnest.local`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, strict-rate-limit]
+      service: hermes
+      tls: {}
+
   services:
 
     adguard:
@@ -120,6 +131,11 @@ http:
       loadBalancer:
         servers:
           - url: "http://openclaw-gateway:18789"
+
+    hermes:
+      loadBalancer:
+        servers:
+          - url: "http://hermes-ttyd:7682"
 
   serversTransports:
     skip-tls-verify:

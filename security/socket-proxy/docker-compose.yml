@@ -25,6 +25,7 @@ services:
       # Read-only endpoints only. Write endpoints (POST/DELETE) remain disabled (0).
       CONTAINERS: "1"
       EVENTS: "1"
+      LOGS: "1"
       IMAGES: "1"
       INFO: "1"
       NETWORKS: "1"

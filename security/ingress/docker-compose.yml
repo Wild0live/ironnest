@@ -67,7 +67,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.filebeat
-    image: platform/ingress-filebeat:2026.4.25-1
+    image: platform/ingress-filebeat:2026.4.25-2
     container_name: ingress-filebeat
     hostname: ingress-filebeat
     restart: unless-stopped

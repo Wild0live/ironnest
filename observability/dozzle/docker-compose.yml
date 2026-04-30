@@ -29,7 +29,7 @@ services:
       # Read-only mode — UI hides any action that would require write access.
       DOZZLE_MODE: "server"
     ports:
-      - "127.0.0.1:8888:8080"
+      - "8888:8080"
     networks:
       - platform-net
       - ingress

@@ -1,0 +1,226 @@
+# Hermes Agent — NousResearch hermes-agent v2026.4.23 + ttyd browser terminal.
+# On-demand stack: start with ./hermes/start.sh (do not add to bootstrap.sh).
+#
+# Three services:
+#   1. infisical-agent:  authenticates to Infisical, writes secrets-runtime/.env
+#   2. hermes-ttyd:      ttyd wrapping `hermes` TUI (browser-accessible terminal)
+#   3. hermes-gateway:   persistent messaging gateway (Telegram, etc.)
+#
+# Secrets flow:
+#   infisical-agent renders secrets.tmpl → secrets-runtime/.env, which is loaded
+#   by Hermes services via env_file. OPENROUTER_API_KEY, Telegram settings,
+#   and ttyd credentials never appear in static config files or git.
+#
+# All outbound HTTPS (LLM API calls to OpenRouter, etc.) routes through Squid.
+# hermes-ttyd uses the `local` terminal backend — shell commands run inside the
+# container itself; no Docker socket is mounted or needed.
+#
+# Port: 7682 (7681 is openclaw-ttyd)
+
+name: hermes
+
+networks:
+  platform-net:
+    external: true              # DNS (AdGuard 172.30.0.10), Squid proxy, Infisical path
+  platform-egress:
+    external: true              # infisical-agent only: platform-net internal:true drops SYNs
+  # Stack-local bridge: needed ONLY so Docker can publish 127.0.0.1:7682 to host.
+  ingress:
+    driver: bridge
+
+volumes:
+  hermes-data:
+    name: hermes_hermes-data    # Hermes home: config, sessions, memories, skills
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ── Infisical Agent sidecar ──────────────────────────────────────────────────
+  # Authenticates to Infisical, renders secrets.tmpl → secrets-runtime/.env,
+  # then polls every 60 s for rotations. hermes-ttyd waits until healthy.
+  infisical-agent:
+    build: { context: ../openclaw, dockerfile: Dockerfile.infisical-cli }
+    image: platform/infisical-cli:0.43.76-patched
+    container_name: hermes-infisical-agent
+    restart: unless-stopped
+    entrypoint: ["sh", "/agent-config/entrypoint.sh"]
+    env_file: ./.env
+    logging: *default-logging
+    volumes:
+      - ./agent-config:/agent-config:ro
+      - ./secrets-runtime:/secrets
+    tmpfs:
+      - /tmp:size=1m,mode=0700
+    networks:
+      - platform-egress          # Infisical reachable here; platform-net internal:true drops SYNs
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /secrets/.env"]
+      interval: 5s
+      timeout: 3s
+      retries: 24      # up to 2 min for Infisical on first boot
+      start_period: 10s
+
+  # ── Hermes browser terminal (ttyd) ───────────────────────────────────────────
+  # ttyd wraps the `hermes` TUI. Opening the browser terminal starts a fresh
+  # interactive Hermes session; state (memories, sessions, config) persists in
+  # the hermes-data volume across sessions.
+  #
+  # TERMINAL_ENV=local — shell commands run inside this container.
+  # No Docker socket mounted; no access to the host daemon.
+  hermes-ttyd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: platform/hermes-agent:v2026.4.23-patched
+    container_name: hermes-ttyd
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /opt/data/home
+        export TELEGRAM_HOME_CHANNEL="$${TELEGRAM_HOME_CHANNEL:-$${TELEGRAM_ALLOWED_USERS:-}}"
+        export TELEGRAM_HOME_CHANNEL_NAME="$${TELEGRAM_HOME_CHANNEL_NAME:-IronNest Hermes}"
+        touch /opt/data/.profile /opt/data/home/.profile
+        for profile in /opt/data/.profile /opt/data/home/.profile; do
+          if ! grep -Fq '/opt/hermes/.venv/bin' "$$profile"; then
+            printf '\n# IronNest: expose Hermes CLI to ttyd and local tool subprocesses.\nexport PATH="/opt/hermes/.venv/bin:$$PATH"\n' >> "$$profile"
+          fi
+        done
+        /opt/hermes/.venv/bin/hermes dashboard --host 0.0.0.0 --insecure --no-open &
+        if [ -n "$${HERMES_TTYD_USERNAME:-}" ] && [ -n "$${HERMES_TTYD_PASSWORD:-}" ]; then
+          exec ttyd --port=7682 --writable --credential "$${HERMES_TTYD_USERNAME}:$${HERMES_TTYD_PASSWORD}" bash -lc 'cd /opt/data/workspace; echo "Hermes ready. Run: hermes auth add openai-codex --type oauth"; exec bash'
+        else
+          exec ttyd --port=7682 --writable bash -lc 'cd /opt/data/workspace; echo "Hermes ready. Run: hermes auth add openai-codex --type oauth"; exec bash'
+        fi
+    env_file:
+      - path: ./.env
+      - path: ./secrets-runtime/.env
+        required: false           # missing before first agent write is fine
+    environment:
+      HERMES_UID: "10000"
+      HERMES_GID: "10000"
+      # Make the Hermes console script visible to both ttyd shells and Hermes'
+      # own local terminal/tool subprocesses.
+      PATH: "/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      # Use local terminal backend — shell commands run in this container.
+      # Avoids needing the Docker socket for the agent's tool calls.
+      TERMINAL_ENV: "local"
+      # All outbound HTTPS routed through Squid (openrouter.ai allowlisted).
+      HTTPS_PROXY: "http://squid:3128"
+      HTTP_PROXY: "http://squid:3128"
+      NO_PROXY: "infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+      https_proxy: "http://squid:3128"
+      http_proxy: "http://squid:3128"
+      no_proxy: "infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+    logging: *default-logging
+    volumes:
+      - hermes-data:/opt/data
+    ports:
+      - "127.0.0.1:7682:7682"
+      - "127.0.0.1:9119:9119"
+    networks:
+      - platform-net              # Squid access + DNS
+      - ingress                   # host port publishing
+    dns:
+      - 172.30.0.10               # AdGuard
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN      # entrypoint chowns /opt/data on first run
+      - SETUID     # gosu drops from root → hermes user
+      - SETGID     # gosu group remapping
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "curl", "-so", "/dev/null", "http://localhost:7682"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      infisical-agent:
+        condition: service_healthy
+
+  # ── Hermes messaging gateway ───────────────────────────────────────────────
+  # Runs Telegram/other platform adapters as a Compose-managed service so
+  # messaging stays up across ttyd terminal closes and container restarts.
+  hermes-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: platform/hermes-agent:v2026.4.23-patched
+    container_name: hermes-gateway
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - |
+        export TELEGRAM_HOME_CHANNEL="$${TELEGRAM_HOME_CHANNEL:-$${TELEGRAM_ALLOWED_USERS:-}}"
+        export TELEGRAM_HOME_CHANNEL_NAME="$${TELEGRAM_HOME_CHANNEL_NAME:-IronNest Hermes}"
+        exec hermes gateway run
+    env_file:
+      - path: ./.env
+      - path: ./secrets-runtime/.env
+        required: false
+    environment:
+      HERMES_UID: "10000"
+      HERMES_GID: "10000"
+      PATH: "/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      TERMINAL_ENV: "local"
+      HTTPS_PROXY: "http://squid:3128"
+      HTTP_PROXY: "http://squid:3128"
+      NO_PROXY: "infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+      https_proxy: "http://squid:3128"
+      http_proxy: "http://squid:3128"
+      no_proxy: "infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+    logging: *default-logging
+    volumes:
+      - hermes-data:/opt/data
+    networks:
+      - platform-net
+    dns:
+      - 172.30.0.10
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      infisical-agent:
+        condition: service_healthy

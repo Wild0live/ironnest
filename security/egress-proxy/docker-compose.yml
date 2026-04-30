@@ -1,4 +1,4 @@
-# Squid HTTP/HTTPS forward proxy with hostname allowlists.
+# Squid HTTP/HTTPS forward proxy — allow by default, blocklist-based blocking.
 # Only HTTP-speaking services should point at this (OpenClaw, Trivy, Wazuh HTTP updaters).
 # Raw-TCP outbound (SMTP, some feeds) goes via platform-egress directly.
 
@@ -13,6 +13,7 @@ networks:
 volumes:
   squid-cache:
   squid-logs:
+  squid-blocklists:
 
 x-logging: &default-logging
   driver: json-file
@@ -31,6 +32,7 @@ services:
       - ./squid.conf:/etc/squid/squid.conf:ro
       - squid-cache:/var/spool/squid
       - squid-logs:/var/log/squid
+      - squid-blocklists:/etc/squid/blocklists
     networks:
       - platform-net         # clients connect here
       - platform-egress      # proxy's own outbound
@@ -58,3 +60,23 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  blocklist-updater:
+    build: { context: ./blocklist-updater, dockerfile: Dockerfile }
+    image: platform/blocklist-updater:1.0
+    container_name: blocklist-updater
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - squid-blocklists:/blocklists
+    networks:
+      - platform-egress       # outbound only — not on platform-net
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 64M
