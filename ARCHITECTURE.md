@@ -2,7 +2,7 @@
 
 ## Overview
 
-**IronNest** is a security-hardened, modular 19-container platform running on Rancher Desktop (WSL2/Windows 11). It hosts AI application workloads (OpenClaw and Hermes Agent) surrounded by a layered security perimeter: ingress proxy, secrets management, DNS filtering, HTTP egress control, SIEM monitoring, image scanning, and observability — each in its own isolated Compose project.
+**IronNest** is a security-hardened, modular 20-container platform running on Rancher Desktop (WSL2/Windows 11). It hosts AI application workloads (OpenClaw and Hermes Agent) surrounded by a layered security perimeter: ingress proxy, secrets management, DNS filtering, HTTP egress control, SIEM monitoring, image scanning, and observability — each in its own isolated Compose project.
 
 **Platform root:** `D:\claude-workspace\platform\`  
 **Docker storage:** `F:\wsl\rancher-desktop-data\ext4.vhdx`  
@@ -45,7 +45,7 @@ Per-stack `.env` files hold credentials. All `.env` files are gitignored; only `
 `bootstrap.sh` brings stacks up in hard-wired dependency order so every service finds its upstream already healthy:
 
 ```
-socket-proxy → adguard → egress-proxy → secrets → dozzle → wazuh → trivy → ingress → openclaw
+socket-proxy → adguard → egress-proxy → secrets → dozzle → wazuh → trivy → ingress → monitoring → openclaw
 ```
 
 OpenClaw is last because it depends on DNS (AdGuard), HTTP proxy (Squid), and optionally Infisical — all of which must be ready first.
@@ -81,12 +81,12 @@ Every service has explicit `cpus` and `memory` limits. This prevents a runaway c
 
 ## Container Profile
 
-All 19 containers across 10 stacks, as reported by `docker ps` when OpenClaw and Hermes are both running.
+All 20 containers across 11 stacks, as reported by `docker ps` when OpenClaw and Hermes are both running.
 
 | Container | Role | Stack | Image | Host Port |
 |-----------|------|-------|-------|-----------|
 | `traefik` | Reverse proxy / ingress | ingress | `traefik:v3.3.4` | `0.0.0.0:80/443`, `127.0.0.1:8880` |
-| `ingress-filebeat` | Ships Traefik access logs → Wazuh | ingress | `platform/ingress-filebeat:2026.4.25-1` | — |
+| `monitoring-fluent-bit` | Ships all container logs → Wazuh | monitoring | `platform/monitoring-fluent-bit:3.2` | — |
 | `openclaw-gateway` | AI app workload | openclaw | `platform/openclaw:2026.4.22-1-codex` | `127.0.0.1:18789` |
 | `openclaw-ttyd` | Browser terminal sidecar | openclaw | `platform/openclaw:2026.4.22-1-codex` | `127.0.0.1:7681` |
 | `openclaw-infisical-agent` | Secrets sidecar | openclaw | `platform/infisical-cli:0.43.76-patched` | — |
@@ -117,7 +117,7 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 | Image (compose / built tag) | Dockerfile `FROM` pin | Upstream version | Pin method |
 |---|---|---|---|
 | `traefik:v3.3.4` | — (used directly) | v3.3.4 | Semver tag |
-| `platform/ingress-filebeat:2026.4.25-1` | `elastic/filebeat:8.17.4` | 8.17.4 | Semver tag |
+| `platform/monitoring-fluent-bit:3.2` | `fluent/fluent-bit:3.2-debug` | 3.2 | Semver tag |
 | `ghcr.io/openclaw/openclaw:2026.4.22-1-amd64` | — (external, set via `$OPENCLAW_IMAGE`) | 2026.4.22-1 | Calendar semver |
 | `platform/hermes-agent:v2026.4.23-patched` | `debian:13.4` + `NousResearch/hermes-agent` tag `v2026.4.23` | v2026.4.23 | Semver tag + helper digests |
 | `platform/infisical-cli:0.43.76-patched` | `infisical/cli@sha256:dba406b3…` | 0.43.76 (binary) | Digest |
@@ -196,7 +196,7 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 
 ### Stack-private networks (not shown above)
 - `secrets-internal` — Postgres + Redis reachable only by Infisical
-- `wazuh-internal` — manager + indexer + dashboard mesh; also joined by `ingress-filebeat` to reach `wazuh.indexer:9200`
+- `wazuh-internal` — manager + indexer + dashboard mesh; also joined by `monitoring-fluent-bit` to reach `wazuh.indexer:9200`
 - `traefik_ingress` — internet-capable bridge for Traefik port publishing (`:80`/`:443`)
 - `ingress` bridges on OpenClaw, Dozzle, Wazuh — used only for localhost port publishing
 - `openclaw_ingress` — non-internal because Windows port publishing requires it; direct outbound NEW connections from its Linux bridge are logged and dropped by `ops/fix-openclaw-egress.sh`
@@ -209,7 +209,7 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 | Service | CPUs | Memory |
 |---------|------|--------|
 | Traefik | 0.5 | 128 MB |
-| ingress-filebeat | 0.25 | 128 MB |
+| monitoring-fluent-bit | 0.5 | 128 MB |
 | Postgres | 1.0 | 512 MB |
 | Redis | 0.5 | 256 MB |
 | Infisical | 2.0 | 1 GB |
@@ -235,8 +235,8 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 |----------|----------|-----------|
 | Browser / internet | Traefik | HTTPS `:443`; HTTP `:80` → redirect |
 | Traefik | Backend services | HTTP/HTTPS on platform-net by container hostname |
-| ingress-filebeat | Traefik | Docker stdout log files (`/var/lib/docker/containers/*/*.log`) |
-| ingress-filebeat | wazuh.indexer | HTTPS `wazuh.indexer:9200` on `wazuh-internal`; basic auth + root-ca.pem |
+| monitoring-fluent-bit | All containers | Docker JSON log files (`/var/lib/docker/containers/*/*.log`) |
+| monitoring-fluent-bit | wazuh.indexer | HTTPS `wazuh.indexer:9200` on `wazuh-internal`; basic auth + root-ca.pem; index `ironnest-containers-YYYY.MM.DD` |
 | Dozzle | socket-proxy | `DOCKER_HOST=tcp://socket-proxy:2375` |
 | Wazuh manager | socket-proxy | `DOCKER_HOST=tcp://socket-proxy:2375` |
 | Trivy scanner | socket-proxy | `DOCKER_HOST=tcp://socket-proxy:2375` |
@@ -495,17 +495,18 @@ docker exec openclaw-gateway curl --noproxy "*" -m 5 -sf https://example.com -o 
 
 ```
 security/ingress/
-├── docker-compose.yml       # traefik + ingress-filebeat
+├── docker-compose.yml       # traefik only (log shipping moved to monitoring/)
 ├── traefik.yml              # static config (entrypoints, access log, ping)
 ├── conf/
 │   ├── routers.yml          # dynamic routing + middleware (hot-watched)
 │   └── tls.yml              # TLS cert binding + cipher config
-├── filebeat/
-│   ├── filebeat.yml         # reads Docker stdout logs → wazuh.indexer
-│   └── root-ca.pem          # Wazuh CA baked into image at build time
-├── Dockerfile.filebeat      # bakes filebeat.yml + root-ca.pem into image
-├── generate-certs.sh        # one-time self-signed cert generator
-└── .env.example             # WAZUH_INDEXER_PASSWORD (copy wazuh/.env value)
+└── generate-certs.sh        # one-time self-signed cert generator
+
+monitoring/
+├── docker-compose.yml       # monitoring-fluent-bit
+├── Dockerfile.fluent-bit    # bakes fluent-bit.conf + root-ca.pem into image
+├── fluent-bit.conf          # reads all container logs → wazuh.indexer:9200
+└── root-ca.pem              # copy from security/wazuh/.../root-ca.pem before build
 ```
 
 ### Routing Rules
@@ -535,10 +536,11 @@ To add a remote IP (VPN, static home IP) to `trusted-networks`, append to `sourc
 
 Traefik writes JSON access logs to **stdout**. This means:
 - **Dozzle** (`127.0.0.1:8888`) shows live traffic by selecting the `traefik` container
-- **ingress-filebeat** reads from Docker's captured stdout (`/var/lib/docker/containers/*/*.log`), filters to the `traefik` container, and ships to `wazuh.indexer:9200`
-- Wazuh indexes traffic under `traefik-access-YYYY.MM.DD` — create index pattern `traefik-access-*` in Stack Management to query it
+- **monitoring-fluent-bit** reads all container stdout logs from `/var/lib/docker/containers/*/*.log` and ships to `wazuh.indexer:9200` under index `ironnest-containers-YYYY.MM.DD` — create index pattern `ironnest-containers-*` in Wazuh Stack Management to query them; filter by `container_name: traefik` for ingress traffic
 
 Key access log fields: `ClientAddr`, `RequestMethod`, `RequestPath`, `RouterName`, `DownstreamStatus`, `Duration`.
+
+> **Why Fluent Bit instead of Filebeat?** Filebeat's OpenSearch output plugin probes `/_license` on startup. OpenSearch (used by Wazuh) rejects this with a 403, causing Filebeat to fail authentication and stop shipping logs. Fluent Bit's `opensearch` output plugin speaks OpenSearch's native API without the license probe — no authentication errors at startup.
 
 ### TLS
 
@@ -566,7 +568,7 @@ Produced by `ops/backup.sh`, stored at `G:\rancher-stack-backups\<YYYY-MM-DD_HHM
 | `adguard-conf.tar.gz` | AdGuard configuration volume |
 | `wazuh-etc.tar.gz` | Wazuh manager `/etc/wazuh` |
 | `wazuh-logs.tar.gz` | Wazuh manager logs |
-| `wazuh-filebeat-etc.tar.gz` | Filebeat config |
+| `wazuh-filebeat-etc.tar.gz` | Wazuh internal Filebeat config (inside Wazuh manager) |
 | `wazuh-indexer-data.tar.gz` | OpenSearch index data |
 | `wazuh-dashboard-config.tar.gz` | Dashboard configuration |
 | `platform-config.tar.gz` | All `.env` files, Wazuh TLS certs, compose files, ops scripts |

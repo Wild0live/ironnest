@@ -37,6 +37,7 @@ STACKS=(
   "security/wazuh"
   "security/trivy"
   "security/ingress"
+  "monitoring"
 )
 
 for stack in "${STACKS[@]}"; do

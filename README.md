@@ -142,9 +142,10 @@ IronNest runs 18 containers in always-on mode. Wazuh's OpenSearch indexer is the
 | Wazuh (manager + indexer + dashboard) | 3 | 5.0 GB |
 | OpenClaw gateway + ttyd + Infisical agent | 3 | 5.1 GB |
 | Infisical + Postgres + Redis | 3 | 1.8 GB |
-| Traefik + Filebeat | 2 | 0.3 GB |
+| Traefik | 1 | 0.13 GB |
+| Monitoring (Fluent Bit) | 1 | 0.13 GB |
 | Trivy, Squid + blocklist-updater, AdGuard, Dozzle, socket-proxy | 7 | 1.3 GB |
-| **Always-on total** | **18** | **~13.5 GB** |
+| **Always-on total** | **15** | **~13.5 GB** |
 | Hermes Agent (ttyd + gateway + Infisical agent) | 3 | 2.5 GB |
 | **All running total** | **21** | **~16 GB** |
 
@@ -170,6 +171,7 @@ IronNest runs 18 containers in always-on mode. Wazuh's OpenSearch indexer is the
 | Ingress | `security/ingress/` | bootstrap | Traefik reverse proxy — TLS termination, single internet entry point | `127.0.0.1:8880` (dashboard) |
 | Secrets manager | `secrets/` | bootstrap | Infisical + Postgres + Redis | `127.0.0.1:18090` |
 | Log viewer | `observability/dozzle/` | bootstrap | Real-time container log viewer | `127.0.0.1:8888` |
+| Log shipping | `monitoring/` | bootstrap | Fluent Bit — ships all container logs → Wazuh OpenSearch | — |
 | AI workload | `openclaw/` | on-demand | OpenClaw gateway + ttyd browser terminal | `127.0.0.1:18789`, `127.0.0.1:7681` |
 | Hermes Agent | `hermes/` | on-demand | Hermes Agent TUI + Telegram gateway | `127.0.0.1:7682` |
 

@@ -1,0 +1,61 @@
+name: monitoring
+
+# Platform-wide container log collection.
+# Ships stdout/stderr from all containers to Wazuh OpenSearch under
+# index ironnest-containers-YYYY.MM.DD, queryable by container_name field.
+#
+# Uses Fluent Bit (not Filebeat) — Fluent Bit's opensearch output plugin
+# speaks OpenSearch natively without the /_license probe that Filebeat requires.
+#
+# Prerequisite: copy root-ca.pem before first build:
+#   cp ../security/wazuh/config/wazuh_indexer_ssl_certs/root-ca.pem root-ca.pem
+
+networks:
+  platform-net:
+    external: true
+  wazuh-internal:
+    external: true
+    name: wazuh_wazuh-internal   # created by security/wazuh stack
+
+volumes:
+  fluent-bit-db:                 # SQLite position database (tracks read offset per file)
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ── Fluent Bit — ships all container logs to Wazuh indexer ──────────────────
+  monitoring-fluent-bit:
+    build:
+      context: .
+      dockerfile: Dockerfile.fluent-bit
+    image: platform/monitoring-fluent-bit:3.2
+    container_name: monitoring-fluent-bit
+    hostname: monitoring-fluent-bit
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - fluent-bit-db:/var/lib/fluent-bit
+    environment:
+      WAZUH_INDEXER_PASSWORD: "${WAZUH_INDEXER_PASSWORD}"
+    networks:
+      - platform-net       # DNS via AdGuard
+      - wazuh-internal     # reach wazuh.indexer:9200
+    dns:
+      - 172.30.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:2020/api/v1/health | grep -q 'fluent-bit'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M

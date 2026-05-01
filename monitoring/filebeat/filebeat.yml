@@ -1,0 +1,50 @@
+# Filebeat — ships all IronNest container logs to the Wazuh indexer (OpenSearch).
+# Reads from Docker's container log files so all stacks are covered without
+# needing a sidecar in each stack.
+#
+# Traefik is excluded — ingress-filebeat already ships it to traefik-access-*.
+# Logs land in index ironnest-containers-YYYY.MM.DD.
+# Create an index pattern ironnest-containers-* in the Wazuh/OpenSearch dashboard
+# to query them (Stack Management → Index Patterns).
+
+filebeat.inputs:
+  - type: container
+    id: all-containers
+    enabled: true
+    paths:
+      - /var/lib/docker/containers/*/*.log
+    stream: stdout
+    processors:
+      - drop_event:
+          when:
+            equals:
+              container.name: "traefik"   # ingress-filebeat already ships this
+
+processors:
+  - add_fields:
+      target: ""
+      fields:
+        platform: ironnest
+
+output.elasticsearch:
+  hosts: ["https://wazuh.indexer:9200"]
+  username: "admin"
+  password: "${WAZUH_INDEXER_PASSWORD}"
+  ssl:
+    certificate_authorities: ["/certs/root-ca.pem"]
+    verification_mode: certificate
+  index: "ironnest-containers-%{+yyyy.MM.dd}"
+  allow_older_versions: true
+
+setup.ilm.enabled: false
+setup.template.enabled: true
+setup.template.name: "ironnest-containers"
+setup.template.pattern: "ironnest-containers-*"
+setup.template.overwrite: false
+
+http.enabled: true
+http.host: "127.0.0.1"
+http.port: 5066
+
+logging.level: info
+logging.to_files: false

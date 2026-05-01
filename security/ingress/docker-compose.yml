@@ -6,16 +6,13 @@ name: ingress
 # Dashboard at 127.0.0.1:8880 (localhost only).
 #
 # Run ./generate-certs.sh once before first `docker compose up -d`.
-# Copy .env.example → .env and fill in WAZUH_INDEXER_PASSWORD.
+# Container logs are collected by the monitoring stack (monitoring-fluent-bit).
 
 networks:
   traefik_ingress:
     driver: bridge              # internet-capable, port publishing
   platform-net:
     external: true              # reach backend services + AdGuard DNS
-  wazuh-internal:
-    external: true
-    name: wazuh_wazuh-internal  # filebeat → wazuh.indexer:9200
 
 volumes:
   traefik-certs:                # TLS cert + key (populated by generate-certs.sh)
@@ -60,39 +57,4 @@ services:
       resources:
         limits:
           cpus: "0.5"
-          memory: 128M
-
-  # ── Filebeat — ships Traefik access logs to Wazuh indexer ───────────────────
-  ingress-filebeat:
-    build:
-      context: .
-      dockerfile: Dockerfile.filebeat
-    image: platform/ingress-filebeat:2026.4.25-2
-    container_name: ingress-filebeat
-    hostname: ingress-filebeat
-    restart: unless-stopped
-    logging: *default-logging
-    user: root
-    volumes:
-      - /var/lib/docker/containers:/var/lib/docker/containers:ro
-    environment:
-      WAZUH_INDEXER_PASSWORD: "${WAZUH_INDEXER_PASSWORD}"
-    networks:
-      - platform-net              # DNS resolution
-      - wazuh-internal            # reach wazuh.indexer:9200
-    dns:
-      - 172.30.0.10
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:5066/ | grep -q '\"beat\"'"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
-    depends_on:
-      traefik:
-        condition: service_healthy
-    deploy:
-      resources:
-        limits:
-          cpus: "0.25"
           memory: 128M
