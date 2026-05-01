@@ -76,12 +76,13 @@ Every service has explicit `cpus` and `memory` limits. This prevents a runaway c
 | ingress | `security/ingress/` | always-on | 127.0.0.1:8880 (dashboard) |
 | openclaw | `openclaw/` | on-demand | 127.0.0.1:18789, 127.0.0.1:7681 (ttyd) |
 | hermes | `hermes/` | on-demand | 127.0.0.1:7682 (ttyd) |
+| browser-intent | `browser-intent/` | on-demand | 127.0.0.1:18901 |
 
 ---
 
 ## Container Profile
 
-All 20 containers across 11 stacks, as reported by `docker ps` when OpenClaw and Hermes are both running.
+All 20 base containers across 11 stacks, plus the optional Browser Intent stack. Shown as reported by `docker ps` when all stacks are running.
 
 | Container | Role | Stack | Image | Host Port |
 |-----------|------|-------|-------|-----------|
@@ -90,6 +91,9 @@ All 20 containers across 11 stacks, as reported by `docker ps` when OpenClaw and
 | `openclaw-gateway` | AI app workload | openclaw | `platform/openclaw:2026.4.22-1-codex` | `127.0.0.1:18789` |
 | `openclaw-ttyd` | Browser terminal sidecar | openclaw | `platform/openclaw:2026.4.22-1-codex` | `127.0.0.1:7681` |
 | `openclaw-infisical-agent` | Secrets sidecar | openclaw | `platform/infisical-cli:0.43.76-patched` | — |
+| `browser-intent-mcp` | Intent-level MCP facade | browser-intent | `platform/browser-intent-mcp:0.1.0` | `127.0.0.1:18901` |
+| `browser-intent-worker` | Playwright browser worker | browser-intent | `platform/browser-intent-worker:0.1.0` | — |
+| `browser-intent-infisical-agent` | Secrets sidecar | browser-intent | `platform/infisical-cli:0.43.76-patched` | — |
 | `hermes-ttyd` | Hermes Agent browser terminal | hermes | `platform/hermes-agent:v2026.4.23-patched` | `127.0.0.1:7682` |
 | `hermes-gateway` | Hermes messaging gateway (Telegram, etc.) | hermes | `platform/hermes-agent:v2026.4.23-patched` | — |
 | `hermes-infisical-agent` | Hermes secrets sidecar | hermes | `platform/infisical-cli:0.43.76-patched` | — |
@@ -218,6 +222,9 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 | hermes-ttyd | 2.0 | 2 GB |
 | hermes-gateway | 0.50 | 512 MB |
 | hermes-infisical-agent | 0.25 | 64 MB |
+| Browser Intent MCP | 0.5 | 256 MB |
+| Browser Intent worker | 2.0 | 2 GB |
+| Browser Intent Infisical agent | 0.25 | 64 MB |
 | AdGuard | 0.5 | 256 MB |
 | socket-proxy | 0.25 | 64 MB |
 | Squid | 0.5 | 256 MB |
@@ -257,6 +264,10 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 | hermes-ttyd (`openai-codex` provider) | chatgpt.com/backend-api/codex + auth.openai.com | HTTPS via Squid — ChatGPT OAuth tokens stored in `hermes-data` |
 | hermes-gateway | Telegram Bot API | HTTPS via Squid — `TELEGRAM_*` values injected from Infisical runtime env, not `/opt/data/.env` |
 | hermes-ttyd direct internet bypass | Docker `DOCKER-USER` firewall | NEW outbound traffic from `hermes_ingress` is logged with prefix `IRONNEST_HERMES_EGRESS_DROP`, then dropped by `ops/fix-hermes-egress.sh` |
+| openclaw-gateway | browser-intent-mcp | Internal MCP/HTTP on `platform-net`; browser-intent also publishes `127.0.0.1:18901` for host-only access |
+| browser-intent-mcp | browser-intent-worker | Internal HTTP on `platform-net`; exposes only named login/session/logout tools |
+| browser-intent-worker | allowlisted portals | Static source IP `172.30.0.30`; HTTPS via Squid plus in-browser domain enforcement; no screenshots, DOM dumps, cookies, or post-login data returned |
+| browser-intent-infisical-agent | Infisical | Universal Auth sidecar renders site credentials into `browser-intent/secrets-runtime/.env` |
 
 ---
 
@@ -270,8 +281,34 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 | Trivy | `ghcr.io`, `.githubusercontent.com`, `aquasecurity.github.io`, `.aquasec.com`, `mirror.gcr.io`, `storage.googleapis.com`, `*.docker.io`, `production.cloudflare.docker.com` |
 | AdGuard | `.quad9.net`, `.cloudflare-dns.com`, `dns.google` |
 | Telegram (optional) | `.telegram.org` |
+| Browser Intent | `.colfinancial.com`, `.maxihealth.com.ph`, `.april.fr`, `.hi-precision.com.ph` |
 
 All other destinations: **denied**.
+
+---
+
+## Browser Intent MCP
+
+`browser-intent/` adds a separate, on-demand browser automation stack for high-risk sites such as financial, insurance, and medical portals. It follows the same IronNest pattern as OpenClaw: localhost-only ingress, Infisical sidecar secret injection, AdGuard DNS, Squid egress allowlisting, dropped Linux capabilities, `no-new-privileges`, and container-level separation by trust boundary.
+
+The AI-facing surface is `browser-intent-mcp`, not the browser worker. It exposes named intent tools only:
+
+```
+login_col_financial
+login_maxicare
+login_april_international
+login_hi_precision
+check_site_session
+logout_site
+list_browser_intent_sites
+```
+
+The worker performs deterministic Playwright flows using `browser-intent/policies/sites.json`. It is intentionally not exposed as an MCP server and does not return secrets, cookies, screenshots, raw HTML, DOM snapshots, arbitrary page text, or post-login sensitive data. Medical and financial extraction should be added only as separate gated tools.
+
+**Startup:**
+```bash
+bash browser-intent/start.sh
+```
 
 ---
 

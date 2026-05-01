@@ -1,0 +1,131 @@
+name: browser-intent
+
+networks:
+  platform-net:
+    external: true
+  platform-egress:
+    external: true
+  browser-internal:
+    driver: bridge
+    internal: true
+  ingress:
+    driver: bridge
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  infisical-agent:
+    image: platform/infisical-cli:0.43.76-patched
+    container_name: browser-intent-infisical-agent
+    restart: unless-stopped
+    entrypoint: ["sh", "/agent-config/entrypoint.sh"]
+    env_file: ./.env
+    logging: *default-logging
+    volumes:
+      - ./agent-config:/agent-config:ro
+      - ./secrets-runtime:/secrets
+    tmpfs:
+      - /tmp:size=1m,mode=0700
+    networks:
+      - platform-egress
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /secrets/.env"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 10s
+
+  worker:
+    build: { context: ., dockerfile: Dockerfile.worker }
+    image: platform/browser-intent-worker:0.1.0
+    container_name: browser-intent-worker
+    restart: unless-stopped
+    env_file:
+      - path: ./secrets-runtime/.env
+        required: false
+    logging: *default-logging
+    environment:
+      NODE_ENV: production
+      BROWSER_INTENT_POLICY_PATH: /app/policies/sites.json
+      HTTP_PROXY: "http://squid:3128"
+      HTTPS_PROXY: "http://squid:3128"
+      NO_PROXY: "mcp,worker,infisical,adguard,squid,localhost,127.0.0.1,.local"
+      http_proxy: "http://squid:3128"
+      https_proxy: "http://squid:3128"
+      no_proxy: "mcp,worker,infisical,adguard,squid,localhost,127.0.0.1,.local"
+    volumes:
+      - ./policies:/app/policies:ro
+    networks:
+      browser-internal:
+      platform-net:
+        ipv4_address: 172.30.0.30
+    dns:
+      - 172.30.0.10
+    depends_on:
+      infisical-agent:
+        condition: service_healthy
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:18902/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  mcp:
+    build: { context: ., dockerfile: Dockerfile.mcp }
+    image: platform/browser-intent-mcp:0.1.0
+    container_name: browser-intent-mcp
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      NODE_ENV: production
+      BROWSER_INTENT_POLICY_PATH: /app/policies/sites.json
+      BROWSER_WORKER_URL: http://browser-intent-worker:18902
+      BROWSER_INTENT_HTTP_PORT: "18901"
+    volumes:
+      - ./policies:/app/policies:ro
+    ports:
+      - "127.0.0.1:18901:18901"
+    networks:
+      ingress:
+      platform-net:
+    depends_on:
+      worker:
+        condition: service_healthy
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:18901/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

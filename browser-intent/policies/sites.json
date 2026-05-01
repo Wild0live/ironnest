@@ -1,0 +1,70 @@
+{
+  "sites": {
+    "col_financial": {
+      "displayName": "COL Financial",
+      "riskLevel": "financial",
+      "loginUrl": "https://www.colfinancial.com/",
+      "allowedDomains": ["colfinancial.com", "*.colfinancial.com"],
+      "secretPrefix": "COL_FINANCIAL",
+      "secretPath": "/sites/col-financial",
+      "allowedTools": ["login", "check_session", "logout"],
+      "loginSelectors": {
+        "username": ["input[name='txtUser1']"],
+        "username2": ["input[name='txtUser2']"],
+        "password": ["input[name='txtPassword']"],
+        "totp": ["input[name*='otp' i]", "input[name*='code' i]", "input[autocomplete='one-time-code']"],
+        "submit": ["input[type='button'][value='LOG IN']", "input[name='cmdLogOn']", "input[type='button']"]
+      },
+      "loggedInUrlPatterns": ["/ape/Final2/", "/ape/"],
+      "loggedInSignals": ["logout", "portfolio", "watchlist"]
+    },
+    "maxicare": {
+      "displayName": "Maxicare",
+      "riskLevel": "medical",
+      "loginUrl": "https://usqp.maxihealth.com.ph/member",
+      "allowedDomains": ["usqp.maxihealth.com.ph", "*.maxihealth.com.ph"],
+      "secretPrefix": "MAXICARE",
+      "secretPath": "/sites/maxicare",
+      "allowedTools": ["login", "check_session", "logout"],
+      "loginSelectors": {
+        "username": ["input[name='username']", "input[name='email']", "input[type='email']", "input[type='text']"],
+        "password": ["input[name='password']", "input[type='password']"],
+        "totp": ["input[name*='otp' i]", "input[name*='code' i]", "input[autocomplete='one-time-code']"],
+        "submit": ["button[type='submit']", "input[type='submit']"]
+      },
+      "loggedInSignals": ["logout", "member"]
+    },
+    "april_international": {
+      "displayName": "April International",
+      "riskLevel": "insurance",
+      "loginUrl": "https://am-gateway.april.fr/",
+      "allowedDomains": ["am-gateway.april.fr", "*.april.fr"],
+      "secretPrefix": "APRIL_INTERNATIONAL",
+      "secretPath": "/sites/april-international",
+      "allowedTools": ["login", "check_session", "logout"],
+      "loginSelectors": {
+        "username": ["input[name='username']", "input[name='email']", "input[type='email']", "input[type='text']"],
+        "password": ["input[name='password']", "input[type='password']"],
+        "totp": ["input[name*='otp' i]", "input[name*='code' i]", "input[autocomplete='one-time-code']"],
+        "submit": ["button[type='submit']", "input[type='submit']"]
+      },
+      "loggedInSignals": ["logout", "sign out", "dashboard"]
+    },
+    "hi_precision": {
+      "displayName": "Hi-Precision",
+      "riskLevel": "medical",
+      "loginUrl": "https://portal.hi-precision.com.ph/",
+      "allowedDomains": ["portal.hi-precision.com.ph", "*.hi-precision.com.ph"],
+      "secretPrefix": "HI_PRECISION",
+      "secretPath": "/sites/hi-precision",
+      "allowedTools": ["login", "check_session", "logout"],
+      "loginSelectors": {
+        "username": ["input[name='username']", "input[name='email']", "input[type='email']", "input[type='text']"],
+        "password": ["input[name='password']", "input[type='password']"],
+        "totp": ["input[name*='otp' i]", "input[name*='code' i]", "input[autocomplete='one-time-code']"],
+        "submit": ["button[type='submit']", "input[type='submit']"]
+      },
+      "loggedInSignals": ["logout", "sign out", "patient", "results"]
+    }
+  }
+}

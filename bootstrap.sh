@@ -61,4 +61,5 @@ done
 echo
 echo "=== bootstrap complete ==="
 echo "OpenClaw is on-demand — start it with: ./openclaw/start.sh"
+echo "Browser Intent is on-demand — start it with: ./browser-intent/start.sh"
 echo "Status across all stacks: ./ops/status.sh"

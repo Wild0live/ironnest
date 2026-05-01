@@ -147,7 +147,8 @@ IronNest runs 18 containers in always-on mode. Wazuh's OpenSearch indexer is the
 | Trivy, Squid + blocklist-updater, AdGuard, Dozzle, socket-proxy | 7 | 1.3 GB |
 | **Always-on total** | **15** | **~13.5 GB** |
 | Hermes Agent (ttyd + gateway + Infisical agent) | 3 | 2.5 GB |
-| **All running total** | **21** | **~16 GB** |
+| Browser Intent MCP + worker + Infisical agent (optional) | 3 | 2.3 GB |
+| **All running total** | **24** | **~18.3 GB** |
 
 > Windows itself plus WSL2 overhead adds ~2–4 GB on top. On a 16 GB machine, if you experience memory pressure, reduce Wazuh's indexer heap: add `OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx1g` to `security/wazuh/.env`.
 
@@ -174,6 +175,7 @@ IronNest runs 18 containers in always-on mode. Wazuh's OpenSearch indexer is the
 | Log shipping | `monitoring/` | bootstrap | Fluent Bit — ships all container logs → Wazuh OpenSearch | — |
 | AI workload | `openclaw/` | on-demand | OpenClaw gateway + ttyd browser terminal | `127.0.0.1:18789`, `127.0.0.1:7681` |
 | Hermes Agent | `hermes/` | on-demand | Hermes Agent TUI + Telegram gateway | `127.0.0.1:7682` |
+| Browser Intent | `browser-intent/` | on-demand | Local MCP facade for allowlisted browser login intents | `127.0.0.1:18901` |
 
 ---
 

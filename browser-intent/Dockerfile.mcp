@@ -1,0 +1,9 @@
+FROM node:24.14.0-bookworm
+
+WORKDIR /app
+COPY mcp-server/ /app/
+
+USER node
+EXPOSE 18901
+CMD ["node", "server.js"]
+

@@ -1,0 +1,10 @@
+FROM mcr.microsoft.com/playwright:v1.56.1-noble
+
+WORKDIR /app
+COPY worker/package.json /app/package.json
+RUN npm install --omit=dev --no-audit --no-fund
+COPY worker/ /app/
+
+USER pwuser
+EXPOSE 18902
+CMD ["node", "worker.js"]
