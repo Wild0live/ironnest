@@ -29,6 +29,12 @@ services:
     image: adguard/adguardhome:v0.107.74
     container_name: adguard
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     logging: *default-logging
     ports:
       - "127.0.0.1:3000:80"        # admin UI — localhost only

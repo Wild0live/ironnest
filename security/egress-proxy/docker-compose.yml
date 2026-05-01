@@ -27,7 +27,12 @@ services:
     image: platform/squid:6.13-patched
     container_name: egress-proxy
     restart: unless-stopped
-    logging: *default-logging
+    logging:
+      driver: syslog
+      options:
+        syslog-address: "udp://wazuh.manager:5140"
+        syslog-format: "rfc3164"
+        tag: "egress-proxy"
     volumes:
       - ./squid.conf:/etc/squid/squid.conf:ro
       - squid-cache:/var/spool/squid

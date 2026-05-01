@@ -33,7 +33,12 @@ services:
     container_name: traefik
     hostname: traefik
     restart: unless-stopped
-    logging: *default-logging
+    logging:
+      driver: syslog
+      options:
+        syslog-address: "udp://wazuh.manager:5140"
+        syslog-format: "rfc3164"
+        tag: "traefik"
     ports:
       - "0.0.0.0:80:80"           # HTTP → redirect to HTTPS
       - "0.0.0.0:443:443"         # HTTPS ingress
