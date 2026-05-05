@@ -12,6 +12,7 @@ ARG HERMES_TAG=v2026.4.23
 # ── Pinned upstream helpers (same digests as official hermes Dockerfile) ──────
 FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df22866bd7857e5d304b67a564f4feab6ac22044dde719b AS uv_source
 FROM tianon/gosu:1.19-trixie@sha256:3b176695959c71e123eb390d427efc665eeb561b1540e82679c15e992006b8b9 AS gosu_source
+FROM infisical/cli@sha256:dba406b35e5819632412c561bfa46e6185e04c6d76175dc82bf97c4ff53745d7 AS infisical_source
 
 FROM debian:13.4
 
@@ -66,6 +67,11 @@ RUN useradd -u 10000 -m -d /opt/data hermes
 
 COPY --chmod=0755 --from=gosu_source /gosu /usr/local/bin/
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+COPY --chmod=0755 --from=infisical_source /bin/infisical /usr/local/bin/infisical
+
+# IronNest secrets pattern: `infisical run` fetches secrets from the local
+# Infisical at process start and injects them as env vars — never on disk.
+COPY --chmod=0755 with-infisical.sh /usr/local/bin/with-infisical
 
 # ── Clone hermes-agent source at pinned tag ───────────────────────────────────
 ARG HERMES_TAG=v2026.4.23

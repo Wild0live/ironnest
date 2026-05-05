@@ -1,15 +1,16 @@
 # Hermes Agent — NousResearch hermes-agent v2026.4.23 + ttyd browser terminal.
 # On-demand stack: start with ./hermes/start.sh (do not add to bootstrap.sh).
 #
-# Three services:
-#   1. infisical-agent:  authenticates to Infisical, writes secrets-runtime/.env
-#   2. hermes-ttyd:      ttyd wrapping `hermes` TUI (browser-accessible terminal)
-#   3. hermes-gateway:   persistent messaging gateway (Telegram, etc.)
+# Two services:
+#   1. hermes-ttyd:      ttyd wrapping `hermes` TUI (browser-accessible terminal)
+#   2. hermes-gateway:   persistent messaging gateway (Telegram, etc.)
 #
-# Secrets flow:
-#   infisical-agent renders secrets.tmpl → secrets-runtime/.env, which is loaded
-#   by Hermes services via env_file. OPENROUTER_API_KEY, Telegram settings,
-#   and ttyd credentials never appear in static config files or git.
+# Secrets flow (option 3 — process-memory only):
+#   Each service starts via /usr/local/bin/with-infisical, which logs in to the
+#   local Infisical at http://infisical:8090 (Universal Auth machine identity)
+#   and exec's `infisical run` — secrets are injected as env vars into the
+#   wrapped process, never written to disk. Machine identity creds come from
+#   ./.env (gitignored).
 #
 # All outbound HTTPS (LLM API calls to OpenRouter, etc.) routes through Squid.
 # hermes-ttyd uses the `local` terminal backend — shell commands run inside the
@@ -21,9 +22,7 @@ name: hermes
 
 networks:
   platform-net:
-    external: true              # DNS (AdGuard 172.30.0.10), Squid proxy, Infisical path
-  platform-egress:
-    external: true              # infisical-agent only: platform-net internal:true drops SYNs
+    external: true              # DNS (AdGuard 172.30.0.10), Squid proxy, Infisical (service name "infisical")
   # Stack-local bridge: needed ONLY so Docker can publish 127.0.0.1:7682 to host.
   ingress:
     driver: bridge
@@ -40,40 +39,6 @@ x-logging: &default-logging
 
 services:
 
-  # ── Infisical Agent sidecar ──────────────────────────────────────────────────
-  # Authenticates to Infisical, renders secrets.tmpl → secrets-runtime/.env,
-  # then polls every 60 s for rotations. hermes-ttyd waits until healthy.
-  infisical-agent:
-    build: { context: ../openclaw, dockerfile: Dockerfile.infisical-cli }
-    image: platform/infisical-cli:0.43.76-patched
-    container_name: hermes-infisical-agent
-    restart: unless-stopped
-    entrypoint: ["sh", "/agent-config/entrypoint.sh"]
-    env_file: ./.env
-    logging: *default-logging
-    volumes:
-      - ./agent-config:/agent-config:ro
-      - ./secrets-runtime:/secrets
-    tmpfs:
-      - /tmp:size=1m,mode=0700
-    networks:
-      - platform-egress          # Infisical reachable here; platform-net internal:true drops SYNs
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    deploy:
-      resources:
-        limits:
-          cpus: "0.25"
-          memory: 64M
-    healthcheck:
-      test: ["CMD-SHELL", "test -f /secrets/.env"]
-      interval: 5s
-      timeout: 3s
-      retries: 24      # up to 2 min for Infisical on first boot
-      start_period: 10s
-
   # ── Hermes browser terminal (ttyd) ───────────────────────────────────────────
   # ttyd wraps the `hermes` TUI. Opening the browser terminal starts a fresh
   # interactive Hermes session; state (memories, sessions, config) persists in
@@ -89,6 +54,7 @@ services:
     container_name: hermes-ttyd
     restart: unless-stopped
     command:
+      - with-infisical
       - sh
       - -c
       - |
@@ -108,12 +74,13 @@ services:
           exec ttyd --port=7682 --writable bash -lc 'cd /opt/data/workspace; echo "Hermes ready. Run: hermes auth add openai-codex --type oauth"; exec bash'
         fi
     env_file:
-      - path: ./.env
-      - path: ./secrets-runtime/.env
-        required: false           # missing before first agent write is fine
+      - path: ./.env              # Infisical machine identity creds for `with-infisical`
     environment:
       HERMES_UID: "10000"
       HERMES_GID: "10000"
+      # Infisical project that holds Hermes' secrets — fetched at process start
+      # by /usr/local/bin/with-infisical (see Dockerfile + with-infisical.sh).
+      INFISICAL_PROJECT_ID: "2777cf9a-8ed7-43d0-84ed-8cb48f9b03ad"
       # Make the Hermes console script visible to both ttyd shells and Hermes'
       # own local terminal/tool subprocesses.
       PATH: "/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -158,9 +125,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
-    depends_on:
-      infisical-agent:
-        condition: service_healthy
 
   # ── Hermes messaging gateway ───────────────────────────────────────────────
   # Runs Telegram/other platform adapters as a Compose-managed service so
@@ -173,6 +137,7 @@ services:
     container_name: hermes-gateway
     restart: unless-stopped
     command:
+      - with-infisical
       - sh
       - -c
       - |
@@ -180,12 +145,11 @@ services:
         export TELEGRAM_HOME_CHANNEL_NAME="$${TELEGRAM_HOME_CHANNEL_NAME:-IronNest Hermes}"
         exec hermes gateway run
     env_file:
-      - path: ./.env
-      - path: ./secrets-runtime/.env
-        required: false
+      - path: ./.env              # Infisical machine identity creds for `with-infisical`
     environment:
       HERMES_UID: "10000"
       HERMES_GID: "10000"
+      INFISICAL_PROJECT_ID: "2777cf9a-8ed7-43d0-84ed-8cb48f9b03ad"
       PATH: "/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
       TERMINAL_ENV: "local"
       HTTPS_PROXY: "http://squid:3128"
@@ -221,6 +185,3 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
-    depends_on:
-      infisical-agent:
-        condition: service_healthy
