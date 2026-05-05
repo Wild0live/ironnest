@@ -5,7 +5,8 @@
 #
 # Covers:
 #   - Infisical Postgres (logical dump)
-#   - OpenClaw home volume
+#   - OpenClaw home volume + Codex CLI home volume
+#   - Hermes data volume (config, sessions, memories, skills)
 #   - AdGuard conf volume
 #   - Wazuh etc + logs + indexer data + dashboard config
 #   - All .env files across stacks (contain ENCRYPTION_KEY etc.)
@@ -57,6 +58,8 @@ backup_volume() {
 }
 
 backup_volume rancher-stack_openclaw-home openclaw-home.tar.gz
+backup_volume openclaw_codex-home         codex-home.tar.gz
+backup_volume hermes_hermes-data          hermes-data.tar.gz
 backup_volume rancher-stack_adguard-conf  adguard-conf.tar.gz
 backup_volume wazuh_wazuh_etc             wazuh-etc.tar.gz
 backup_volume wazuh_wazuh_logs            wazuh-logs.tar.gz

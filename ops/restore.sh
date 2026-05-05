@@ -21,7 +21,7 @@ fi
 cd "$PLATFORM_DIR"
 
 echo "Restoring from: $SRC"
-echo "This will DESTROY current data in postgres, openclaw-home, adguard-conf, wazuh volumes."
+echo "This will DESTROY current data in postgres, openclaw-home, codex-home, hermes-data, adguard-conf, wazuh volumes."
 read -p "Type 'yes' to continue: " C
 [[ "$C" == "yes" ]] || { echo "aborted"; exit 1; }
 
@@ -52,6 +52,8 @@ restore_volume() {
 }
 
 restore_volume rancher-stack_openclaw-home  openclaw-home.tar.gz
+restore_volume openclaw_codex-home          codex-home.tar.gz
+restore_volume hermes_hermes-data           hermes-data.tar.gz
 restore_volume rancher-stack_adguard-conf   adguard-conf.tar.gz
 restore_volume wazuh_wazuh_etc              wazuh-etc.tar.gz
 restore_volume wazuh_wazuh_logs             wazuh-logs.tar.gz
@@ -59,9 +61,14 @@ restore_volume wazuh_filebeat_etc           wazuh-filebeat-etc.tar.gz
 restore_volume wazuh_wazuh-indexer-data     wazuh-indexer-data.tar.gz
 restore_volume wazuh_wazuh-dashboard-config wazuh-dashboard-config.tar.gz
 
-# OpenClaw volume must be owned by UID 1000
+# Re-assert volume ownership (defensive — tar normally preserves uid/gid):
+#   openclaw user runs as 1000; hermes user runs as 10000.
 MSYS_NO_PATHCONV=1 docker run --rm -v rancher-stack_openclaw-home:/dst \
   alpine chown -R 1000:1000 /dst
+[[ -f "$SRC/codex-home.tar.gz" ]] && MSYS_NO_PATHCONV=1 docker run --rm \
+  -v openclaw_codex-home:/dst alpine chown -R 1000:1000 /dst
+[[ -f "$SRC/hermes-data.tar.gz" ]] && MSYS_NO_PATHCONV=1 docker run --rm \
+  -v hermes_hermes-data:/dst alpine chown -R 10000:10000 /dst
 
 echo "=== starting secrets first (postgres needs to receive dump) ==="
 ( cd secrets && docker compose up -d postgres )

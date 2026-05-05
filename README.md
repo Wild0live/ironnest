@@ -620,6 +620,52 @@ bash ops/restore.sh /path/to/backup/<timestamp>
 
 Restore verifies checksums before touching anything, tears down all stacks, restores volumes, then runs `bootstrap.sh` automatically.
 
+### Runtime backup (weekly)
+
+`ops/backup.sh` covers application *data* but not the Rancher Desktop runtime itself — image cache, Docker daemon config, and the WSL2 filesystem at `F:\wsl\rancher-desktop-data\ext4.vhdx`. If Rancher Desktop fails or gets uninstalled, you'd reinstall it, re-pull all upstream images (~10 GB compressed), **and rebuild every custom `platform/*` image from its Dockerfile**, before `restore.sh` could even run — easily an hour of work, longer if the custom image builds need to fetch dependencies.
+
+`ops/backup-runtime.sh` exports both Rancher Desktop WSL2 distros (`rancher-desktop` and `rancher-desktop-data`) as point-in-time tarballs to `G:\rancher-runtime-backups`. Recovery is then a single `wsl --import` per distro. Run it weekly, and always before a major Rancher Desktop upgrade.
+
+```bash
+# Use defaults (G:\rancher-runtime-backups, keep newest 2):
+bash ops/backup-runtime.sh
+
+# Override the backup destination:
+IRONNEST_RUNTIME_BACKUP_ROOT=/e/runtime-backups bash ops/backup-runtime.sh
+
+# Keep only the newest 1 archive instead of 2:
+IRONNEST_RUNTIME_BACKUP_KEEP=1 bash ops/backup-runtime.sh
+```
+
+**Prerequisite:** Rancher Desktop must be shut down before running — right-click the tray icon → **Quit**, wait until `wsl -l -v` shows both distros as `Stopped`. The script will refuse to run otherwise (exporting a live distro produces an inconsistent snapshot).
+
+Each run produces a timestamped directory containing:
+- `rancher-desktop.tar` — engine, k3s, Docker daemon config
+- `rancher-desktop-data.tar` — `ext4.vhdx` with image cache and all Docker volumes
+- `MANIFEST.txt` — pre-export `wsl -l -v` output and per-distro restore commands
+
+Retention is **count-based** (keep newest 2 by default) rather than age-based — each archive is roughly 75-100 GB (mostly Docker image cache and Wazuh indexer data), so age-based retention with weekly cadence could leave you with zero archives if you skip a week.
+
+**To restore the runtime from a backup:**
+
+```powershell
+# 1. Quit Rancher Desktop (tray icon → Quit), confirm both distros are Stopped
+wsl -l -v
+
+# 2. Unregister the existing distros (DESTRUCTIVE — only after confirming you have the backup)
+wsl --unregister rancher-desktop-data
+wsl --unregister rancher-desktop
+
+# 3. Re-import from the backup, choosing where the new vhdx will live
+wsl --import rancher-desktop-data F:\wsl\rancher-desktop-data G:\rancher-runtime-backups\<TS>\rancher-desktop-data.tar --version 2
+wsl --import rancher-desktop      F:\wsl\rancher-desktop      G:\rancher-runtime-backups\<TS>\rancher-desktop.tar      --version 2
+
+# 4. Restart Rancher Desktop, then run bootstrap.sh once Docker is ready
+bash bootstrap.sh
+```
+
+The exact restore commands for a given backup are also written into `MANIFEST.txt` inside each archive directory.
+
 ---
 
 ## Troubleshooting
