@@ -19,6 +19,7 @@ networks:
 
 volumes:
   fluent-bit-db:                 # SQLite position database (tracks read offset per file)
+  container-lookups:             # shared container ID → name lookup written by monitoring-container-sync
 
 x-logging: &default-logging
   driver: json-file
@@ -41,6 +42,7 @@ services:
     volumes:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
       - fluent-bit-db:/var/lib/fluent-bit
+      - container-lookups:/lookups:ro
     environment:
       WAZUH_INDEXER_PASSWORD: "${WAZUH_INDEXER_PASSWORD}"
     networks:
@@ -59,3 +61,23 @@ services:
         limits:
           cpus: "0.5"
           memory: 128M
+
+  # ── Container name sync — writes short-ID → name lookup for Fluent Bit ──────
+  monitoring-container-sync:
+    image: alpine:3.20
+    container_name: monitoring-container-sync
+    restart: unless-stopped
+    logging: *default-logging
+    entrypoint: ["/bin/sh", "/scripts/container-sync.sh"]
+    volumes:
+      - ./container-sync.sh:/scripts/container-sync.sh:ro
+      - container-lookups:/lookups
+    networks:
+      - platform-net
+    dns:
+      - 172.30.0.10
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 32M

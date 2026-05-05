@@ -1,3 +1,4 @@
 FROM fluent/fluent-bit:3.2-debug
 COPY fluent-bit.conf /fluent-bit/etc/fluent-bit.conf
+COPY scripts/        /fluent-bit/scripts/
 COPY root-ca.pem    /certs/root-ca.pem
