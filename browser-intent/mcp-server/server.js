@@ -38,10 +38,52 @@ function toolSchema(siteId) {
   };
 }
 
+const EXTRACTION_TOOLS = {
+  get_portfolio: {
+    description: (site) =>
+      `Read holdings from ${site.displayName}: per-symbol quantity, average cost, last price, market value, unrealized P&L, and totals. Returns sanitized JSON; never returns credentials, cookies, or raw HTML. Caller must call login_${site.id} first.`
+  },
+  diagnose_portfolio: {
+    description: (site) =>
+      `Diagnostic tool for ${site.displayName}. Dumps frame URLs and table header rows to help locate the portfolio page. Returns no holdings data, no cell values — only structural metadata for tuning the real extractor. Caller must call login_${site.id} first.`
+  }
+};
+
+function extractionToolSchemas() {
+  const policy = loadPolicy();
+  const tools = [];
+  for (const [siteId, site] of Object.entries(policy.sites)) {
+    for (const [action, spec] of Object.entries(EXTRACTION_TOOLS)) {
+      if (!site.allowedTools.includes(action)) continue;
+      tools.push({
+        name: `${siteId}_${action}`,
+        description: spec.description({ ...site, id: siteId }),
+        inputSchema: {
+          type: "object",
+          properties: {},
+          additionalProperties: false
+        }
+      });
+    }
+  }
+  return tools;
+}
+
+function parseExtractionToolName(name) {
+  for (const siteId of siteIds()) {
+    const prefix = `${siteId}_`;
+    if (!name.startsWith(prefix)) continue;
+    const action = name.slice(prefix.length);
+    if (EXTRACTION_TOOLS[action]) return { siteId, action };
+  }
+  return null;
+}
+
 function toolsList() {
   const loginTools = siteIds().map(toolSchema);
   return [
     ...loginTools,
+    ...extractionToolSchemas(),
     {
       name: "check_site_session",
       description: "Check whether a site has an active worker-side browser session. Returns only status.",
@@ -105,6 +147,8 @@ function audit(event) {
 async function callTool(name, args = {}) {
   let siteForAudit = args.site;
   if (name.startsWith("login_")) siteForAudit = name.slice("login_".length);
+  const extraction = parseExtractionToolName(name);
+  if (extraction) siteForAudit = extraction.siteId;
 
   if (name === "list_browser_intent_sites") {
     const result = { sites: siteIds().map(publicSite) };
@@ -124,6 +168,13 @@ async function callTool(name, args = {}) {
       const site = name.slice("login_".length);
       assertSite(site);
       result = await workerCall("/login", { site });
+    } else if (extraction) {
+      assertSite(extraction.siteId);
+      const site = loadPolicy().sites[extraction.siteId];
+      if (!site.allowedTools.includes(extraction.action)) {
+        throw new Error(`tool not allowed for site ${extraction.siteId}: ${extraction.action}`);
+      }
+      result = await workerCall("/extract", { site: extraction.siteId, action: extraction.action });
     } else {
       throw new Error(`unknown tool: ${name}`);
     }

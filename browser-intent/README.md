@@ -77,17 +77,40 @@ The local API is published at `http://127.0.0.1:18901`.
 
 ## MCP Tools
 
+Login / session:
+
 - `login_col_financial`
 - `login_maxicare`
 - `login_april_international`
 - `login_hi_precision`
 - `check_site_session`
 - `logout_site`
+- `list_browser_intent_sites`
 
-All tools return minimal status payloads. Post-login data extraction should be added later as separate gated tools.
+Post-login data:
+
+- `col_financial_get_portfolio` — returns holdings (symbol, quantity, average cost, last price, market value, unrealized P&L) and totals.
+
+Login and session tools return minimal status payloads only. Post-login data tools return sanitized JSON for the requested dataset; see "Security posture" below.
 
 MFA is treated as a separate user action. If a site asks for an OTP, push approval, captcha, or other second factor and no deterministic `TOTP_SECRET` flow is configured, the worker returns:
 
 ```json
 { "status": "needs_user_action", "reason": "mfa_required" }
 ```
+
+## Security posture
+
+Two invariants apply to every tool in this stack:
+
+1. **Credentials never reach the LLM.** Username, password, and `TOTP_SECRET` are rendered into the worker's environment by the Infisical sidecar and used only by Playwright. No tool returns them.
+2. **Login / session tools never return post-login data.** They return only `{status, ...}`.
+
+Post-login data tools (e.g. `col_financial_get_portfolio`) are gated additions that *do* return business data — portfolio holdings, balances, etc. They:
+
+- Only run on sites whose `allowedTools` in `policies/sites.json` lists the action.
+- Require an existing logged-in session — return `{status: "session_expired"}` if not, so the LLM is forced to call `login_<site>` first.
+- Return only the documented JSON shape (no raw HTML, cookies, or screenshots).
+- Are flagged in the audit log with `returned_sensitive_data: true`.
+
+If the site's DOM changes such that the extractor can't locate its target, the tool returns `{status: "needs_extractor_update"}` rather than guessing.

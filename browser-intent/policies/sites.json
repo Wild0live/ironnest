@@ -7,7 +7,7 @@
       "allowedDomains": ["colfinancial.com", "*.colfinancial.com"],
       "secretPrefix": "COL_FINANCIAL",
       "secretPath": "/sites/col-financial",
-      "allowedTools": ["login", "check_session", "logout"],
+      "allowedTools": ["login", "check_session", "logout", "get_portfolio", "diagnose_portfolio"],
       "loginSelectors": {
         "username": ["input[name='txtUser1']"],
         "username2": ["input[name='txtUser2']"],
@@ -15,7 +15,7 @@
         "totp": ["input[name*='otp' i]", "input[name*='code' i]", "input[autocomplete='one-time-code']"],
         "submit": ["input[type='button'][value='LOG IN']", "input[name='cmdLogOn']", "input[type='button']"]
       },
-      "loggedInUrlPatterns": ["/ape/Final2/", "/ape/"],
+      "loggedInUrlPatterns": ["/ape/Final2/main/"],
       "loggedInSignals": ["logout", "portfolio", "watchlist"]
     },
     "maxicare": {

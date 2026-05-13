@@ -1,9 +1,11 @@
 const fs = require("node:fs");
+const path = require("node:path");
 const http = require("node:http");
 const crypto = require("node:crypto");
 const { chromium } = require("playwright");
 
 const policyPath = process.env.BROWSER_INTENT_POLICY_PATH || "/app/policies/sites.json";
+const extractorsDir = process.env.BROWSER_INTENT_EXTRACTORS_DIR || path.join(__dirname, "extractors");
 const port = 18902;
 const sessions = new Map();
 
@@ -260,6 +262,61 @@ async function logout(siteId) {
   return { site: siteId, status: "logged_out", returned_sensitive_data: false };
 }
 
+function actionToMethod(action) {
+  return action.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+}
+
+async function extract(siteId, action) {
+  const site = getSite(siteId);
+  if (!action || typeof action !== "string") throw new Error("missing action");
+  if (!site.allowedTools.includes(action)) {
+    throw new Error(`action is not allowed for site ${siteId}: ${action}`);
+  }
+
+  // Diagnostic actions are allowed to run on any page state (including a failed
+  // login landing) so a human can inspect what COL actually returned. They MUST
+  // return returned_sensitive_data: false.
+  const isDiagnostic = action.startsWith("diagnose_");
+  if (!isDiagnostic) {
+    const sessionStatus = await checkSession(siteId);
+    if (sessionStatus.status !== "logged_in") {
+      audit({ action, site: siteId, result: "session_expired", returned_sensitive_data: false });
+      return { site: siteId, status: "session_expired", returned_sensitive_data: false };
+    }
+  } else if (!sessions.has(siteId)) {
+    audit({ action, site: siteId, result: "no_session", returned_sensitive_data: false });
+    return { site: siteId, status: "no_session", returned_sensitive_data: false };
+  }
+
+  const extractorPath = path.join(extractorsDir, `${siteId}.js`);
+  if (!fs.existsSync(extractorPath)) {
+    throw new Error(`no extractor module for site: ${siteId}`);
+  }
+  const extractor = require(extractorPath);
+  const method = actionToMethod(action);
+  if (typeof extractor[method] !== "function") {
+    throw new Error(`extractor does not implement ${method}`);
+  }
+
+  const session = sessions.get(siteId);
+  try {
+    const result = await extractor[method](session.page);
+    audit({
+      action,
+      site: siteId,
+      result: result.status || "ok",
+      returned_sensitive_data: Boolean(result.returned_sensitive_data)
+    });
+    return result;
+  } catch (error) {
+    if (error.code === "needs_extractor_update") {
+      audit({ action, site: siteId, result: "needs_extractor_update", returned_sensitive_data: false });
+      return { site: siteId, status: "needs_extractor_update", returned_sensitive_data: false };
+    }
+    throw error;
+  }
+}
+
 async function readJson(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -286,6 +343,7 @@ const server = http.createServer(async (req, res) => {
     if (req.url === "/login") payload = await login(body.site);
     else if (req.url === "/session") payload = await checkSession(body.site);
     else if (req.url === "/logout") payload = await logout(body.site);
+    else if (req.url === "/extract") payload = await extract(body.site, body.action);
     else {
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "not_found" }));
