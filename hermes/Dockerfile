@@ -1,13 +1,13 @@
-# platform/hermes-agent:v2026.4.23-patched
+# platform/hermes-agent:v2026.5.7-patched
 # Built from NousResearch/hermes-agent at a pinned release tag + ttyd 1.7.7.
-# Source: https://github.com/NousResearch/hermes-agent/releases/tag/v2026.4.23
+# Source: https://github.com/NousResearch/hermes-agent/releases/tag/v2026.5.7
 #
 # First build downloads Node modules, Playwright, and Python deps — allow ~20 min.
 # Subsequent builds are fast (Docker layer cache hits on the npm/pip layers).
 #
 # To upgrade: bump HERMES_TAG, update the image tag in docker-compose.yml, rebuild.
 
-ARG HERMES_TAG=v2026.4.23
+ARG HERMES_TAG=v2026.5.7
 
 # ── Pinned upstream helpers (same digests as official hermes Dockerfile) ──────
 FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df22866bd7857e5d304b67a564f4feab6ac22044dde719b AS uv_source
@@ -74,7 +74,7 @@ COPY --chmod=0755 --from=infisical_source /bin/infisical /usr/local/bin/infisica
 COPY --chmod=0755 with-infisical.sh /usr/local/bin/with-infisical
 
 # ── Clone hermes-agent source at pinned tag ───────────────────────────────────
-ARG HERMES_TAG=v2026.4.23
+ARG HERMES_TAG=v2026.5.7
 RUN git clone --depth 1 --branch ${HERMES_TAG} \
       https://github.com/NousResearch/hermes-agent.git /opt/hermes
 

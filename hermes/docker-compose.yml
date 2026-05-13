@@ -1,4 +1,4 @@
-# Hermes Agent — NousResearch hermes-agent v2026.4.23 + ttyd browser terminal.
+# Hermes Agent — NousResearch hermes-agent v2026.5.7 + ttyd browser terminal.
 # On-demand stack: start with ./hermes/start.sh (do not add to bootstrap.sh).
 #
 # Two services:
@@ -50,7 +50,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: platform/hermes-agent:v2026.4.23-patched
+    image: platform/hermes-agent:v2026.5.7-patched
     container_name: hermes-ttyd
     restart: unless-stopped
     command:
@@ -133,7 +133,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: platform/hermes-agent:v2026.4.23-patched
+    image: platform/hermes-agent:v2026.5.7-patched
     container_name: hermes-gateway
     restart: unless-stopped
     command:
