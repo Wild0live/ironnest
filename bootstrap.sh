@@ -16,8 +16,16 @@ echo "=== platform bootstrap starting from $PLATFORM ==="
 # platform-egress: not internal. Only services that cannot use the HTTP proxy
 #                  (SMTP, AdGuard DoH upstream, Wazuh raw feeds, Squid itself).
 echo "--- ensuring shared networks exist ---"
+# platform-net: --ip-range reserves the lower half of the /24 (.2-.127) for
+# static pins (e.g. adguard at .10). Dynamic allocations come from .128-.254.
+# Without this, a container that boots before adguard can race in and grab
+# .10, causing adguard to fail with "Address already in use" on next start.
 docker network inspect platform-net >/dev/null 2>&1 \
-  || docker network create --driver bridge --internal --subnet 172.30.0.0/24 platform-net
+  || docker network create --driver bridge --internal \
+       --subnet 172.30.0.0/24 \
+       --ip-range 172.30.0.128/25 \
+       --gateway 172.30.0.1 \
+       platform-net
 
 docker network inspect platform-egress >/dev/null 2>&1 \
   || docker network create --driver bridge --subnet 172.31.0.0/24 platform-egress
