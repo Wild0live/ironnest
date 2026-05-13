@@ -24,7 +24,9 @@ providers:
     directory: /etc/traefik/conf
     watch: true                 # picks up changes to conf/ without restart
 
-# JSON access log — one line per request, consumed by filebeat sidecar.
+# JSON access log — one line per request to stdout, collected by the
+# monitoring stack's fluent-bit (no dedicated filebeat sidecar anymore;
+# logs land in Wazuh index ironnest-containers-* with container_name=traefik).
 accessLog:
   format: json
   bufferingSize: 100

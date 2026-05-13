@@ -76,7 +76,7 @@ http:
     # ── Wazuh SIEM dashboard ──────────────────────────────────────────────────────
     # Sensitive: full security event visibility.
     wazuh:
-      rule: "Host(`wazuh.ironnest.local`)"
+      rule: "Host(`wazuh.ironnest.local`) || Host(`127.0.0.1`) || Host(`localhost`)"
       entryPoints: [websecure]
       middlewares: [trusted-networks, strict-rate-limit]
       service: wazuh
