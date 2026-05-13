@@ -46,8 +46,9 @@ services:
     environment:
       WAZUH_INDEXER_PASSWORD: "${WAZUH_INDEXER_PASSWORD}"
     networks:
-      - platform-net       # DNS via AdGuard
-      - wazuh-internal     # reach wazuh.indexer:9200
+      platform-net:
+        ipv4_address: 172.30.0.15   # STABLE — prevents squatting on another service's reserved IP
+      wazuh-internal: {}            # reach wazuh.indexer:9200
     dns:
       - 172.30.0.10
     healthcheck:
@@ -62,15 +63,16 @@ services:
           cpus: "0.5"
           memory: 128M
 
-  # ── Container name sync — writes short-ID → name lookup for Fluent Bit ──────
+  # ── Container metadata sync — writes /lookups/containers.tsv for Fluent Bit ──
   monitoring-container-sync:
-    image: alpine:3.20
+    build:
+      context: .
+      dockerfile: Dockerfile.container-sync
+    image: platform/monitoring-container-sync:1.0
     container_name: monitoring-container-sync
     restart: unless-stopped
     logging: *default-logging
-    entrypoint: ["/bin/sh", "/scripts/container-sync.sh"]
     volumes:
-      - ./container-sync.sh:/scripts/container-sync.sh:ro
       - container-lookups:/lookups
     networks:
       - platform-net
