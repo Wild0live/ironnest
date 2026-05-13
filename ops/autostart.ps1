@@ -20,4 +20,4 @@ if ($elapsed -ge $timeout) {
     exit 1   # Docker never came up — Task Scheduler will record the failure
 }
 
-& $bash -c "bash $script && bash /d/claude-workspace/platform/openclaw/start.sh"
+& $bash -c "bash $script && { bash /d/claude-workspace/platform/openclaw/start.sh; bash /d/claude-workspace/platform/hermes/start.sh; bash /d/claude-workspace/platform/browser-intent/start.sh; }"

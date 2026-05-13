@@ -4,8 +4,9 @@
 # Prerequisite: bootstrap.sh must have run (platform-net, platform-egress,
 # Squid, AdGuard, and Infisical must be healthy).
 #
-# First build downloads ~1 GB of Node/Python/Playwright deps — allow ~20 min.
-# Subsequent starts are fast (Docker layer cache + pre-built image).
+# This script does NOT build. Rebuild with: bash hermes/build.sh (e.g., after
+# Dockerfile changes). On first run, if the image is missing, this script
+# invokes build.sh automatically.
 set -euo pipefail
 
 export PATH="/c/Program Files/Rancher Desktop/resources/resources/win32/bin:$PATH"
@@ -18,9 +19,22 @@ PLATFORM="$(cd "$(dirname "$0")/.." && pwd)"
 
 cd "$PLATFORM/hermes"
 
-echo "--- building hermes image and starting stack ---"
-echo "    (first build: ~20 min — subsequent builds use Docker layer cache)"
-docker compose up -d --build
+# First-run detection: if the hermes image isn't present locally, build it.
+IMAGE="$(awk '/^[[:space:]]+image:/{print $2; exit}' docker-compose.yml)"
+if [ -z "$IMAGE" ]; then
+  echo "ERROR: could not parse image name from docker-compose.yml" >&2
+  exit 1
+fi
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "--- hermes image $IMAGE not present, running build.sh first ---"
+  "$(dirname "$0")/build.sh"
+fi
+
+echo "--- starting hermes stack ---"
+# --no-build: skip BuildKit evaluation entirely. Compose would otherwise inspect
+# the build: context even when the image exists, which hangs for many minutes
+# under WSL2 cold-start I/O pressure. Rebuilds are explicit via build.sh.
+docker compose up -d --no-build
 
 # Block direct outbound from the hermes_ingress bridge at the kernel level.
 # Must run after compose up so hermes_ingress network exists.
