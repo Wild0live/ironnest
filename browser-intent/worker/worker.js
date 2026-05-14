@@ -99,6 +99,26 @@ function audit(event) {
   })}\n`);
 }
 
+// Sanitize an error message before it leaves the worker. Playwright errors
+// frequently embed the URL being navigated and the failing selector; URLs
+// often carry session tokens in query strings, and full URLs in stderr land
+// in Wazuh via Fluent Bit. Replace any URL with origin+pathname only, then
+// truncate so a stray page-HTML dump can't blow up an audit log line.
+const URL_REDACT_RE = /https?:\/\/[^\s"'<>`]+/g;
+function redactErrorMessage(err) {
+  if (!err) return "";
+  const raw = err.message || String(err);
+  const sanitized = raw.replace(URL_REDACT_RE, (m) => {
+    try {
+      const u = new URL(m);
+      return `${u.origin}${u.pathname}`;
+    } catch {
+      return "[URL]";
+    }
+  });
+  return sanitized.length > 500 ? `${sanitized.slice(0, 500)}…[truncated]` : sanitized;
+}
+
 async function firstVisible(page, selectors) {
   for (const sel of selectors || []) {
     // sel can be a plain CSS string or {selector, nth} for indexed fields (e.g. split User ID)
@@ -377,7 +397,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(400, { "content-type": "application/json" });
     res.end(JSON.stringify({
       status: "failed",
-      error: error.message || String(error),
+      error: redactErrorMessage(error),
       returned_sensitive_data: false
     }));
   }

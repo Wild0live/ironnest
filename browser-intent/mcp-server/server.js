@@ -173,6 +173,26 @@ function audit(event) {
   })}\n`);
 }
 
+// Sanitize an error message before logging it to stderr or returning it to a
+// JSON-RPC caller. Worker errors propagated through workerCall can include
+// the underlying Playwright text — URLs in those errors often carry session
+// tokens. Replace any URL with origin+pathname only and truncate so a stray
+// page-HTML dump can't blow up an audit log line. Mirrored in worker.js.
+const URL_REDACT_RE = /https?:\/\/[^\s"'<>`]+/g;
+function redactErrorMessage(err) {
+  if (!err) return "";
+  const raw = err.message || String(err);
+  const sanitized = raw.replace(URL_REDACT_RE, (m) => {
+    try {
+      const u = new URL(m);
+      return `${u.origin}${u.pathname}`;
+    } catch {
+      return "[URL]";
+    }
+  });
+  return sanitized.length > 500 ? `${sanitized.slice(0, 500)}…[truncated]` : sanitized;
+}
+
 async function callTool(name, args = {}) {
   let siteForAudit = args.site;
   if (name.startsWith("login_")) siteForAudit = name.slice("login_".length);
@@ -219,7 +239,7 @@ async function callTool(name, args = {}) {
       tool: name,
       site: siteForAudit,
       result: "failed",
-      error: error.message || String(error),
+      error: redactErrorMessage(error),
       returned_sensitive_data: false
     });
     throw error;
@@ -231,7 +251,7 @@ function mcpResult(id, result) {
 }
 
 function mcpError(id, error) {
-  return { jsonrpc: "2.0", id, error: { code: -32000, message: error.message || String(error) } };
+  return { jsonrpc: "2.0", id, error: { code: -32000, message: redactErrorMessage(error) } };
 }
 
 async function handleJsonRpc(message) {
@@ -297,7 +317,7 @@ const httpServer = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ error: "not_found" }));
   } catch (error) {
     res.writeHead(500, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: error.message || String(error) }));
+    res.end(JSON.stringify({ error: redactErrorMessage(error) }));
   }
 });
 
