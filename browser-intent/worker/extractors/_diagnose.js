@@ -15,6 +15,22 @@
 //   caller supplies; an unfiltered link dump would round-trip session IDs.
 // - The top-level diagnostic result MUST set returned_sensitive_data: false.
 
+// Redact common PII patterns from text returned in diagnostic output. Used
+// for table header cells: most content is structural ("Symbol", "Quantity"),
+// but a portal that uses tables for layout may render PII like
+// "Welcome, John Doe (Member #00123-45)" inside what shape-detects as a
+// header row. Strip the highest-signal patterns — digit runs of 4+ (IDs,
+// account numbers), formatted numbers (amounts), and email addresses.
+// Letter sequences are preserved because column-name signal is the whole
+// point of the diagnostic.
+function redactCellText(text) {
+  if (!text) return "";
+  return String(text)
+    .replace(/\b[\w._%+-]+@[\w.-]+\.[a-z]{2,}\b/gi, "[EMAIL]")
+    .replace(/\d+(?:[,.]\d+)+/g, "[NUM]")
+    .replace(/\d{4,}/g, "[NUM]");
+}
+
 function sanitizeUrl(rawUrl) {
   try {
     const u = new URL(rawUrl);
@@ -68,7 +84,9 @@ async function summarizeFrame(frame) {
       tables.push({
         index: i,
         row_count: rowCount,
-        header_cells: headerCells.map((s) => s.replace(/\s+/g, " ").trim()).filter(Boolean)
+        header_cells: headerCells
+          .map((s) => redactCellText(s.replace(/\s+/g, " ").trim()))
+          .filter(Boolean)
       });
     }
   } catch {
@@ -161,6 +179,7 @@ async function summarizeForms(page) {
 module.exports = {
   sanitizeUrl,
   redactHref,
+  redactCellText,
   summarizeFrame,
   collectFrameSummaries,
   collectFrameLinksMatching,
