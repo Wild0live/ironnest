@@ -9,6 +9,20 @@ const extractorsDir = process.env.BROWSER_INTENT_EXTRACTORS_DIR || path.join(__d
 const port = 18902;
 const sessions = new Map();
 
+// Per-site mutex. Login/logout/extract on the same site must serialize, or two
+// concurrent calls race the sessions Map and leak Chromium instances; on real
+// sites the parallel auth attempts also risk account lockouts.
+const siteLocks = new Map();
+function withSiteLock(siteId, fn) {
+  const prev = siteLocks.get(siteId) || Promise.resolve();
+  const next = prev.catch(() => {}).then(fn);
+  siteLocks.set(siteId, next);
+  next.catch(() => {}).then(() => {
+    if (siteLocks.get(siteId) === next) siteLocks.delete(siteId);
+  });
+  return next;
+}
+
 function loadPolicy() {
   return JSON.parse(fs.readFileSync(policyPath, "utf8"));
 }
@@ -154,15 +168,15 @@ async function confirmLoggedIn(page, site) {
   return textSignals(page, site.loggedInSignals);
 }
 
-async function login(siteId) {
+async function _login(siteId) {
   const site = getSite(siteId);
   if (!site.allowedTools.includes("login")) throw new Error("login is not allowed for this site");
   assertAllowedUrl(site.loginUrl, site);
 
   if (sessions.has(siteId)) {
-    const active = await checkSession(siteId);
+    const active = await _checkSession(siteId);
     if (active.status === "logged_in" || active.status === "session_exists") return active;
-    await logout(siteId);
+    await _logout(siteId);
   }
 
   const username = secret(site, "USERNAME");
@@ -235,7 +249,7 @@ async function login(siteId) {
   return result;
 }
 
-async function checkSession(siteId) {
+async function _checkSession(siteId) {
   const site = getSite(siteId);
   const session = sessions.get(siteId);
   if (!session) return { site: siteId, status: "logged_out", returned_sensitive_data: false };
@@ -247,13 +261,13 @@ async function checkSession(siteId) {
   // redirects back to the login form without closing the Playwright session.
   const stillActive = await confirmLoggedIn(session.page, site);
   if (!stillActive) {
-    await logout(siteId);
+    await _logout(siteId);
     return { site: siteId, status: "logged_out", returned_sensitive_data: false };
   }
   return { site: siteId, status: "logged_in", returned_sensitive_data: false };
 }
 
-async function logout(siteId) {
+async function _logout(siteId) {
   getSite(siteId);
   const session = sessions.get(siteId);
   if (!session) return { site: siteId, status: "logged_out", returned_sensitive_data: false };
@@ -266,7 +280,7 @@ function actionToMethod(action) {
   return action.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
 }
 
-async function extract(siteId, action) {
+async function _extract(siteId, action) {
   const site = getSite(siteId);
   if (!action || typeof action !== "string") throw new Error("missing action");
   if (!site.allowedTools.includes(action)) {
@@ -278,7 +292,7 @@ async function extract(siteId, action) {
   // return returned_sensitive_data: false.
   const isDiagnostic = action.startsWith("diagnose_");
   if (!isDiagnostic) {
-    const sessionStatus = await checkSession(siteId);
+    const sessionStatus = await _checkSession(siteId);
     if (sessionStatus.status !== "logged_in") {
       audit({ action, site: siteId, result: "session_expired", returned_sensitive_data: false });
       return { site: siteId, status: "session_expired", returned_sensitive_data: false };
@@ -316,6 +330,13 @@ async function extract(siteId, action) {
     throw error;
   }
 }
+
+// Public entry points serialize per-site so the sessions map is never read and
+// then written across an await boundary by two callers at once.
+const login = (siteId) => withSiteLock(siteId, () => _login(siteId));
+const checkSession = (siteId) => withSiteLock(siteId, () => _checkSession(siteId));
+const logout = (siteId) => withSiteLock(siteId, () => _logout(siteId));
+const extract = (siteId, action) => withSiteLock(siteId, () => _extract(siteId, action));
 
 async function readJson(req) {
   const chunks = [];
@@ -367,6 +388,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(port, "0.0.0.0");
 
 process.on("SIGTERM", async () => {
-  for (const siteId of sessions.keys()) await logout(siteId).catch(() => {});
+  // Bypass the lock at shutdown — we are tearing down regardless of in-flight calls.
+  for (const siteId of sessions.keys()) await _logout(siteId).catch(() => {});
   process.exit(0);
 });

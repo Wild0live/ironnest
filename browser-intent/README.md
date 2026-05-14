@@ -70,10 +70,22 @@ Maxicare's portal URL is currently a placeholder and should be confirmed before 
 ```bash
 cp browser-intent/.env.example browser-intent/.env
 # edit .env and browser-intent/agent-config/secrets.tmpl
+# .env requires BROWSER_INTENT_MCP_TOKEN — generate with: openssl rand -hex 32
 ./browser-intent/start.sh
 ```
 
-The local API is published at `http://127.0.0.1:18901`.
+The local API is published at `http://127.0.0.1:18901`. The HTTP transport
+(`POST /mcp`, `GET /sites`) requires `Authorization: Bearer $BROWSER_INTENT_MCP_TOKEN`;
+`GET /healthz` is open. The stdio transport is unauthenticated by design.
+
+```powershell
+# Quick sanity check
+$token = (Get-Content .env | Select-String '^BROWSER_INTENT_MCP_TOKEN=').Line.Split('=',2)[1]
+Invoke-RestMethod -Uri http://127.0.0.1:18901/mcp -Method Post `
+  -Headers @{ Authorization = "Bearer $token" } `
+  -ContentType 'application/json' `
+  -Body '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
 
 ## MCP Tools
 

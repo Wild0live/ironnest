@@ -1,10 +1,35 @@
 const fs = require("node:fs");
 const http = require("node:http");
+const crypto = require("node:crypto");
 const readline = require("node:readline");
 
 const policyPath = process.env.BROWSER_INTENT_POLICY_PATH || "/app/policies/sites.json";
 const workerUrl = process.env.BROWSER_WORKER_URL || "http://worker:18902";
 const httpPort = Number(process.env.BROWSER_INTENT_HTTP_PORT || 18901);
+const authToken = process.env.BROWSER_INTENT_MCP_TOKEN || "";
+
+if (!authToken) {
+  process.stderr.write(`${JSON.stringify({
+    timestamp: new Date().toISOString(),
+    component: "browser-intent-mcp",
+    level: "warn",
+    msg: "BROWSER_INTENT_MCP_TOKEN is not set; HTTP /mcp and /sites will reject all requests"
+  })}\n`);
+}
+
+// Gate the HTTP front door so a local process (or a malicious page in the
+// host browser) cannot trigger real logins just by reaching 127.0.0.1:18901.
+// stdio is intentionally not gated — anyone who can attach to this process's
+// pipes already has container-local privilege.
+function checkAuth(req) {
+  if (!authToken) return false;
+  const header = req.headers["authorization"] || "";
+  if (!header.startsWith("Bearer ")) return false;
+  const provided = Buffer.from(header.slice("Bearer ".length));
+  const expected = Buffer.from(authToken);
+  if (provided.length !== expected.length) return false;
+  return crypto.timingSafeEqual(provided, expected);
+}
 
 function loadPolicy() {
   return JSON.parse(fs.readFileSync(policyPath, "utf8"));
@@ -241,11 +266,21 @@ const httpServer = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === "GET" && req.url === "/sites") {
+      if (!checkAuth(req)) {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "auth_required", hint: "set BROWSER_INTENT_MCP_TOKEN and pass Authorization: Bearer <token>" }));
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ sites: siteIds().map(publicSite) }));
       return;
     }
     if (req.method === "POST" && req.url === "/mcp") {
+      if (!checkAuth(req)) {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "auth_required", hint: "set BROWSER_INTENT_MCP_TOKEN and pass Authorization: Bearer <token>" }));
+        return;
+      }
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       const msg = JSON.parse(Buffer.concat(chunks).toString("utf8"));

@@ -104,6 +104,7 @@ services:
       BROWSER_INTENT_POLICY_PATH: /app/policies/sites.json
       BROWSER_WORKER_URL: http://browser-intent-worker:18902
       BROWSER_INTENT_HTTP_PORT: "18901"
+      BROWSER_INTENT_MCP_TOKEN: ${BROWSER_INTENT_MCP_TOKEN:?missing BROWSER_INTENT_MCP_TOKEN in .env (generate one with: openssl rand -hex 32)}
     volumes:
       - ./policies:/app/policies:ro
     ports:
