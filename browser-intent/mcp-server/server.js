@@ -71,6 +71,10 @@ const EXTRACTION_TOOLS = {
   diagnose_portfolio: {
     description: (site) =>
       `Diagnostic tool for ${site.displayName}. Dumps frame URLs and table header rows to help locate the portfolio page. Returns no holdings data, no cell values — only structural metadata for tuning the real extractor. Caller must call login_${site.id} first.`
+  },
+  diagnose_member_portal: {
+    description: (site) =>
+      `Diagnostic tool for ${site.displayName}. After login, dumps frame URLs, table headers, form-field metadata, and filtered link candidates to help locate the right post-login page for the real extractor. Returns no cell values, no form values, no row contents — only structural metadata. Caller must call login_${site.id} first.`
   }
 };
 

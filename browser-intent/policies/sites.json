@@ -25,7 +25,7 @@
       "allowedDomains": ["usqp.maxihealth.com.ph", "*.maxihealth.com.ph"],
       "secretPrefix": "MAXICARE",
       "secretPath": "/sites/maxicare",
-      "allowedTools": ["login", "check_session", "logout"],
+      "allowedTools": ["login", "check_session", "logout", "diagnose_member_portal"],
       "loginSelectors": {
         "username": ["input[name='username']", "input[name='email']", "input[type='email']", "input[type='text']"],
         "password": ["input[name='password']", "input[type='password']"],
@@ -41,7 +41,7 @@
       "allowedDomains": ["am-gateway.april.fr", "*.april.fr"],
       "secretPrefix": "APRIL_INTERNATIONAL",
       "secretPath": "/sites/april-international",
-      "allowedTools": ["login", "check_session", "logout"],
+      "allowedTools": ["login", "check_session", "logout", "diagnose_member_portal"],
       "loginSelectors": {
         "username": ["input[name='username']", "input[name='email']", "input[type='email']", "input[type='text']"],
         "password": ["input[name='password']", "input[type='password']"],
@@ -57,7 +57,7 @@
       "allowedDomains": ["portal.hi-precision.com.ph", "*.hi-precision.com.ph"],
       "secretPrefix": "HI_PRECISION",
       "secretPath": "/sites/hi-precision",
-      "allowedTools": ["login", "check_session", "logout"],
+      "allowedTools": ["login", "check_session", "logout", "diagnose_member_portal"],
       "loginSelectors": {
         "username": ["input[name='username']", "input[name='email']", "input[type='email']", "input[type='text']"],
         "password": ["input[name='password']", "input[type='password']"],
