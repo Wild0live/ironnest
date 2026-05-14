@@ -24,6 +24,28 @@ function sanitizeUrl(rawUrl) {
   }
 }
 
+// Redact an anchor href for diagnostic output. Many portal hrefs carry session
+// IDs or member identifiers in query strings (?sid=abc&memberId=123) — those
+// must not round-trip from the worker to a maintainer's chat or paste buffer.
+// Strategy: resolve against the frame URL so relative links become absolute,
+// then return origin + pathname + redacted query (keys preserved, values
+// stripped). Keys are kept because they reveal the endpoint's API shape, which
+// is what the maintainer needs to author the real extractor; values are not.
+function redactHref(href, baseUrl) {
+  if (!href) return "";
+  if (href.startsWith("javascript:")) return "javascript:";
+  if (href.startsWith("#")) return "";
+  try {
+    const u = new URL(href, baseUrl || undefined);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return `${u.protocol}`;
+    const keys = [...u.searchParams.keys()];
+    const query = keys.length ? `?${keys.map((k) => `${k}=`).join("&")}` : "";
+    return `${u.origin}${u.pathname}${query}`;
+  } catch {
+    return "";
+  }
+}
+
 async function summarizeFrame(frame) {
   const url = sanitizeUrl(frame.url());
   let title = "";
@@ -65,13 +87,18 @@ async function collectFrameSummaries(page) {
 }
 
 // Walks every frame and returns links whose text OR href matches the keyword
-// regex. Limits per-frame so a noisy SPA can't blow up the response payload.
+// regex. Filtering runs in-page against the RAW href so a keyword match
+// against a query-string value (e.g. ?action=view_claims) still counts.
+// Output hrefs are then redacted in Node before being returned — values
+// stripped, keys kept. Limits per-frame so a noisy SPA can't blow up the
+// response payload.
 async function collectFrameLinksMatching(page, keywordRegex) {
   const out = [];
   for (const frame of page.frames()) {
     try {
-      const frameUrl = sanitizeUrl(frame.url());
-      const links = await frame
+      const frameUrlRaw = frame.url();
+      const frameUrlSafe = sanitizeUrl(frameUrlRaw);
+      const rawLinks = await frame
         .locator("a[href], area[href], button")
         .evaluateAll(
           (nodes, patternSource) => {
@@ -89,7 +116,8 @@ async function collectFrameLinksMatching(page, keywordRegex) {
           },
           keywordRegex.source
         );
-      if (links.length) out.push({ frame_url: frameUrl, links });
+      const links = rawLinks.map((l) => ({ text: l.text, href: redactHref(l.href, frameUrlRaw) }));
+      if (links.length) out.push({ frame_url: frameUrlSafe, links });
     } catch {
       /* frame may have detached */
     }
@@ -132,6 +160,7 @@ async function summarizeForms(page) {
 
 module.exports = {
   sanitizeUrl,
+  redactHref,
   summarizeFrame,
   collectFrameSummaries,
   collectFrameLinksMatching,
