@@ -4,7 +4,25 @@ WORKDIR /app
 COPY worker/package.json /app/package.json
 RUN npm install --omit=dev --no-audit --no-fund
 COPY worker/ /app/
+RUN chmod +x /app/entrypoint.sh
+
+# Pre-create the X11 socket directory with the standard tmp permissions
+# (sticky, world-writable). Xvfb refuses to create /tmp/.X11-unix itself
+# when euid != 0 — it logs `_XSERVTransmkdir: ERROR: euid != 0, directory
+# /tmp/.X11-unix will not be created` and exits, which silently breaks
+# the BROWSER_INTENT_HEADLESS=false path because USER below is non-root.
+# Pre-creating here lets xvfb-run bind a socket inside the existing dir
+# without needing root, and the sticky bit (1777) preserves the standard
+# tmp semantics so other users on the image can't tamper with each
+# other's sockets if one is ever added.
+RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
 USER pwuser
 EXPOSE 18902
-CMD ["node", "worker.js"]
+# entrypoint.sh execs `node worker.js` directly in the headless path
+# (the default — headless Chromium ignores DISPLAY) and only wraps with
+# xvfb-run when BROWSER_INTENT_HEADLESS=false. Wrapping unconditionally
+# triggered a PID-1 SIGUSR1 race in xvfb-run that silently hung the
+# worker before node started; the conditional preserves compose's
+# env-var-only flip to non-headless without paying that cost normally.
+CMD ["/app/entrypoint.sh"]

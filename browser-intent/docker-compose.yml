@@ -60,6 +60,18 @@ services:
     environment:
       NODE_ENV: production
       BROWSER_INTENT_POLICY_PATH: /app/policies/sites.json
+      # Headless toggle. Default is true (headless). Flip to "false" and
+      # `docker compose up -d worker` (NO rebuild needed — the Dockerfile
+      # already wraps node with xvfb-run, so a virtual display is ready
+      # whenever Chromium asks for one) to escalate to non-headless
+      # Chromium for portals that fingerprint the headless compositor.
+      # NOTE 2026-05-16: headed mode does NOT defeat TLS JA3 fingerprinting
+      # (Playwright bundles its own Chromium with BoringSSL, identical in
+      # headed and headless), so flipping this won't unblock Hi-Precision.
+      # Useful only for sites that detect headless-specific WebGL/canvas
+      # signals; for JA3 issues, the path is chromium.connectOverCDP() to
+      # a real Chrome instance instead.
+      BROWSER_INTENT_HEADLESS: "true"
       HTTP_PROXY: "http://squid:3128"
       HTTPS_PROXY: "http://squid:3128"
       NO_PROXY: "mcp,worker,infisical,adguard,squid,localhost,127.0.0.1,.local"
@@ -68,6 +80,11 @@ services:
       no_proxy: "mcp,worker,infisical,adguard,squid,localhost,127.0.0.1,.local"
     volumes:
       - ./policies:/app/policies:ro
+      # Read-only mount of the Infisical-sidecar-rendered secrets dir. The
+      # worker re-reads /secrets/.env on each credential lookup (mtime-cached)
+      # so rotated values land without --force-recreate. env_file above is the
+      # bootstrap fallback (populates process.env at container start).
+      - ./secrets-runtime:/secrets:ro
     networks:
       browser-internal:
       platform-net:
@@ -102,9 +119,15 @@ services:
     environment:
       NODE_ENV: production
       BROWSER_INTENT_POLICY_PATH: /app/policies/sites.json
+      BROWSER_INTENT_CLIENTS_PATH: /app/policies/clients.json
       BROWSER_WORKER_URL: http://browser-intent-worker:18902
       BROWSER_INTENT_HTTP_PORT: "18901"
-      BROWSER_INTENT_MCP_TOKEN: ${BROWSER_INTENT_MCP_TOKEN:?missing BROWSER_INTENT_MCP_TOKEN in .env (generate one with: openssl rand -hex 32)}
+      # Per-client tokens. Each one corresponds to an entry in
+      # policies/clients.json (matched by tokenEnvVar). Clients whose env var
+      # is unset are silently skipped — adding a new entry to clients.json is
+      # a no-op until the matching token is provisioned in .env.
+      BROWSER_INTENT_MCP_TOKEN: "${BROWSER_INTENT_MCP_TOKEN:?missing BROWSER_INTENT_MCP_TOKEN in .env - generate one with openssl rand -hex 32}"
+      BROWSER_INTENT_MCP_TOKEN_DR_SMITH: "${BROWSER_INTENT_MCP_TOKEN_DR_SMITH:-}"
     volumes:
       - ./policies:/app/policies:ro
     ports:
