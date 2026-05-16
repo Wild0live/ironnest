@@ -1,0 +1,15 @@
+{
+  "_comment": "Per-client (bearer-token) policy for the browser-intent MCP server. Each entry maps a token to the sites that token is allowed to operate on. The server uses this to narrow the `site` enum in tools/list and to gate /extract calls at the dispatcher. Token values themselves come from environment variables, not this file — only the env var name is referenced here, so the file is safe to commit to the repo. A client whose tokenEnvVar is unset at runtime is silently skipped (cannot match any request), so adding a new entry here without provisioning the env var is a no-op rather than an open door.",
+  "clients": {
+    "admin": {
+      "tokenEnvVar": "BROWSER_INTENT_MCP_TOKEN",
+      "allowedSites": "*",
+      "description": "Maintainer / ops-script token. Full access to every site. Backward-compatible with the original single-token design; existing callers (e.g. the README's Invoke-RestMethod sanity check) keep working."
+    },
+    "hermes_dr_smith": {
+      "tokenEnvVar": "BROWSER_INTENT_MCP_TOKEN_DR_SMITH",
+      "allowedSites": ["april_international", "hi_precision"],
+      "description": "Hermes default profile (@DrSmithVBot). Scoped to April International claims management, plus Hi-Precision diagnostic-portal access (added 2026-05-16). The site enum on every tool returned to this client is narrowed to the listed sites, and a call with site=anything-else is rejected at the dispatcher."
+    }
+  }
+}
