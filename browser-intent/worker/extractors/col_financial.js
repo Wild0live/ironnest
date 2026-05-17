@@ -7,18 +7,28 @@
 // dependent on COL's column wording — if the headers change we throw, the worker
 // returns needs_extractor_update, and a human updates HEADER_MATCHERS below.
 
-const PORTFOLIO_URL_CANDIDATES = [
-  "https://www.colfinancial.com/ape/Final2/main/PORTFOLIO_t.asp",
-  "https://www.colfinancial.com/ape/Final2/home_p.asp",
-  "https://www.colfinancial.com/ape/Final2/"
+// Path templates only. Host is derived from the current page URL because COL
+// assigns each session to a shard (e.g. ph14.colfinancial.com) — hardcoding a
+// host would only work for one user. New layout is FINAL2_STARTER (observed
+// 2026-05-14); the "Portfolio" menu item invokes getwin(44) which navigates
+// parent.frames['main'] to ../trading_PCA3/As_CashBalStockPos.asp. Legacy
+// Final2 paths are kept as fallback for sessions still on the old layout.
+const PORTFOLIO_PATH_CANDIDATES = [
+  "/ape/FINAL2_STARTER/trading_PCA3/As_CashBalStockPos.asp",
+  "/ape/Final2/main/PORTFOLIO_t.asp"
 ];
 
+// Keywords are intentionally specific. The new As_CashBalStockPos page has
+// near-duplicate column names (Stock Code vs Stock Name, Total Shares vs
+// Uncommitted Shares, Market Value vs Cash Balance) so loose substring matches
+// like "stock" or "shares" collide. Each entry must be distinctive enough to
+// land on the intended column.
 const HEADER_MATCHERS = {
-  symbol: ["stock", "symbol", "code", "name"],
-  quantity: ["shares", "quantity", "qty", "total shares"],
-  averageCost: ["ave price", "avg price", "average price", "average cost", "ave cost"],
-  lastPrice: ["last price", "current price", "market price", "last"],
-  marketValue: ["market value", "total value", "value"]
+  symbol: ["stock code", "symbol"],
+  quantity: ["total shares", "quantity"],
+  averageCost: ["average price", "avg price", "ave price", "average cost"],
+  lastPrice: ["market price", "last price", "current price"],
+  marketValue: ["market value"]
 };
 
 function normalize(text) {
@@ -37,62 +47,101 @@ function matchHeaderColumn(headerCells) {
   const normalized = headerCells.map(normalize);
   const out = {};
   for (const [field, candidates] of Object.entries(HEADER_MATCHERS)) {
-    const idx = normalized.findIndex((h) => candidates.some((c) => h.includes(c)));
+    // A real column header is a short label — reject cells over 40 chars, which
+    // are usually concatenated wrapper-row text containing every keyword on
+    // the page. Without this guard, wrapper tables that flatten all nested
+    // content into one cell collapse every field onto the same index.
+    const idx = normalized.findIndex(
+      (h) => h.length > 0 && h.length <= 40 && candidates.some((c) => h.includes(c))
+    );
     if (idx === -1) return null;
     out[field] = idx;
   }
+  // Every field must land on a distinct column. Same-index collisions mean we
+  // matched a concatenation, not a real header row.
+  const indices = Object.values(out);
+  if (new Set(indices).size !== indices.length) return null;
   return out;
 }
 
-async function findHoldingsTable(frame) {
-  const tables = await frame.locator("table").all().catch(() => []);
-  for (const table of tables) {
-    const headerCells = await table
-      .locator("tr")
-      .first()
-      .locator("th, td")
-      .allInnerTexts()
-      .catch(() => []);
-    if (headerCells.length < 3) continue;
-    const columnMap = matchHeaderColumn(headerCells);
-    if (columnMap) return { table, columnMap };
-  }
-  return null;
-}
+// Walk every table in the frame using DIRECT children only. COL's portfolio
+// page wraps the equities table inside several nested layout tables; if we
+// followed descendant cells we'd read the flattened text of every nested
+// table from a single wrapper cell. The wrapper-row guard in matchHeaderColumn
+// catches the worst case but only direct-cell extraction is structurally safe.
+async function findAndExtractRawHoldings(frame, headerMatchers) {
+  return await frame.evaluate(({ matchers }) => {
+    function norm(s) {
+      return (s || "").toLowerCase().replace(/\s+/g, " ").trim();
+    }
+    function parseNum(s) {
+      const cleaned = String(s || "").replace(/[^\d.\-]/g, "");
+      if (!cleaned || cleaned === "-" || cleaned === ".") return null;
+      const n = Number.parseFloat(cleaned);
+      return Number.isFinite(n) ? n : null;
+    }
+    function directRows(table) {
+      const out = [];
+      for (const c of table.children) {
+        if (c.tagName === "TR") out.push(c);
+        else if (c.tagName === "TBODY" || c.tagName === "THEAD" || c.tagName === "TFOOT") {
+          for (const r of c.children) if (r.tagName === "TR") out.push(r);
+        }
+      }
+      return out;
+    }
+    function directCellTexts(row) {
+      const cells = [];
+      for (const c of row.children) {
+        if (c.tagName === "TD" || c.tagName === "TH") {
+          cells.push((c.innerText || "").replace(/\s+/g, " ").trim());
+        }
+      }
+      return cells;
+    }
+    function matchHeader(cells) {
+      const normalized = cells.map(norm);
+      const out = {};
+      for (const [field, candidates] of Object.entries(matchers)) {
+        const idx = normalized.findIndex(
+          (h) => h.length > 0 && h.length <= 40 && candidates.some((c) => h.includes(c))
+        );
+        if (idx === -1) return null;
+        out[field] = idx;
+      }
+      const indices = Object.values(out);
+      if (new Set(indices).size !== indices.length) return null;
+      return out;
+    }
 
-async function extractRows(table, columnMap) {
-  const rowLocators = await table.locator("tr").all();
-  const holdings = [];
-  for (let i = 1; i < rowLocators.length; i++) {
-    const cells = await rowLocators[i].locator("td").allInnerTexts().catch(() => []);
-    if (!cells.length) continue;
+    const tables = document.querySelectorAll("table");
+    for (const table of tables) {
+      const rows = directRows(table);
+      for (let i = 0; i < rows.length; i++) {
+        const headerCells = directCellTexts(rows[i]);
+        if (headerCells.length < 5) continue;
+        const cols = matchHeader(headerCells);
+        if (!cols) continue;
 
-    const symbolRaw = cells[columnMap.symbol];
-    const symbol = normalize(symbolRaw).toUpperCase().split(" ")[0];
-    if (!symbol || symbol.length > 10) continue;
-
-    const quantity = parseNumber(cells[columnMap.quantity]);
-    const averageCost = parseNumber(cells[columnMap.averageCost]);
-    const lastPrice = parseNumber(cells[columnMap.lastPrice]);
-    const marketValueRaw = parseNumber(cells[columnMap.marketValue]);
-    if (quantity === null || averageCost === null || lastPrice === null) continue;
-
-    const marketValue = marketValueRaw !== null ? marketValueRaw : quantity * lastPrice;
-    const costBasis = quantity * averageCost;
-    const unrealizedPnl = marketValue - costBasis;
-    const unrealizedPnlPct = costBasis !== 0 ? (unrealizedPnl / costBasis) * 100 : 0;
-
-    holdings.push({
-      symbol,
-      quantity,
-      average_cost: round(averageCost, 4),
-      last_price: round(lastPrice, 4),
-      market_value: round(marketValue, 2),
-      unrealized_pnl: round(unrealizedPnl, 2),
-      unrealized_pnl_pct: round(unrealizedPnlPct, 2)
-    });
-  }
-  return holdings;
+        const holdings = [];
+        for (let j = i + 1; j < rows.length; j++) {
+          const cells = directCellTexts(rows[j]);
+          if (!cells.length) continue;
+          const symbol = norm(cells[cols.symbol] || "").toUpperCase().split(" ")[0];
+          if (!symbol || symbol.length > 10) continue;
+          if (/^total/i.test(symbol)) continue;
+          const quantity = parseNum(cells[cols.quantity]);
+          const averageCost = parseNum(cells[cols.averageCost]);
+          const lastPrice = parseNum(cells[cols.lastPrice]);
+          const marketValue = parseNum(cells[cols.marketValue]);
+          if (quantity === null || averageCost === null || lastPrice === null) continue;
+          holdings.push({ symbol, quantity, averageCost, lastPrice, marketValue });
+        }
+        if (holdings.length) return holdings;
+      }
+    }
+    return null;
+  }, { matchers: headerMatchers });
 }
 
 function round(value, digits) {
@@ -101,10 +150,22 @@ function round(value, digits) {
 }
 
 async function tryNavigate(page) {
-  for (const url of PORTFOLIO_URL_CANDIDATES) {
+  // Derive host from the current logged-in page so the same code works across
+  // COL's shard pool (www.colfinancial.com → phNN.colfinancial.com after login).
+  let base;
+  try {
+    const cur = new URL(page.url());
+    base = `${cur.protocol}//${cur.host}`;
+  } catch {
+    base = "https://www.colfinancial.com";
+  }
+  for (const path of PORTFOLIO_PATH_CANDIDATES) {
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+      const response = await page.goto(`${base}${path}`, { waitUntil: "domcontentloaded", timeout: 20000 });
       await page.waitForTimeout(1500);
+      // page.goto returns the response for the main resource. IIS 404 returns a
+      // valid HTML body so playwright doesn't throw — explicitly skip 4xx/5xx.
+      if (response && response.status() >= 400) continue;
       return;
     } catch {
       // Try the next candidate.
@@ -116,18 +177,33 @@ async function getPortfolio(page) {
   await tryNavigate(page);
 
   const frames = [page.mainFrame(), ...page.frames().filter((f) => f !== page.mainFrame())];
-  let found = null;
+  let rawHoldings = null;
   for (const frame of frames) {
-    found = await findHoldingsTable(frame).catch(() => null);
-    if (found) break;
+    rawHoldings = await findAndExtractRawHoldings(frame, HEADER_MATCHERS).catch(() => null);
+    if (rawHoldings) break;
   }
-  if (!found) {
+  if (!rawHoldings) {
     const error = new Error("col_financial portfolio table not found");
     error.code = "needs_extractor_update";
     throw error;
   }
 
-  const holdings = await extractRows(found.table, found.columnMap);
+  const holdings = rawHoldings.map((h) => {
+    const marketValue = h.marketValue !== null ? h.marketValue : h.quantity * h.lastPrice;
+    const costBasis = h.quantity * h.averageCost;
+    const unrealizedPnl = marketValue - costBasis;
+    const unrealizedPnlPct = costBasis !== 0 ? (unrealizedPnl / costBasis) * 100 : 0;
+    return {
+      symbol: h.symbol,
+      quantity: h.quantity,
+      average_cost: round(h.averageCost, 4),
+      last_price: round(h.lastPrice, 4),
+      market_value: round(marketValue, 2),
+      unrealized_pnl: round(unrealizedPnl, 2),
+      unrealized_pnl_pct: round(unrealizedPnlPct, 2)
+    };
+  });
+
   if (!holdings.length) {
     return {
       site: "col_financial",
@@ -280,4 +356,12 @@ async function diagnosePortfolio(page) {
   };
 }
 
-module.exports = { getPortfolio, diagnosePortfolio };
+module.exports = {
+  getPortfolio,
+  diagnosePortfolio,
+  // Test-only:
+  parseNumber,
+  matchHeaderColumn,
+  normalize,
+  round
+};

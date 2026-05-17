@@ -91,11 +91,11 @@ services:
       # All HTTP/HTTPS egress forced through Squid, which only allows AI APIs.
       HTTP_PROXY: "http://squid:3128"
       HTTPS_PROXY: "http://squid:3128"
-      NO_PROXY: "infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+      NO_PROXY: "infisical,adguard,squid,socket-proxy,browser-intent-mcp,browser-intent-worker,localhost,127.0.0.1,.local"
       # Lowercase variants — many clients look for these instead.
       http_proxy: "http://squid:3128"
       https_proxy: "http://squid:3128"
-      no_proxy: "infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+      no_proxy: "infisical,adguard,squid,socket-proxy,browser-intent-mcp,browser-intent-worker,localhost,127.0.0.1,.local"
     ports:
       - "127.0.0.1:18789:18789"   # UI — localhost only
     volumes:
@@ -151,10 +151,10 @@ services:
       # through Squid because direct egress from openclaw_ingress is blocked.
       HTTP_PROXY: "http://squid:3128"
       HTTPS_PROXY: "http://squid:3128"
-      NO_PROXY: "openclaw-gateway,infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+      NO_PROXY: "openclaw-gateway,infisical,adguard,squid,socket-proxy,browser-intent-mcp,browser-intent-worker,localhost,127.0.0.1,.local"
       http_proxy: "http://squid:3128"
       https_proxy: "http://squid:3128"
-      no_proxy: "openclaw-gateway,infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+      no_proxy: "openclaw-gateway,infisical,adguard,squid,socket-proxy,browser-intent-mcp,browser-intent-worker,localhost,127.0.0.1,.local"
       # OpenClaw loads bundled plugin runtimes in the CLI process; the default
       # Node heap can OOM during first-run status/model discovery.
       NODE_OPTIONS: "--max-old-space-size=768"

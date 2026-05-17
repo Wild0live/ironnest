@@ -326,37 +326,46 @@ All other destinations: **denied**. Browser Intent's source-IP ACL means even if
 
 The AI-facing surface is `browser-intent-mcp`, never the worker. It exposes named intent tools only — no raw browser controls, no DOM access, no JavaScript eval, no arbitrary navigation, no Infisical reads.
 
-**Login/session tools:**
+Each action is exposed as a single tool that takes a `site` argument. The per-tool `site` enum is derived from `policies/sites.json`: only sites whose `allowedTools` list the action appear in the enum, so disallowed `(site, action)` combinations are rejected at the MCP schema layer.
+
+**Session tools:**
 ```
-login_col_financial
-login_maxicare
-login_april_international
-login_hi_precision
-check_site_session
-logout_site
-list_browser_intent_sites
+login           { site }
+logout          { site }
+check_session   { site }
+provide_otp     { site, code }        — only enum site is maxicare
+list_browser_intent_sites             — no args
 ```
 
 **Post-login data tools (gated):**
 ```
-col_financial_get_portfolio        — holdings + totals (sanitized JSON)
-col_financial_diagnose_portfolio   — frame/header structural metadata only (no cell values)
+get_portfolio        { site }                      — holdings + totals (col_financial)
+get_account_info     { site }                      — maxicare, april_international
+get_policy_summary   { site }                      — maxicare
+get_policy_info      { site }                      — april_international
+get_claims_history   { site }                      — april_international
+get_claim_status     { site, claim_id }            — april_international
+get_documents_list   { site }                      — april_international
+submit_claim         { site, treatment_date, ... } — april_international (WRITE; dry_run=true by default)
 ```
+
+**Diagnostic tools (maintainer-only, off by default):** `diagnose_login_form`, `diagnose_member_portal`, `diagnose_portfolio`, `diagnose_claim_form`. Set `BROWSER_INTENT_ENABLE_DIAGNOSTICS=true` on the MCP container to expose them; leave unset in normal operation so the LLM never sees them.
 
 ### Security invariants
 
 1. **Credentials never reach the LLM.** Username, password, and `TOTP_SECRET` are rendered into the worker's environment by the Infisical sidecar and used only by Playwright. No tool returns them.
 2. **Login/session tools never return post-login data.** They return only `{status, ...}`.
-3. **Post-login data tools** are explicit, allowlisted opt-ins:
+3. **Per-client site scoping (`policies/clients.json`).** Each bearer token maps to a site allowlist. The MCP server intersects every tool's `site` enum with the calling client's `allowedSites`; tools with an empty intersection are dropped from `tools/list`, and a `tools/call` for a non-allowed site is rejected at the dispatcher. Hermes' default profile (Dr. Smith / @DrSmithVBot) is scoped to April International only; the `admin` client (existing `BROWSER_INTENT_MCP_TOKEN`) keeps full access for ops scripts. Clients whose `tokenEnvVar` is unset are silently skipped, so adding an entry without provisioning the secret is a no-op.
+4. **Post-login data tools** are explicit, allowlisted opt-ins:
    - Each new action must appear in `policies/sites.json` under the site's `allowedTools` array.
-   - Session is required: if the worker has no logged-in session for the site, the call returns `{status: "session_expired"}` so the LLM is forced to call `login_<site>` first.
+   - Session is required: if the worker has no logged-in session for the site, the call returns `{status: "session_expired"}` so the LLM is forced to call `login` (with the same `site`) first.
    - Returns only the documented JSON shape — no raw HTML, cookies, screenshots, or unparsed DOM.
    - Each call is audit-logged with `returned_sensitive_data: true`.
    - If the page DOM has drifted and the extractor cannot locate its target, the worker returns `{status: "needs_extractor_update"}` rather than guessing.
 
 ### Extractor module layout
 
-`browser-intent/worker/extractors/<site>.js` exports functions named after the snake_case action (e.g. `getPortfolio`, `diagnosePortfolio`). The worker resolves `<site>_<action>` MCP calls to the matching module and method dynamically — adding a new extraction action means dropping a new file and listing the action in `policies/sites.json`; no MCP server code changes.
+`browser-intent/worker/extractors/<site>.js` exports functions named after the snake_case action (e.g. `getPortfolio`, `diagnosePortfolio`). The MCP server forwards each tool call as `{ site, action, args }` over `/extract`; the worker resolves that to the matching module and method dynamically — adding a new extraction action means dropping a new file and listing the action in `policies/sites.json` and `ACTIONS` in `mcp-server/server.js`. The `site` enum on the tool is derived automatically from `allowedTools`, so listing the action under a new site is enough to make it callable for that site.
 
 The first concrete extractor is `extractors/col_financial.js`: it frame-scans COL's classic-ASP `/ape/Final2/` portal for a holdings table whose headers match `HEADER_MATCHERS` (a forgiving allowlist of expected column names), then returns symbol/quantity/average-cost/last-price/market-value/unrealized-P&L per row plus totals. Header drift throws `needs_extractor_update` — humans patch `HEADER_MATCHERS` rather than letting the extractor silently mismatch.
 

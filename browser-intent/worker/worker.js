@@ -86,6 +86,30 @@ const loginWindowMs = Number(process.env.BROWSER_INTENT_LOGIN_WINDOW_MINUTES || 
 // SMS OTP codes typically expire in 3-5 min upstream; match that here so we
 // don't tie up Chromium beyond the code's usable lifetime.
 const otpTtlMs = Number(process.env.BROWSER_INTENT_OTP_TTL_SECONDS || 300) * 1000;
+// Bound the time spent inside a single extractor invocation. workerCall on
+// the MCP side has a 60s outer abort, but that only kills the HTTP request —
+// the worker's Chromium can still be stuck waiting for a DOM event that
+// never fires. With a per-action timeout, a hung extractor surfaces as
+// needs_extractor_update (via the error code remap) instead of consuming
+// the worker's only Chromium for the full MCP timeout window. 45s default
+// leaves enough headroom for real extraction work; tune per deployment.
+const extractorTimeoutMs = Number(process.env.BROWSER_INTENT_EXTRACTOR_TIMEOUT_SECONDS || 45) * 1000;
+
+// Race a promise against a per-action timeout. On timeout the returned
+// promise rejects with an Error carrying code="extractor_timeout"; the
+// caller maps that to a structured status payload so the LLM sees a clean
+// rejection rather than a generic upstream error.
+function withActionTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const e = new Error(`extractor '${label}' exceeded ${ms}ms`);
+      e.code = "extractor_timeout";
+      reject(e);
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 // Per-site mutex. Login/logout/extract on the same site must serialize, or two
 // concurrent calls race the sessions Map and leak Chromium instances; on real
@@ -246,13 +270,42 @@ function totp(secretValue, timeStep = 30, digits = 6, counterOffset = 0) {
   return String(code % (10 ** digits)).padStart(digits, "0");
 }
 
+// Normalized status vocabulary — MUST stay in sync with mcp-server/server.js
+// `STATUS_KIND`. Keep both copies updated when a new worker status string is
+// introduced; dashboards group on status_kind, not on the raw status. An
+// unmapped status falls through to "unknown" so an alert on
+// `status_kind:unknown` surfaces drift.
+const STATUS_KIND = {
+  success: ["ok", "logged_in", "logged_out", "dry_run", "listed_sites", "session_exists"],
+  needs_user: [
+    "awaiting_otp", "awaiting_fresh_sms", "needs_user_action",
+    "no_pending_otp", "otp_expired"
+  ],
+  session_expired: ["session_expired", "no_session"],
+  rate_limited: ["rate_limited"],
+  needs_update: ["needs_extractor_update", "needs_site_selector_update"],
+  denied: ["denied_by_client_policy", "denied_invalid_args", "worker_auth_rejected"],
+  error: ["failed", "extractor_timeout"]
+};
+const _statusKindIndex = new Map();
+for (const [kind, statuses] of Object.entries(STATUS_KIND)) {
+  for (const s of statuses) _statusKindIndex.set(s, kind);
+}
+function statusToKind(status) {
+  if (typeof status !== "string" || status.length === 0) return "unknown";
+  return _statusKindIndex.get(status) || "unknown";
+}
+
 function audit(event) {
   // event_type=audit lets the Wazuh dashboard filter audit events out of the
   // generic stderr stream that Fluent Bit ships under ironnest-containers-*.
+  // status_kind classifies the free-text `result` into a stable enum.
+  const status_kind = "status_kind" in event ? event.status_kind : statusToKind(event.result);
   process.stderr.write(`${JSON.stringify({
     timestamp: new Date().toISOString(),
     component: "browser-intent-worker",
     event_type: "audit",
+    status_kind,
     ...event
   })}\n`);
 }
@@ -299,8 +352,17 @@ async function mfaLikely(page) {
   const bodyText = (await page.locator("body").innerText({ timeout: 3000 }).catch(() => "")).toLowerCase();
   const terms = ["otp", "one-time", "one time", "verification code", "authenticator", "2fa", "mfa", "captcha"];
   const hasTextSignal = terms.some((term) => bodyText.includes(term));
-  const hasOtpInput = await page.locator("input[name*='otp' i], input[name*='code' i], input[autocomplete='one-time-code']").count().catch(() => 0);
-  return hasTextSignal || hasOtpInput > 0;
+  // Only count VISIBLE OTP-shaped inputs. Sites like Hi-Precision render
+  // optional 2FA-setup inputs on the post-login dashboard (e.g. otpPassword,
+  // receiveOTP) hidden by default — treating their mere presence as a
+  // required MFA gate produced a false positive that masked a successful
+  // login. `body.innerText` already excludes display:none content, so the
+  // text-signal half doesn't need a parallel guard.
+  const hasVisibleOtpInput = await page
+    .locator("input[name*='otp' i]:visible, input[name*='code' i]:visible, input[autocomplete='one-time-code']:visible")
+    .count()
+    .catch(() => 0);
+  return hasTextSignal || hasVisibleOtpInput > 0;
 }
 
 // Patch outbound headers to match what real Chrome sends. Headless Chromium
@@ -728,18 +790,45 @@ async function snapshotPage(page) {
   };
 }
 
-// Substitute templated tokens in a login URL. Currently supports
-// {{code_challenge}} for sites whose loginUrl is an OAuth 2.0 + PKCE entry
-// point (April International). The associated code_verifier is generated
-// here and discarded — we only need the challenge for the initial GET,
-// and don't follow the redirect back to the redirect_uri ourselves, so the
-// verifier is never needed for a token exchange. If a site adds token-
-// exchange in the future, store the verifier alongside the pending session.
+// Registry of {{placeholder}} substituters for site.loginUrl. A single
+// regex sweep replaces every recognized token; an unrecognized token throws
+// rather than passing through to the upstream URL. That fail-fast property
+// matters: if a future sites.json edit typos `{{cod_challenge}}`, the
+// literal string would otherwise hit the remote portal as part of a real
+// HTTP GET and surface in its logs. Now it crashes the login call with a
+// clear error before any network egress happens.
+//
+// Each substituter is called fresh per replacement and returns the value to
+// splice in. Add new tokens by extending this object.
+//
+// Current tokens:
+//   {{code_challenge}} — PKCE S256 challenge for OAuth 2.0 + PKCE entry
+//   points (April International). The associated code_verifier is generated
+//   here and discarded; we don't follow the redirect back to the
+//   redirect_uri ourselves, so the verifier is never needed for a token
+//   exchange. If a site adds token-exchange in the future, store the
+//   verifier alongside the pending session.
+const URL_PLACEHOLDERS = {
+  code_challenge() {
+    const verifier = crypto.randomBytes(32).toString("base64url");
+    return crypto.createHash("sha256").update(verifier).digest("base64url");
+  }
+};
+const URL_PLACEHOLDER_RE = /\{\{(\w+)\}\}/g;
+
 function resolveLoginUrl(rawUrl) {
-  if (!rawUrl.includes("{{code_challenge}}")) return rawUrl;
-  const verifier = crypto.randomBytes(32).toString("base64url");
-  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
-  return rawUrl.replace(/\{\{code_challenge\}\}/g, challenge);
+  return rawUrl.replace(URL_PLACEHOLDER_RE, (_, key) => {
+    const fn = URL_PLACEHOLDERS[key];
+    if (!fn) {
+      // Throwing here surfaces a misconfigured sites.json at the first
+      // login attempt rather than leaking the literal token into an
+      // upstream URL. Listed keys give the operator a copy-paste-ready
+      // hint at the cause.
+      const known = Object.keys(URL_PLACEHOLDERS).map((k) => `{{${k}}}`).join(", ") || "(none)";
+      throw new Error(`unknown loginUrl placeholder '{{${key}}}' — supported: ${known}`);
+    }
+    return fn();
+  });
 }
 
 async function _login(siteId) {
@@ -1076,6 +1165,30 @@ async function _login(siteId) {
       .catch(() => {});
     await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
     await page.waitForTimeout(1500);
+  }
+  // Post-submit settle. If we're still on the login URL after the initial
+  // 1500ms, the site may be running a slower JS-driven redirect chain
+  // (Hi-Precision: XHR validate → form POST → 302 → cross-domain dashboard).
+  // Wait for the URL to leave loginUrl OR for any loggedInUrlPattern to
+  // appear, then let the network settle. Best-effort: if neither happens
+  // confirmLoggedIn will still run and we'll fall through to needs_user_action.
+  if (page.url().split(/[?#]/)[0] === site.loginUrl.split(/[?#]/)[0]) {
+    const loginUrlPath = (() => {
+      try { return new URL(site.loginUrl).pathname; } catch { return ""; }
+    })();
+    const patterns = site.loggedInUrlPatterns || [];
+    await page
+      .waitForFunction(
+        ({ loginPath, patterns }) => {
+          const href = window.location.href;
+          if (loginPath && !href.includes(loginPath)) return true;
+          return patterns.some((p) => href.includes(p));
+        },
+        { loginPath: loginUrlPath, patterns },
+        { timeout: 15000 }
+      )
+      .catch(() => {});
+    await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
   }
   let usedTotp = false;
   let loggedIn = await confirmLoggedIn(page, site);
@@ -1604,7 +1717,16 @@ async function _extract(siteId, action, args) {
     // (every existing one) simply ignore it — they're declared as
     // `function fn(page) {}` and the extra arg is dropped by the engine.
     // New write-class tools (submit_claim) destructure it explicitly.
-    const result = await extractor[method](session.page, args || {});
+    // Wrap in a per-action timeout: if the extractor wedges on a DOM
+    // wait (network black-hole, infinite redirect, missing element), the
+    // worker would otherwise consume its only Chromium for the full MCP
+    // outer timeout (~60s). withActionTimeout rejects fast with
+    // code="extractor_timeout", remapped below to a clean status payload.
+    const result = await withActionTimeout(
+      extractor[method](session.page, args || {}),
+      extractorTimeoutMs,
+      `${siteId}.${action}`
+    );
     session.lastActivity = Date.now();
     audit({
       action,
@@ -1617,6 +1739,16 @@ async function _extract(siteId, action, args) {
     if (error.code === "needs_extractor_update") {
       audit({ action, site: siteId, result: "needs_extractor_update", returned_sensitive_data: false });
       return { site: siteId, status: "needs_extractor_update", returned_sensitive_data: false };
+    }
+    if (error.code === "extractor_timeout") {
+      audit({
+        action,
+        site: siteId,
+        result: "extractor_timeout",
+        timeout_ms: extractorTimeoutMs,
+        returned_sensitive_data: false
+      });
+      return { site: siteId, status: "extractor_timeout", timeout_ms: extractorTimeoutMs, returned_sensitive_data: false };
     }
     throw error;
   }
@@ -1660,6 +1792,29 @@ async function readJson(req) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
+// Shared-secret auth between MCP and worker. Must match the MCP side's
+// `BROWSER_INTENT_WORKER_SECRET` env. When unset, the worker logs a warning
+// at boot and accepts requests (bootstrap fallback for fresh deployments
+// where the operator hasn't yet generated the secret) — production stacks
+// should always set it. /healthz is exempt: the compose healthcheck runs
+// inside this container and we don't want it reading .env.
+// Read the env fresh on each call so tests can flip the secret without
+// reloading the module. Production hot path is one env lookup per request,
+// which is cheaper than the JSON parse that follows.
+function workerAuthOk(req, expectedSecret = process.env.BROWSER_INTENT_WORKER_SECRET || "") {
+  if (!expectedSecret) return true; // bootstrap fallback; warned at boot
+  const provided = req.headers && req.headers["x-worker-auth"];
+  if (typeof provided !== "string" || provided.length === 0) return false;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expectedSecret);
+  if (a.length !== b.length) return false;
+  try {
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url === "/healthz") {
@@ -1671,6 +1826,20 @@ const server = http.createServer(async (req, res) => {
     if (req.method !== "POST") {
       res.writeHead(405, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "method_not_allowed" }));
+      return;
+    }
+
+    if (!workerAuthOk(req)) {
+      // Route through audit() so the event picks up status_kind:denied like
+      // every other denial event in the system. A misconfigured MCP or a
+      // hostile sibling container surfaces uniformly in Wazuh.
+      audit({
+        result: "worker_auth_rejected",
+        path: req.url,
+        remote: req.socket && req.socket.remoteAddress
+      });
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "worker_auth_required" }));
       return;
     }
 
@@ -1713,6 +1882,12 @@ module.exports = {
   parseDotEnv,
   readRenderedSecrets,
   getSmsCooldownState,
+  workerAuthOk,
+  statusToKind,
+  STATUS_KIND,
+  resolveLoginUrl,
+  URL_PLACEHOLDERS,
+  withActionTimeout,
   __setSmsCooldownForTest(siteId, untilMs, smsLikelyFresh) {
     smsCooldown.set(siteId, { until: untilMs, smsLikelyFresh });
   },
@@ -1729,6 +1904,14 @@ module.exports = {
 if (require.main === module) {
   // 0.0.0.0 is required: worker is on an isolated Docker internal network (browser-internal);
   // access is limited to the MCP container — never published to the host.
+  if (!process.env.BROWSER_INTENT_WORKER_SECRET) {
+    process.stderr.write(`${JSON.stringify({
+      timestamp: new Date().toISOString(),
+      component: "browser-intent-worker",
+      level: "warn",
+      msg: "BROWSER_INTENT_WORKER_SECRET is unset; worker is accepting unauthenticated requests. Generate with `openssl rand -hex 32`, add to .env, and set on both worker and mcp services."
+    })}\n`);
+  }
   server.listen(port, "0.0.0.0");
   startIdleReaper();
 

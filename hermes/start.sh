@@ -40,9 +40,10 @@ docker compose up -d --no-build
 # Must run after compose up so hermes_ingress network exists.
 "$PLATFORM/ops/fix-hermes-egress.sh"
 
-echo "--- waiting for hermes-ttyd and hermes-gateway to be healthy ---"
+echo "--- waiting for hermes-ttyd, hermes-gateway, hermes-gateway-wifey to be healthy ---"
 until [ "$(docker inspect -f '{{.State.Health.Status}}' hermes-ttyd 2>/dev/null)" = "healthy" ] \
-   && [ "$(docker inspect -f '{{.State.Health.Status}}' hermes-gateway 2>/dev/null)" = "healthy" ]; do
+   && [ "$(docker inspect -f '{{.State.Health.Status}}' hermes-gateway 2>/dev/null)" = "healthy" ] \
+   && [ "$(docker inspect -f '{{.State.Health.Status}}' hermes-gateway-wifey 2>/dev/null)" = "healthy" ]; do
   printf '.'
   sleep 5
 done
@@ -52,7 +53,8 @@ echo ""
 echo "=== Hermes Agent is ready ==="
 echo "  Browser terminal:  http://127.0.0.1:7682"
 echo "  Via Traefik:       https://hermes.ironnest.local"
-echo "  Gateway:           hermes-gateway (Compose-managed)"
+echo "  Gateways:          hermes-gateway (default → @DrSmithVBot)"
+echo "                     hermes-gateway-wifey (wifey → @may192007_bot)"
 echo ""
 echo "  Credentials: Infisical → project 'hermes' → HERMES_TTYD_USERNAME / HERMES_TTYD_PASSWORD"
 echo ""

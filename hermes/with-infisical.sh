@@ -33,12 +33,16 @@ INFISICAL_PATH="${INFISICAL_PATH:-/}"
 LOGIN_HOME=$(mktemp -d)
 trap 'rm -rf "$LOGIN_HOME"' EXIT
 
-TOKEN=$(HOME="$LOGIN_HOME" infisical login \
+# Pass token via INFISICAL_TOKEN env var rather than --token=, so it never
+# appears in argv (visible to anyone who can `ps -ef` inside the container).
+# Same reasoning for the login: client-id/client-secret are read from the
+# already-exported INFISICAL_UNIVERSAL_AUTH_CLIENT_{ID,SECRET} env vars
+# instead of being passed as --client-id / --client-secret flags.
+INFISICAL_TOKEN=$(HOME="$LOGIN_HOME" infisical login \
   --method=universal-auth \
-  --client-id="$INFISICAL_UNIVERSAL_AUTH_CLIENT_ID" \
-  --client-secret="$INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET" \
   --domain="$INFISICAL_DOMAIN" \
   --plain --silent)
+export INFISICAL_TOKEN
 
 unset INFISICAL_UNIVERSAL_AUTH_CLIENT_ID INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET
 
@@ -47,7 +51,6 @@ rm -rf "$LOGIN_HOME"
 trap - EXIT
 
 exec infisical run \
-  --token="$TOKEN" \
   --domain="$INFISICAL_DOMAIN" \
   --projectId="$INFISICAL_PROJECT_ID" \
   --env="$INFISICAL_ENV" \

@@ -3,8 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "type": "commonjs",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
   "dependencies": {
-    "playwright": "1.56.1"
+    "playwright": "1.56.1",
+    "playwright-extra": "4.3.6",
+    "puppeteer-extra-plugin-stealth": "2.11.2"
   }
 }
 

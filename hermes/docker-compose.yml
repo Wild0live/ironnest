@@ -1,9 +1,14 @@
 # Hermes Agent — NousResearch hermes-agent v2026.5.7 + ttyd browser terminal.
 # On-demand stack: start with ./hermes/start.sh (do not add to bootstrap.sh).
 #
-# Two services:
-#   1. hermes-ttyd:      ttyd wrapping `hermes` TUI (browser-accessible terminal)
-#   2. hermes-gateway:   persistent messaging gateway (Telegram, etc.)
+# Three services:
+#   1. hermes-ttyd:           ttyd wrapping `hermes` TUI (browser-accessible terminal)
+#   2. hermes-gateway:        persistent messaging gateway for the `default` profile (@DrSmithVBot)
+#   3. hermes-gateway-wifey:  persistent messaging gateway for the `wifey`   profile (@may192007_bot)
+#
+# Each gateway = one Telegram bot. Per-profile .env files live at:
+#   default: /opt/data/.env
+#   wifey:   /opt/data/profiles/wifey/.env
 #
 # Secrets flow (option 3 — process-memory only):
 #   Each service starts via /usr/local/bin/with-infisical, which logs in to the
@@ -30,6 +35,14 @@ networks:
 volumes:
   hermes-data:
     name: hermes_hermes-data    # Hermes home: config, sessions, memories, skills
+  # Shared inbox for handing files (e.g. Telegram-cached images) to
+  # browser-intent's submit_claim. Hermes writes here as uid 10000 with
+  # mode 0644 (umask 022); browser-intent worker mounts the same volume
+  # read-only at /uploads/from-hermes. Workflow:
+  #   cp /opt/data/cache/images/img_X.jpg /opt/uploads-out/
+  #   then call submit_claim with receipts=["/uploads/from-hermes/img_X.jpg"]
+  hermes-to-browser-intent:
+    external: true
 
 x-logging: &default-logging
   driver: json-file
@@ -90,13 +103,14 @@ services:
       # All outbound HTTPS routed through Squid (openrouter.ai allowlisted).
       HTTPS_PROXY: "http://squid:3128"
       HTTP_PROXY: "http://squid:3128"
-      NO_PROXY: "infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+      NO_PROXY: "infisical,adguard,squid,socket-proxy,browser-intent-mcp,browser-intent-worker,localhost,127.0.0.1,.local"
       https_proxy: "http://squid:3128"
       http_proxy: "http://squid:3128"
-      no_proxy: "infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+      no_proxy: "infisical,adguard,squid,socket-proxy,browser-intent-mcp,browser-intent-worker,localhost,127.0.0.1,.local"
     logging: *default-logging
     volumes:
       - hermes-data:/opt/data
+      - hermes-to-browser-intent:/opt/uploads-out
     ports:
       - "127.0.0.1:7682:7682"
       - "127.0.0.1:9119:9119"
@@ -154,13 +168,14 @@ services:
       TERMINAL_ENV: "local"
       HTTPS_PROXY: "http://squid:3128"
       HTTP_PROXY: "http://squid:3128"
-      NO_PROXY: "infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+      NO_PROXY: "infisical,adguard,squid,socket-proxy,browser-intent-mcp,browser-intent-worker,localhost,127.0.0.1,.local"
       https_proxy: "http://squid:3128"
       http_proxy: "http://squid:3128"
-      no_proxy: "infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+      no_proxy: "infisical,adguard,squid,socket-proxy,browser-intent-mcp,browser-intent-worker,localhost,127.0.0.1,.local"
     logging: *default-logging
     volumes:
       - hermes-data:/opt/data
+      - hermes-to-browser-intent:/opt/uploads-out
     networks:
       - platform-net
     dns:
@@ -181,6 +196,69 @@ services:
           memory: 512M
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ── Hermes messaging gateway — `wifey` profile ────────────────────────────
+  # Second Hermes gateway, runs against the `wifey` profile so a separate
+  # Telegram bot (token in /opt/data/profiles/wifey/.env) gets its own poller.
+  # Shares the hermes-data volume with hermes-gateway; lock contention is
+  # avoided because each profile has its own gateway.lock under its profile dir.
+  hermes-gateway-wifey:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: platform/hermes-agent:v2026.5.7-patched
+    container_name: hermes-gateway-wifey
+    restart: unless-stopped
+    command:
+      - with-infisical
+      - sh
+      - -c
+      - |
+        export TELEGRAM_HOME_CHANNEL="$${TELEGRAM_HOME_CHANNEL:-$${TELEGRAM_ALLOWED_USERS:-}}"
+        export TELEGRAM_HOME_CHANNEL_NAME="$${TELEGRAM_HOME_CHANNEL_NAME:-IronNest Hermes (wifey)}"
+        exec hermes -p wifey gateway run
+    env_file:
+      - path: ./.env
+    environment:
+      HERMES_UID: "10000"
+      HERMES_GID: "10000"
+      INFISICAL_PROJECT_ID: "2777cf9a-8ed7-43d0-84ed-8cb48f9b03ad"
+      PATH: "/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      TERMINAL_ENV: "local"
+      HTTPS_PROXY: "http://squid:3128"
+      HTTP_PROXY: "http://squid:3128"
+      NO_PROXY: "infisical,adguard,squid,socket-proxy,browser-intent-mcp,browser-intent-worker,localhost,127.0.0.1,.local"
+      https_proxy: "http://squid:3128"
+      http_proxy: "http://squid:3128"
+      no_proxy: "infisical,adguard,squid,socket-proxy,browser-intent-mcp,browser-intent-worker,localhost,127.0.0.1,.local"
+    logging: *default-logging
+    volumes:
+      - hermes-data:/opt/data
+      - hermes-to-browser-intent:/opt/uploads-out
+    networks:
+      - platform-net
+    dns:
+      - 172.30.0.10
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'hermes -p wifey gateway run' >/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 3

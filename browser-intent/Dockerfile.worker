@@ -17,6 +17,12 @@ RUN chmod +x /app/entrypoint.sh
 # other's sockets if one is ever added.
 RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
+# Pre-create the named-volume mountpoint inside the read-only /uploads tree.
+# Docker can mount named volumes into a ro parent (it creates the mountpoint
+# during volume setup) but a bind mount needs the directory to exist in the
+# image first; /results lives at top-level for that reason.
+RUN mkdir -p /uploads/from-hermes
+
 USER pwuser
 EXPOSE 18902
 # entrypoint.sh execs `node worker.js` directly in the headless path

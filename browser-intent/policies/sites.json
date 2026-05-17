@@ -7,7 +7,7 @@
       "allowedDomains": ["colfinancial.com", "*.colfinancial.com"],
       "secretPrefix": "COL_FINANCIAL",
       "secretPath": "/sites/col-financial",
-      "allowedTools": ["login", "check_session", "logout", "get_portfolio", "diagnose_portfolio"],
+      "allowedTools": ["login", "logout", "check_session", "get_portfolio", "diagnose_portfolio"],
       "loginSelectors": {
         "username": ["input[name='txtUser1']"],
         "username2": ["input[name='txtUser2']"],
@@ -15,56 +15,73 @@
         "totp": ["input[name*='otp' i]", "input[name*='code' i]", "input[autocomplete='one-time-code']"],
         "submit": ["input[type='button'][value='LOG IN']", "input[name='cmdLogOn']", "input[type='button']"]
       },
-      "loggedInUrlPatterns": ["/ape/Final2/main/"],
-      "loggedInSignals": ["logout", "portfolio", "watchlist"]
+      "loggedInUrlPatterns": ["/ape/FINAL2_STARTER/", "/ape/Final2/main/"],
+      "loggedInSignals": ["logout", "portfolio", "watchlist", "last login"]
     },
     "maxicare": {
       "displayName": "Maxicare",
       "riskLevel": "medical",
-      "loginUrl": "https://usqp.maxihealth.com.ph/member",
-      "allowedDomains": ["usqp.maxihealth.com.ph", "*.maxihealth.com.ph"],
+      "loginUrl": "https://membergateway.maxicare.com.ph/login",
+      "allowedDomains": ["membergateway.maxicare.com.ph", "*.maxicare.com.ph"],
       "secretPrefix": "MAXICARE",
       "secretPath": "/sites/maxicare",
-      "allowedTools": ["login", "check_session", "logout", "diagnose_member_portal"],
+      "allowedTools": ["login", "logout", "check_session", "diagnose_member_portal", "diagnose_login_form", "provide_otp", "get_policy_summary", "get_account_info"],
+      "loginFlow": "username_otp",
+      "enforceSubresourceAllowlist": false,
       "loginSelectors": {
-        "username": ["input[name='username']", "input[name='email']", "input[type='email']", "input[type='text']"],
-        "password": ["input[name='password']", "input[type='password']"],
-        "totp": ["input[name*='otp' i]", "input[name*='code' i]", "input[autocomplete='one-time-code']"],
-        "submit": ["button[type='submit']", "input[type='submit']"]
+        "username": ["input[name='mobileNumber']"],
+        "continue": ["button:has-text('Continue')"]
       },
-      "loggedInSignals": ["logout", "member"]
+      "otpSelectors": {
+        "inputs": ["input[type='tel']"],
+        "submit": ["button:has-text('Verify')"]
+      },
+      "loggedInUrlPatterns": ["/home", "/policy", "/book-service", "/transaction-history", "/my-account"],
+      "loggedInSignals": ["logout", "log out", "sign out"]
     },
     "april_international": {
       "displayName": "April International",
       "riskLevel": "insurance",
-      "loginUrl": "https://am-gateway.april.fr/",
-      "allowedDomains": ["am-gateway.april.fr", "*.april.fr"],
+      "loginUrl": "https://am-gateway.april.fr/ipmi/login?client_id=ip_member_portal&response_type=code&redirect_uri=https%3A%2F%2Fmembers.april-international.com%2Fauth%2Fcallback&code_challenge={{code_challenge}}&code_challenge_method=S256",
+      "allowedDomains": ["am-gateway.april.fr", "*.april.fr", "members.april-international.com", "www.april-international.com", "*.april-international.com"],
       "secretPrefix": "APRIL_INTERNATIONAL",
       "secretPath": "/sites/april-international",
-      "allowedTools": ["login", "check_session", "logout", "diagnose_member_portal"],
+      "allowedTools": ["login", "logout", "check_session", "diagnose_member_portal", "diagnose_login_form", "diagnose_claim_form", "get_account_info", "get_policy_info", "get_claims_history", "get_claim_status", "submit_claim", "get_documents_list"],
+      "enforceSubresourceAllowlist": false,
       "loginSelectors": {
-        "username": ["input[name='username']", "input[name='email']", "input[type='email']", "input[type='text']"],
-        "password": ["input[name='password']", "input[type='password']"],
+        "username": ["input#username[name='username']"],
+        "password": ["input#password[name='password']"],
         "totp": ["input[name*='otp' i]", "input[name*='code' i]", "input[autocomplete='one-time-code']"],
-        "submit": ["button[type='submit']", "input[type='submit']"]
+        "submit": ["button.cta.cta-button-label:has-text('Login')"]
       },
-      "loggedInSignals": ["logout", "sign out", "dashboard"]
+      "loggedInUrlPatterns": ["/home/", "/policy", "/claims", "/hospitalisation", "/documents", "/account"],
+      "loggedInSignals": ["log out", "logout", "sign out", "dashboard", "telehealth", "submit a claim", "déconnexion", "se déconnecter"]
     },
     "hi_precision": {
       "displayName": "Hi-Precision",
       "riskLevel": "medical",
-      "loginUrl": "https://portal.hi-precision.com.ph/",
-      "allowedDomains": ["portal.hi-precision.com.ph", "*.hi-precision.com.ph"],
+      "loginUrl": "https://portal.hi-precision.com.ph/onlinepatient.do",
+      "allowedDomains": [
+        "portal.hi-precision.com.ph",
+        "*.hi-precision.com.ph",
+        "results.healthonlineasia.com",
+        "*.healthonlineasia.com"
+      ],
       "secretPrefix": "HI_PRECISION",
       "secretPath": "/sites/hi-precision",
-      "allowedTools": ["login", "check_session", "logout", "diagnose_member_portal"],
+      "allowedTools": ["login", "logout", "check_session", "get_results", "diagnose_member_portal", "diagnose_login_form"],
+      "enforceSubresourceAllowlist": false,
       "loginSelectors": {
-        "username": ["input[name='username']", "input[name='email']", "input[type='email']", "input[type='text']"],
-        "password": ["input[name='password']", "input[type='password']"],
+        "username": ["input#pid", "input[name='pid']"],
+        "password": ["input#passwordPatient", "input[name='lastname'][type='password']"],
         "totp": ["input[name*='otp' i]", "input[name*='code' i]", "input[autocomplete='one-time-code']"],
-        "submit": ["button[type='submit']", "input[type='submit']"]
+        "submit": ["button#loginBtn", "button.hp-login-btn"]
       },
-      "loggedInSignals": ["logout", "sign out", "patient", "results"]
+      "prefillHidden": {
+        "urlHipre": "{{location.href}}"
+      },
+      "loggedInUrlPatterns": ["/dashboard.do", "results.healthonlineasia.com"],
+      "loggedInSignals": ["logout", "sign out", "my account", "results", "transaction"]
     }
   }
 }

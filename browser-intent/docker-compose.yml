@@ -11,6 +11,13 @@ networks:
   ingress:
     driver: bridge
 
+volumes:
+  # Shared inbox written by Hermes (uid 10000) and read by the browser-intent
+  # worker (uid 1001 pwuser). Hermes mounts it writable at /opt/uploads-out;
+  # we mount it read-only at /uploads/from-hermes. See hermes/docker-compose.yml.
+  hermes-to-browser-intent:
+    external: true
+
 x-logging: &default-logging
   driver: json-file
   options:
@@ -19,7 +26,15 @@ x-logging: &default-logging
 
 services:
   infisical-agent:
-    image: platform/infisical-cli:0.43.76-patched
+    # Digest-pin upstream `infisical/cli` rather than carrying a "-patched"
+    # local image. The previous Dockerfile.infisical-cli wrapped this exact
+    # digest with no RUN/COPY — it was byte-identical to upstream, so the
+    # ":0.43.76-patched" tag advertised a fix that didn't exist there. The
+    # actual workaround for the multi-path etag bug lives in
+    # agent-config/secrets.tmpl (single recursive listSecrets call); see
+    # README "Infisical Agent sidecar". When upstream cuts a release that
+    # fixes the etag bug, bump the digest below and re-test rotation.
+    image: infisical/cli@sha256:dba406b35e5819632412c561bfa46e6185e04c6d76175dc82bf97c4ff53745d7
     container_name: browser-intent-infisical-agent
     restart: unless-stopped
     entrypoint: ["sh", "/agent-config/entrypoint.sh"]
@@ -72,6 +87,11 @@ services:
       # signals; for JA3 issues, the path is chromium.connectOverCDP() to
       # a real Chrome instance instead.
       BROWSER_INTENT_HEADLESS: "true"
+      # Shared secret with the MCP service. Generate once per stack with
+      # `openssl rand -hex 32` and put in .env. Compose will refuse to start
+      # without it (intentional — running without breaks the auth invariant
+      # on the worker's only ingress path).
+      BROWSER_INTENT_WORKER_SECRET: "${BROWSER_INTENT_WORKER_SECRET:?missing BROWSER_INTENT_WORKER_SECRET in .env - generate with: openssl rand -hex 32}"
       HTTP_PROXY: "http://squid:3128"
       HTTPS_PROXY: "http://squid:3128"
       NO_PROXY: "mcp,worker,infisical,adguard,squid,localhost,127.0.0.1,.local"
@@ -85,6 +105,15 @@ services:
       # so rotated values land without --force-recreate. env_file above is the
       # bootstrap fallback (populates process.env at container start).
       - ./secrets-runtime:/secrets:ro
+      - ./uploads:/uploads:ro
+      - hermes-to-browser-intent:/uploads/from-hermes:ro
+      # Writable result-PDF dropbox. hi_precision's get_results fetches each
+      # session-cookie-protected PDF through the Playwright request context
+      # and writes it here; the LLM sees a local download_path instead of a
+      # cookie-gated URL. Auto-pruned (24h default) per-call by the extractor.
+      # Lives at /results (NOT under /uploads) because /uploads is mounted ro
+      # and Docker can't create a bind-mount target inside a ro tree.
+      - ./uploads-results:/results
     networks:
       browser-internal:
       platform-net:
@@ -128,6 +157,13 @@ services:
       # a no-op until the matching token is provisioned in .env.
       BROWSER_INTENT_MCP_TOKEN: "${BROWSER_INTENT_MCP_TOKEN:?missing BROWSER_INTENT_MCP_TOKEN in .env - generate one with openssl rand -hex 32}"
       BROWSER_INTENT_MCP_TOKEN_DR_SMITH: "${BROWSER_INTENT_MCP_TOKEN_DR_SMITH:-}"
+      # Shared secret used to authenticate every MCP→worker call. Must match
+      # the value set on the worker service; missing here will cause the
+      # worker to 401 every dispatch.
+      BROWSER_INTENT_WORKER_SECRET: "${BROWSER_INTENT_WORKER_SECRET:?missing BROWSER_INTENT_WORKER_SECRET in .env - generate with: openssl rand -hex 32}"
+      # Maintainer-only: when "true", diagnose_* tools appear in tools/list.
+      # Off by default so the LLM never sees these in normal operation.
+      BROWSER_INTENT_ENABLE_DIAGNOSTICS: "${BROWSER_INTENT_ENABLE_DIAGNOSTICS:-}"
     volumes:
       - ./policies:/app/policies:ro
     ports:
