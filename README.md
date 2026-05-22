@@ -104,6 +104,8 @@ Trivy checks every running image against its CVE database and produces a report.
 
 Both `openclaw/` and `hermes/` stacks include an **Infisical Agent sidecar** that authenticates using a Machine Identity, fetches secrets, and writes them to a runtime `.env` file every 60 seconds. API keys never appear in `docker-compose.yml`, never in a `.env` committed to git, never in a container image.
 
+**Per-workload scoping uses folders, not key prefixes.** When two workloads need the same logical secret (e.g. each `hermes-gateway-*` profile needs its own `TELEGRAM_BOT_TOKEN`), the right pattern is one Infisical folder per workload — `/steve`, `/wifey`, `/mark` — each holding the workload's specific values plus a Secret Link importing shared keys from `/`. The workload sets `INFISICAL_PATH=/<name>` and `infisical run --include-imports` merges its folder with the imports. This isolates blast radius (a compromised gateway only sees its own folder + shared), keeps ACLs aligned with workload boundaries, and avoids the brittle naming-convention path (`STEVE_TELEGRAM_BOT_TOKEN`, `MARK_TELEGRAM_BOT_TOKEN`, …) that doesn't scale and can't be enforced by access control. See [hermes/docker-compose.yml](hermes/docker-compose.yml) for the canonical example.
+
 ### AI Workloads — `openclaw/` and `hermes/`
 
 Both workloads run with strict isolation — no Docker socket access, no capability to control other containers, all outbound traffic forced through Squid, secrets injected at runtime.
@@ -439,14 +441,20 @@ Hermes Agent is a second AI workload that adds a Telegram messaging gateway and 
 **Set up Infisical secrets for Hermes** (same pattern as Step 6):
 
 1. In Infisical, create a new project called `hermes`
-2. Add these secrets in the `dev` environment at path `/`:
+2. Add these **shared** secrets in the `dev` environment at path `/`:
 
 | Secret name | Value |
 |---|---|
 | `OPENROUTER_API_KEY` | Your API key from [openrouter.ai](https://openrouter.ai) |
 | `HERMES_TTYD_USERNAME` | A username for the Hermes browser terminal |
 | `HERMES_TTYD_PASSWORD` | A strong password for the Hermes browser terminal |
-| `TELEGRAM_BOT_TOKEN` | *(optional)* Token from [@BotFather](https://t.me/BotFather) on Telegram |
+| `TELEGRAM_BOT_TOKEN` | *(optional)* Token from [@BotFather](https://t.me/BotFather) for the default profile's bot |
+
+3. **(Optional — multi-profile setup.)** Each non-default gateway (`steve`, `wifey`, `mark`) runs its own Telegram bot. For each profile:
+   - Create a folder at `/` named after the profile (e.g. `/steve`)
+   - Inside the folder, add `TELEGRAM_BOT_TOKEN` with that profile's BotFather token
+   - Inside the folder, add a **Secret Link** (Environment=Development, Secret Path=`/`) so shared keys flow through
+   - The matching `hermes-gateway-<profile>` service in [hermes/docker-compose.yml](hermes/docker-compose.yml) already sets `INFISICAL_PATH=/<profile>` — no compose edit needed when you add the folder. Per-folder `TELEGRAM_BOT_TOKEN` overrides the one at `/`.
 
 3. Create a Machine Identity named `hermes-gateway` (Access Control → Machine Identities), assign it Viewer role on the hermes project, and copy the Client ID + Client Secret into `hermes/.env`
 

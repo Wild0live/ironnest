@@ -8,18 +8,25 @@
 #   4. hermes-gateway-steve:  persistent messaging gateway for the `steve`   profile
 #   5. hermes-gateway-mark:   persistent messaging gateway for the `mark`    profile
 #
-# Each gateway = one Telegram bot. Per-profile .env files live at:
-#   default: /opt/data/.env
-#   wifey:   /opt/data/profiles/wifey/.env
-#   steve:   /opt/data/profiles/steve/.env
-#   mark:    /opt/data/profiles/mark/.env
+# Each gateway = one Telegram bot. Tokens are scoped per-profile in Infisical
+# (NOT in /opt/data/profiles/<p>/.env — those files exist but are shadowed by
+# Infisical injection):
+#   default: Infisical path /          → @DrSmithVBot
+#   wifey:   Infisical path /wifey     → @may192007_bot
+#   steve:   Infisical path /steve     → @SteveArmstrongBot
+#   mark:    Infisical path /mark      → @MarkGordonBot
+#
+# Each non-default folder has a Secret Link (import) from / so shared keys
+# (OPENROUTER_API_KEY, GEMINI_API_KEY, …) flow through. The per-folder
+# TELEGRAM_BOT_TOKEN overrides the one at / for that gateway.
+# See platform/README.md "Per-workload scoping" for the architecture rationale.
 #
 # Secrets flow (option 3 — process-memory only):
 #   Each service starts via /usr/local/bin/with-infisical, which logs in to the
 #   local Infisical at http://infisical:8090 (Universal Auth machine identity)
-#   and exec's `infisical run` — secrets are injected as env vars into the
-#   wrapped process, never written to disk. Machine identity creds come from
-#   ./.env (gitignored).
+#   and exec's `infisical run --path=$INFISICAL_PATH --include-imports` —
+#   secrets are injected as env vars into the wrapped process, never written
+#   to disk. Machine identity creds come from ./.env (gitignored).
 #
 # All outbound HTTPS (LLM API calls to OpenRouter, etc.) routes through Squid.
 # hermes-ttyd uses the `local` terminal backend — shell commands run inside the
@@ -243,6 +250,7 @@ services:
       HERMES_UID: "10000"
       HERMES_GID: "10000"
       INFISICAL_PROJECT_ID: "2777cf9a-8ed7-43d0-84ed-8cb48f9b03ad"
+      INFISICAL_PATH: "/wifey"           # per-profile bot token at /wifey; shared keys imported from /
       PATH: "/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
       TERMINAL_ENV: "local"
       HTTPS_PROXY: "http://squid:3128"
@@ -307,6 +315,7 @@ services:
       HERMES_UID: "10000"
       HERMES_GID: "10000"
       INFISICAL_PROJECT_ID: "2777cf9a-8ed7-43d0-84ed-8cb48f9b03ad"
+      INFISICAL_PATH: "/steve"           # per-profile bot token at /steve; shared keys imported from /
       PATH: "/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
       TERMINAL_ENV: "local"
       HTTPS_PROXY: "http://squid:3128"
@@ -371,6 +380,7 @@ services:
       HERMES_UID: "10000"
       HERMES_GID: "10000"
       INFISICAL_PROJECT_ID: "2777cf9a-8ed7-43d0-84ed-8cb48f9b03ad"
+      INFISICAL_PATH: "/mark"            # per-profile bot token at /mark; shared keys imported from /
       PATH: "/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
       TERMINAL_ENV: "local"
       HTTPS_PROXY: "http://squid:3128"
