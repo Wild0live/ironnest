@@ -17,6 +17,15 @@ volumes:
   # we mount it read-only at /uploads/from-hermes. See hermes/docker-compose.yml.
   hermes-to-browser-intent:
     external: true
+  # Shared outbox written by the worker (uid 1001 pwuser) and read by Hermes
+  # (uid 10000) read-only. Holds result PDFs that get_results downloads —
+  # the worker writes them at /results, Hermes sees them at /opt/uploads-in
+  # so the agent can attach to Telegram replies. Files come out mode 0644
+  # by default umask so world-read is enough; no shared GID needed.
+  # Create once on the host with:
+  #   docker volume create browser-intent-to-hermes
+  browser-intent-to-hermes:
+    external: true
 
 x-logging: &default-logging
   driver: json-file
@@ -108,12 +117,19 @@ services:
       - ./uploads:/uploads:ro
       - hermes-to-browser-intent:/uploads/from-hermes:ro
       # Writable result-PDF dropbox. hi_precision's get_results fetches each
-      # session-cookie-protected PDF through the Playwright request context
-      # and writes it here; the LLM sees a local download_path instead of a
+      # session-cookie-protected PDF through Chromium's network stack and
+      # writes it here; the LLM sees a local download_path instead of a
       # cookie-gated URL. Auto-pruned (24h default) per-call by the extractor.
       # Lives at /results (NOT under /uploads) because /uploads is mounted ro
       # and Docker can't create a bind-mount target inside a ro tree.
-      - ./uploads-results:/results
+      #
+      # Backed by the browser-intent-to-hermes named volume so Hermes can
+      # read these files at /opt/uploads-in/... and attach them to chat
+      # replies. Previously a host bind to ./uploads-results — switched to
+      # a named volume so the inter-container handoff doesn't require
+      # symmetric host-path config and so Hermes-side perms aren't tied to
+      # whatever the host filesystem mode happens to be.
+      - browser-intent-to-hermes:/results
     networks:
       browser-internal:
       platform-net:

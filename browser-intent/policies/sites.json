@@ -7,7 +7,7 @@
       "allowedDomains": ["colfinancial.com", "*.colfinancial.com"],
       "secretPrefix": "COL_FINANCIAL",
       "secretPath": "/sites/col-financial",
-      "allowedTools": ["login", "logout", "check_session", "get_portfolio", "diagnose_portfolio"],
+      "allowedTools": ["login", "logout", "check_session", "get_portfolio", "place_order", "get_pending_acknowledgment", "submit_acknowledgment", "diagnose_portfolio", "diagnose_order_form", "diagnose_order_preview"],
       "loginSelectors": {
         "username": ["input[name='txtUser1']"],
         "username2": ["input[name='txtUser2']"],
@@ -15,8 +15,17 @@
         "totp": ["input[name*='otp' i]", "input[name*='code' i]", "input[autocomplete='one-time-code']"],
         "submit": ["input[type='button'][value='LOG IN']", "input[name='cmdLogOn']", "input[type='button']"]
       },
+      "submitMethod": "click",
       "loggedInUrlPatterns": ["/ape/FINAL2_STARTER/", "/ape/Final2/main/"],
-      "loggedInSignals": ["logout", "portfolio", "watchlist", "last login"]
+      "loggedInSignals": ["logout", "portfolio", "watchlist", "last login"],
+      "pendingActionSignals": {
+        "trade_acknowledgment": [
+          "Type Your Password and Click Here to Acknowledge",
+          "ACKNOWLEDGE RECEIPT OF CONFIRMATION",
+          "PLEASE REVIEW YOUR PREVIOUS TRANSACTIONS"
+        ]
+      },
+      "actionsAllowedWhilePending": ["get_pending_acknowledgment", "submit_acknowledgment"]
     },
     "maxicare": {
       "displayName": "Maxicare",

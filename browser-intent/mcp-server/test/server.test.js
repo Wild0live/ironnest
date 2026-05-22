@@ -74,7 +74,7 @@ test("authenticateClient: matches Dr. Smith token → restricted client per live
   assert.equal(c.name, "hermes_dr_smith");
   // Mirrors policies/clients.json — update this assertion whenever the live
   // file's hermes_dr_smith.allowedSites changes.
-  assert.deepEqual(c.allowedSites.sort(), ["april_international", "hi_precision"].sort());
+  assert.deepEqual(c.allowedSites.sort(), ["april_international", "col_financial", "hi_precision"].sort());
 });
 
 test("authenticateClient: skips clients whose tokenEnvVar is unset (no empty-token bypass)", () => {
@@ -124,6 +124,157 @@ test("sitesAllowing: returns only sites whose policy lists the action", () => {
   assert.deepEqual(server.sitesAllowing("submit_claim"), ["april_international"]);
   assert.deepEqual(server.sitesAllowing("login").sort(), ["april_international", "col_financial", "hi_precision", "maxicare"].sort());
   assert.deepEqual(server.sitesAllowing("drop_database"), []);
+});
+
+test("sitesAllowing: diagnose_order_form is allowlisted on col_financial only", () => {
+  // Pins the policy wiring for the order-form diagnostic. If a future edit
+  // adds the action to another site (or removes it from col_financial),
+  // this assertion fires before a misrouted diagnostic reaches the LLM.
+  assert.deepEqual(server.sitesAllowing("diagnose_order_form"), ["col_financial"]);
+});
+
+test("sitesAllowing: diagnose_order_preview is allowlisted on col_financial only", () => {
+  assert.deepEqual(server.sitesAllowing("diagnose_order_preview"), ["col_financial"]);
+});
+
+test("ACTIONS catalog: diagnose_order_preview takes the same args as place_order so a maintainer can mirror the failed call", () => {
+  const spec = server.ACTIONS.diagnose_order_preview;
+  assert.ok(spec, "diagnose_order_preview must exist");
+  assert.equal(spec.category, "diagnostic");
+  const required = spec.extra.required;
+  // Same required fields as place_order so the failed call's params can be
+  // pasted directly into the diagnostic.
+  assert.ok(required.includes("symbol"));
+  assert.ok(required.includes("quantity"));
+  assert.ok(required.includes("side"));
+  assert.ok(required.includes("limit_price"));
+  // Side enum mirrors place_order.
+  assert.deepEqual(spec.extra.properties.side.enum, ["buy", "sell"]);
+});
+
+test("sitesAllowing: place_order is allowlisted on col_financial only", () => {
+  // Write-op pin. place_order on another site (e.g. submitting an insurance
+  // claim via the order form, or vice versa) would be catastrophic — if a
+  // future edit broadens the allowlist, this test fires before the
+  // misrouted call ever ships.
+  assert.deepEqual(server.sitesAllowing("place_order"), ["col_financial"]);
+});
+
+test("ACTIONS catalog: place_order is registered with required schema fields + dry_run flag", () => {
+  const spec = server.ACTIONS.place_order;
+  assert.ok(spec, "place_order must exist in ACTIONS");
+  assert.equal(spec.category, "extraction");
+  const required = spec.extra.required;
+  assert.ok(required.includes("symbol"));
+  assert.ok(required.includes("quantity"));
+  assert.ok(required.includes("side"));
+  assert.ok(required.includes("limit_price"));
+  // side must be constrained to buy/sell — guards against an LLM passing
+  // garbage like "long"/"short" or a free-text value.
+  assert.deepEqual(spec.extra.properties.side.enum, ["buy", "sell"]);
+  // order_type and board are optional but their enums must be the COL-native values.
+  assert.deepEqual(spec.extra.properties.order_type.enum, ["DAY", "GTC", "ATC"]);
+  assert.deepEqual(spec.extra.properties.board.enum, ["MAIN", "ODD"]);
+  // dry_run is the safety contract — must be a boolean property.
+  assert.equal(spec.extra.properties.dry_run.type, "boolean");
+});
+
+test("toolsList(admin): place_order schema carries the structured-args extras alongside site", () => {
+  const place = server.toolsList(ADMIN_CLIENT).find((t) => t.name === "place_order");
+  assert.ok(place, "place_order should be in toolsList for admin");
+  assert.ok(place.inputSchema.required.includes("symbol"));
+  assert.ok(place.inputSchema.required.includes("quantity"));
+  assert.ok(place.inputSchema.required.includes("side"));
+  assert.ok(place.inputSchema.required.includes("limit_price"));
+  assert.ok(place.inputSchema.required.includes("site"));
+  // The site enum must be col-only (no leakage to other sites).
+  assert.deepEqual(place.inputSchema.properties.site.enum, ["col_financial"]);
+});
+
+test("tools/call: place_order rejects invalid side ('long' instead of 'buy')", async () => {
+  const resp = await server.handleJsonRpc(ADMIN_CLIENT, {
+    jsonrpc: "2.0",
+    id: 400,
+    method: "tools/call",
+    params: {
+      name: "place_order",
+      arguments: { site: "col_financial", symbol: "AC", quantity: 100, side: "long", limit_price: 100 }
+    }
+  });
+  assert.ok(resp.error, "validator must reject side='long'");
+  assert.match(resp.error.message, /not in allowed enum/);
+});
+
+test("tools/call: place_order rejects invalid symbol (lowercase, traversal-shaped)", async () => {
+  const resp = await server.handleJsonRpc(ADMIN_CLIENT, {
+    jsonrpc: "2.0",
+    id: 401,
+    method: "tools/call",
+    params: {
+      name: "place_order",
+      arguments: { site: "col_financial", symbol: "ac", quantity: 100, side: "buy", limit_price: 100 }
+    }
+  });
+  assert.ok(resp.error);
+  assert.match(resp.error.message, /does not match pattern/);
+});
+
+test("tools/call: place_order rejects non-positive quantity / limit_price", async () => {
+  for (const bad of [{ quantity: 0 }, { quantity: -1 }, { limit_price: 0 }]) {
+    const resp = await server.handleJsonRpc(ADMIN_CLIENT, {
+      jsonrpc: "2.0",
+      id: 402,
+      method: "tools/call",
+      params: {
+        name: "place_order",
+        arguments: {
+          site: "col_financial", symbol: "AC", side: "buy",
+          quantity: bad.quantity ?? 100, limit_price: bad.limit_price ?? 50, ...bad
+        }
+      }
+    });
+    assert.ok(resp.error, `must reject ${JSON.stringify(bad)}`);
+    assert.match(resp.error.message, /must be > 0/);
+  }
+});
+
+test("PROMPTS: place_col_order is workflow-category, scoped to sites that allow place_order", () => {
+  const spec = server.PROMPTS.place_col_order;
+  assert.ok(spec, "place_col_order must exist");
+  assert.equal(spec.category, "workflow");
+  assert.ok(spec.requiredActions.includes("place_order"));
+  const sites = server.sitesForPrompt(spec);
+  assert.deepEqual(sites, ["col_financial"]);
+});
+
+test("getPrompt(admin): place_col_order renders the dry-run guardrail prominently", () => {
+  const out = server.getPrompt(ADMIN_CLIENT, "place_col_order", {
+    site: "col_financial",
+    symbol: "AC",
+    quantity: 100,
+    side: "buy",
+    limit_price: 25.50
+  });
+  const text = out.messages[0].content.text;
+  assert.match(text, /COL Financial/);
+  assert.match(text, /AC/);
+  assert.match(text, /100/);
+  assert.match(text, /25\.5/);
+  // The dry-run guardrail must survive into the rendered prompt.
+  assert.match(text, /dry_run: true/);
+  assert.match(text, /Never call place_order with dry_run=false/i);
+  // Same-payload constraint: no derivative orders.
+  assert.match(text, /same payload exactly|do NOT vary/i);
+});
+
+test("ACTIONS catalog: diagnose_order_form is registered as a diagnostic-category action", () => {
+  // The boot-time drift guard would already crash on a malformed schema,
+  // but explicitly assert category=diagnostic so the env-gate
+  // (BROWSER_INTENT_ENABLE_DIAGNOSTICS) keeps hiding it from non-maintainer
+  // clients by default.
+  const spec = server.ACTIONS.diagnose_order_form;
+  assert.ok(spec, "diagnose_order_form must exist in ACTIONS");
+  assert.equal(spec.category, "diagnostic");
 });
 
 test("toolsList(admin): includes consolidated tools with full site enums", () => {
@@ -558,6 +709,13 @@ test("statusToKind: extractor_timeout classifies as 'error'", () => {
   // classified as 'error' on both sides so Wazuh dashboards group it with
   // other failure modes.
   assert.equal(server.statusToKind("extractor_timeout"), "error");
+});
+
+test("statusToKind: market_closed classifies as 'needs_user' on the MCP side", () => {
+  // Operator-actionable state from COL Financial's after-hours order page.
+  // Mirrors the worker-side bucket; Wazuh queries on status_kind:needs_user
+  // pick up off-hours order attempts alongside OTP waits etc.
+  assert.equal(server.statusToKind("market_closed"), "needs_user");
 });
 
 test("audit: every event carries policy_version anchored to the current files", () => {
@@ -1079,6 +1237,6 @@ test("loadClients: clients.json parses and contains both admin and hermes_dr_smi
   // Mirrors the live policy file; update when allowedSites is edited there.
   assert.deepEqual(
     clients.hermes_dr_smith.allowedSites.sort(),
-    ["april_international", "hi_precision"].sort()
+    ["april_international", "col_financial", "hi_precision"].sort()
   );
 });

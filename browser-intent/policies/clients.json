@@ -8,8 +8,8 @@
     },
     "hermes_dr_smith": {
       "tokenEnvVar": "BROWSER_INTENT_MCP_TOKEN_DR_SMITH",
-      "allowedSites": ["april_international", "hi_precision"],
-      "description": "Hermes default profile (@DrSmithVBot). Scoped to April International claims management, plus Hi-Precision diagnostic-portal access (added 2026-05-16). The site enum on every tool returned to this client is narrowed to the listed sites, and a call with site=anything-else is rejected at the dispatcher."
+      "allowedSites": ["april_international", "hi_precision", "col_financial"],
+      "description": "Hermes default profile (@DrSmithVBot). Scoped to April International claims management, Hi-Precision diagnostic-portal access (added 2026-05-16), and COL Financial brokerage (added 2026-05-19). The site enum on every tool returned to this client is narrowed to the listed sites, and a call with site=anything-else is rejected at the dispatcher."
     }
   }
 }

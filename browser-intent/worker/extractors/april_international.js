@@ -24,6 +24,62 @@ const {
 
 const RELEVANT_LINK_RE = /policy|certificate|claim|coverage|beneficiary|premium|reimburs|account|dashboard|document|hospital/i;
 
+// Section headers that delimit the "Insured members" card on
+// /policies/individual. The page renders Information / Insured members /
+// Bank Details / Documents as a vertical stack of cards — not tabs — so the
+// line-scan fallback in getPolicyInfo MUST stop at the next card heading,
+// otherwise it sweeps into Bank Details and yields contaminants like the
+// Bank Account Holder name (which repeats a member) and "Insurance
+// Certificate".
+const POLICY_SECTION_BOUNDARY_RE =
+  /^(Bank Details|Documents|Information|Make a change to my policy|Download Insurance Certificate)$/i;
+
+// Belt-and-suspenders deny-list for the line-scan fallback. Bounding by
+// section header handles the snapshot in april-diag.json, but a future
+// reshuffle could put a Bank-/Currency- line inside the Insured-members
+// window; these patterns reject them regardless.
+const NON_MEMBER_DENY_RE =
+  /^(Bank\s|Currency\s+[A-Z]{2,4}|Swift\s+BIC|Insurance\s+(?:Certificate|Card)|Cookie Policy|Privacy Policy|Terms\b|Asia\s+[A-Z])/i;
+
+// Parse insured-member names from a list of trimmed, non-empty lines (i.e.
+// main.innerText.split("\n").map(trim).filter(Boolean)). Exported as a pure
+// function so the parsing rules are unit-testable without a live browser —
+// the structured-table path in getPolicyInfo is preferred, this is the
+// fallback when the DOM shape drifts. Returns deduped member names in
+// document order.
+function parseInsuredMembersFromLines(lines) {
+  if (!Array.isArray(lines) || !lines.length) return [];
+  const startIdx = lines.findIndex((l) => /^Insured members$/i.test(l));
+  if (startIdx < 0) return [];
+  let endIdx = lines.length;
+  for (let i = startIdx + 1; i < lines.length; i++) {
+    if (POLICY_SECTION_BOUNDARY_RE.test(lines[i])) {
+      endIdx = i;
+      break;
+    }
+  }
+  // Cap the window even when no boundary is found — protects against the
+  // whole page collapsing into one card.
+  endIdx = Math.min(endIdx, startIdx + 30);
+  const window = lines.slice(startIdx + 1, endIdx);
+  const seen = new Set();
+  const out = [];
+  for (const raw of window) {
+    const line = raw.replace(/\s+/g, " ").trim();
+    if (!line) continue;
+    if (NON_MEMBER_DENY_RE.test(line)) continue;
+    // Anchored full-line: 2-4 capitalized words (handles hyphens,
+    // apostrophes, middle names). Anchoring at end is what rejects 3-word
+    // labels like "Bank Account Holder" that the old prefix-only regex
+    // accepted.
+    if (!/^[A-Z][A-Za-z\-']+(?:\s+[A-Z][A-Za-z\-']+){1,3}$/.test(line)) continue;
+    if (seen.has(line)) continue;
+    seen.add(line);
+    out.push(line);
+  }
+  return out;
+}
+
 // Known sub-pages discovered via diagnose 2026-05-14. The portal exposes
 // real <a href> nav items (unlike Maxicare's div-based nav), so a maintainer
 // can extend this list by reading link_candidates from a fresh diagnose run.
@@ -152,38 +208,69 @@ async function getPolicyInfo(page) {
     })
     .catch(() => ({}));
 
-  // Switch to the "Insured members" tab to read names. Best-effort: if the
-  // tab is missing or the click fails, return an empty list and a note.
-  let insuredMembers = [];
-  try {
-    const tab = page.getByText("Insured members", { exact: true }).first();
-    if (await tab.count().catch(() => 0)) {
-      await tab.click({ timeout: 5000 }).catch(() => {});
-      await page.waitForTimeout(800);
-      insuredMembers = await page
+  // Insured members. The /policies/individual page renders Information,
+  // Insured members, Bank Details, and Documents as a stack of cards (not
+  // tabs), so the click on "Insured members" is just a scroll anchor — the
+  // member table is always already in the DOM. Prefer the structured
+  // <table> the page provides (header row: Name / Date of birth); fall
+  // back to a bounded line-scan if the DOM shape drifts.
+  let insuredMembers = await page
+    .evaluate(() => {
+      const tables = Array.from(document.querySelectorAll("table"));
+      const memberTable = tables.find((t) => {
+        const firstRowCells = Array.from(
+          t.querySelectorAll(
+            "thead th, thead td, tr:first-child th, tr:first-child td"
+          )
+        )
+          .slice(0, 8)
+          .map((c) => (c.textContent || "").trim().toLowerCase());
+        return (
+          firstRowCells.some((c) => c === "name") &&
+          firstRowCells.some((c) => c.startsWith("date of birth"))
+        );
+      });
+      if (!memberTable) return null;
+      const bodyRows = Array.from(memberTable.querySelectorAll("tbody tr"));
+      const rows = bodyRows.length
+        ? bodyRows
+        : Array.from(memberTable.querySelectorAll("tr")).slice(1);
+      const seen = new Set();
+      const out = [];
+      for (const tr of rows) {
+        const firstCell = tr.querySelector("td, th");
+        const name = ((firstCell && firstCell.textContent) || "")
+          .replace(/navigate_next/gi, "")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+        out.push(name);
+      }
+      return out;
+    })
+    .catch(() => null);
+
+  if (!Array.isArray(insuredMembers)) {
+    try {
+      const tab = page.getByText("Insured members", { exact: true }).first();
+      if (await tab.count().catch(() => 0)) {
+        await tab.click({ timeout: 5000 }).catch(() => {});
+        await page.waitForTimeout(800);
+      }
+      const mainLines = await page
         .evaluate(() => {
           const main = document.querySelector("main, [role=main]") || document.body;
-          // Insured members table: each row carries a person's name. We
-          // collect text from card-like elements after the "Insured members"
-          // heading and filter heuristically.
-          const txt = (main.innerText || "")
+          return (main.innerText || "")
             .split("\n")
             .map((s) => s.trim())
             .filter(Boolean);
-          const startIdx = txt.findIndex((l) => /^Insured members$/i.test(l));
-          if (startIdx < 0) return [];
-          const candidate = txt.slice(startIdx + 1, startIdx + 40);
-          // A member row typically looks like "FIRSTNAME LASTNAME" (all
-          // letters, possibly hyphens), distinct from headers like "Date of
-          // birth" or "Relationship".
-          return candidate.filter((l) =>
-            /^[A-Z][A-Za-z\-']+\s+[A-Z][A-Za-z\-']+/.test(l) && !/Date|Birth|Relationship|Email/i.test(l)
-          );
         })
         .catch(() => []);
+      insuredMembers = parseInsuredMembersFromLines(mainLines);
+    } catch {
+      insuredMembers = [];
     }
-  } catch {
-    /* fall through with empty list */
   }
 
   return {
@@ -860,5 +947,6 @@ module.exports = {
   getClaimsHistory,
   getClaimStatus,
   getDocumentsList,
-  submitClaim
+  submitClaim,
+  parseInsuredMembersFromLines
 };

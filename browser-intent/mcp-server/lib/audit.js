@@ -11,7 +11,12 @@
 
 const STATUS_KIND = {
   success: ["ok", "logged_in", "logged_out", "dry_run", "listed_sites"],
-  needs_user: ["awaiting_otp", "awaiting_fresh_sms", "needs_user_action"],
+  needs_user: [
+    "awaiting_otp", "awaiting_fresh_sms", "needs_user_action", "market_closed",
+    "board_lot_violation", "insufficient_buying_power", "tick_size_violation",
+    "invalid_symbol", "minimum_order_violation",
+    "insufficient_shares", "symbol_not_in_portfolio"
+  ],
   session_expired: ["session_expired", "no_session"],
   rate_limited: ["rate_limited"],
   needs_update: ["needs_extractor_update", "needs_site_selector_update"],

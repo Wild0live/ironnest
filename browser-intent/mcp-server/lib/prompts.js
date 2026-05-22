@@ -147,6 +147,64 @@ const PROMPTS = {
     }
   },
 
+  place_col_order: {
+    category: "workflow",
+    description:
+      "Guided workflow for placing a buy/sell order on COL Financial. Walks through session check → login → dry-run preview via COL's native 'Preview Order' button → explicit user confirmation → real submission. Encodes the dry_run=true-by-default contract so the LLM cannot bypass the preview step, and surfaces broker errors (insufficient funds, invalid symbol, market closed, board-lot violations) verbatim.",
+    requiredActions: ["check_session", "login", "place_order"],
+    arguments: [
+      { name: "site", description: "Site identifier. Only sites whose policy allows place_order and that the calling client is scoped to are accepted.", required: true },
+      { name: "symbol", description: "PSE ticker symbol, uppercase (e.g. 'AC', 'SM', 'ALI').", required: true },
+      { name: "quantity", description: "Number of shares as a whole number. PSE board-lot rules vary by symbol; the broker will reject invalid quantities at preview.", required: true },
+      { name: "side", description: "'buy' or 'sell'.", required: true },
+      { name: "limit_price", description: "Limit price in PHP.", required: true },
+      { name: "order_type", description: "Order term: 'DAY' (default), 'GTC' (good till cancel), or 'ATC' (at the close). Optional.", required: false },
+      { name: "board", description: "PSE board: 'MAIN' (default, regular trading) or 'ODD' (odd lot, below board lot). Optional.", required: false }
+    ],
+    render(args, ctx) {
+      const payloadLines = [
+        `  site: "${ctx.siteId}"`,
+        `  symbol: "${args.symbol}"`,
+        `  quantity: ${args.quantity}`,
+        `  side: "${args.side}"`,
+        `  limit_price: ${args.limit_price}`
+      ];
+      if (args.order_type) payloadLines.push(`  order_type: "${args.order_type}"`);
+      if (args.board) payloadLines.push(`  board: "${args.board}"`);
+      const payload = payloadLines.join("\n");
+      const text = [
+        `You are about to place a securities order on ${ctx.displayName} (site="${ctx.siteId}"). This is a WRITE operation against a real brokerage account. The steps below are mandatory.`,
+        "",
+        `1. Call \`check_session\` with site="${ctx.siteId}". If the response status is not "logged_in", continue to step 2; otherwise jump to step 3.`,
+        `2. Call \`login\` with site="${ctx.siteId}". Wait for status="logged_in" before continuing. If status is "rate_limited" or "needs_user_action", surface the response to the user and stop — do not retry until told to.`,
+        `3. PREVIEW the order. Call \`place_order\` with the following payload AND dry_run=true:`,
+        "",
+        "```",
+        payload,
+        "  dry_run: true",
+        "```",
+        "",
+        "4. Inspect the response carefully:",
+        "   - status=\"dry_run\": preview rendered successfully. Continue to step 5.",
+        "   - status=\"needs_user_action\" with reason=\"preview_error\": the broker returned an error on the preview page (insufficient buying power, invalid symbol, market closed, board-lot violation, etc.). Surface the `matched_phrase` and the `preview.body_excerpt` to the user verbatim. STOP — do not call again with dry_run=false.",
+        "   - status=\"needs_extractor_update\": the extractor is broken; surface to the user and stop.",
+        "5. Show the user the dry-run preview content (the `preview.tables` are usually a clean breakdown of order amount + fees + total; `preview.body_excerpt` is the raw page text). Confirm the order details EXPLICITLY in plain text before proceeding.",
+        `6. ONLY after the user confirms in plain text (e.g. "yes, place that order"), call \`place_order\` AGAIN with the SAME payload and dry_run=false. Do NOT vary any of symbol / quantity / side / limit_price / order_type / board between the dry-run and the real submission — the user confirmed THIS exact order, not a derivative.`,
+        "7. Report back:",
+        "   - status=\"ok\" with write_operation=true: order submitted. Surface the `confirmation` content so the user has a record.",
+        "   - status=\"needs_user_action\": broker rejected the confirmation page. Surface `error_phrase` and the `confirmation.body_excerpt`.",
+        "   - status=\"needs_extractor_update\" with reason=\"confirm_button_not_found\": the preview rendered but the worker couldn't identify the confirm button. The order was NOT placed. Tell the user to confirm manually in the COL web UI or wait for a maintainer to update CONFIRM_BUTTON_SELECTORS.",
+        "",
+        "Hard constraints:",
+        "- Never call place_order with dry_run=false before showing the user the dry-run preview AND receiving explicit confirmation.",
+        "- Never retry place_order with dry_run=false if the prior call returned anything other than status=\"dry_run\".",
+        "- Never modify the order parameters between the dry-run and the real call — same payload exactly.",
+        "- If you're unsure about ANY part of the preview (price, quantity, fees, total), ask the user before proceeding."
+      ].join("\n");
+      return { messages: [{ role: "user", content: { type: "text", text } }] };
+    }
+  },
+
   diagnose_failed_login: {
     category: "diagnostic",
     description:

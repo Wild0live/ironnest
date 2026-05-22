@@ -23,6 +23,13 @@ RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 # image first; /results lives at top-level for that reason.
 RUN mkdir -p /uploads/from-hermes
 
+# /results is the worker→hermes outbox for downloaded result PDFs. Named
+# volumes auto-inherit ownership + mode from the matching dir in the image
+# when first mounted, so this chown is what lets pwuser (uid 1001) write
+# into the fresh volume. Hermes (uid 10000) reads files by world-read mode
+# from default umask 022, not by ownership, so we don't need a shared GID.
+RUN mkdir -p /results && chown pwuser:pwuser /results
+
 USER pwuser
 EXPOSE 18902
 # entrypoint.sh execs `node worker.js` directly in the headless path

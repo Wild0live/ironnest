@@ -6,12 +6,22 @@
 //   Lab No. | Branch | Order Date | Patient ID | Patient Name |
 //   Account | Gender | Age | Type | Download
 //
-// The Download column is an anchor pointing at a session-cookie-protected
-// PDF on the same host. We fetch each PDF through the Playwright request
-// context (which shares the browser's cookies and TLS profile) and write it
-// to a worker-local volume; the response replaces `download_url` with
-// `download_path` so a cookie-gated URL never reaches the LLM (prevents a
-// prompt-injection exfil — the model can otherwise be coerced into
+// The Download column is NOT a plain <a href>; it uses one of three JS-only
+// patterns depending on Type (see downloadHref for the dispatch table):
+//   - Physical Exam (PE)         : formLink('download-physicalExamResultPDF.do', qs)
+//   - Imaging (X-RAY, ULTRASOUND): formLink('download-imagingResultPDF.do', qs)
+//   - LAB                         : modalPopupsDownloadLaboratoryPdf(pid, labNo, ...)
+//                                   which opens a UI modal, lists test
+//                                   codes via XHR, and only then fires the
+//                                   actual /nocumresults.do download.
+//
+// We parse the onclick attribute into a download_spec, resolve it to a real
+// URL in resolveDownloadUrl (LAB needs a preliminary POST), then fetch the
+// PDF through the Playwright request context (which shares the browser's
+// cookies + TLS profile) and write it to a worker-local volume. The
+// response replaces `download_spec` with `download_path` so neither the
+// cookie-gated URL nor the JS handler shape ever reaches the LLM (prevents
+// a prompt-injection exfil — the model can otherwise be coerced into
 // rendering the URL, which any reader with the session cookies could open).
 //
 // The dashboard also embeds an optional 2FA-setup form and a feedback widget
@@ -135,12 +145,19 @@ async function findAndExtractResults(page, headerMatchers) {
     function cellText(cell) {
       return (cell.innerText || "").replace(/\s+/g, " ").trim();
     }
+    // Collect raw DOM signals for the download cell. The actual parsing
+    // into a download_spec is done Node-side by parseDownloadDescriptor —
+    // see the export at the bottom of this file. Keeping the browser-side
+    // dumb keeps the parser testable without a browser.
     function downloadHref(cell) {
       if (!cell) return null;
-      const a = cell.querySelector("a[href]");
+      const a = cell.querySelector("a");
       if (!a) return null;
-      // a.href resolves relative URLs against the document base.
-      return a.href || null;
+      return {
+        onclick: a.getAttribute("onclick") || "",
+        rawHref: a.getAttribute("href") || "",
+        resolvedHref: a.href || "" // resolves relative URLs vs document base
+      };
     }
     function matchHeader(textCells) {
       const normalized = textCells.map(norm);
@@ -184,7 +201,7 @@ async function findAndExtractResults(page, headerMatchers) {
             gender: texts[cols.gender] || "",
             age: texts[cols.age] || "",
             type: texts[cols.type] || "",
-            download_url: downloadHref(cells[cols.download])
+            download_descriptor: downloadHref(cells[cols.download])
           });
         }
         return results;
@@ -192,6 +209,48 @@ async function findAndExtractResults(page, headerMatchers) {
     }
     return null;
   }, { matchers: headerMatchers });
+}
+
+// Parse the raw download-cell descriptor (onclick text + href attribute)
+// into a structured spec the Node side can dispatch on. Pure function so
+// it's covered by unit tests without spinning up Chromium.
+//
+// Dispatch table mirrors what the Hi-Precision dashboard's JS does:
+//
+//   PE / Imaging  → onclick="formLink('endpoint.do', 'qs'); return false;"
+//                   → { kind: "formLink", endpoint, qs }
+//
+//   LAB           → onclick="modalPopupsDownloadLaboratoryPdf('pid','labNo',
+//                            '',false,'status');" (no href attribute)
+//                   → { kind: "modalLab", pid, labNo }
+//
+//   Real URL      → <a href="https://..."> (forward-compat — not currently
+//                   on the dashboard but cheap to keep)
+//                   → { kind: "direct", url }
+//
+// Anything else (empty descriptor, javascript:void(0) with no recognized
+// onclick, malformed onclick) → null, which surfaces as
+// download_status: "no_url" in the user-visible row.
+function parseDownloadDescriptor(desc) {
+  if (!desc || typeof desc !== "object") return null;
+  const onclick = typeof desc.onclick === "string" ? desc.onclick : "";
+  const rawHref = typeof desc.rawHref === "string" ? desc.rawHref : "";
+  const resolvedHref = typeof desc.resolvedHref === "string" ? desc.resolvedHref : "";
+
+  const formLinkMatch = onclick.match(/formLink\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]*)['"]/);
+  if (formLinkMatch) {
+    return { kind: "formLink", endpoint: formLinkMatch[1], qs: formLinkMatch[2] };
+  }
+  const modalLabMatch = onclick.match(
+    /modalPopupsDownloadLaboratoryPdf\s*\(\s*['"]([^'"]*)['"]\s*,\s*['"]([^'"]*)['"]/
+  );
+  if (modalLabMatch) {
+    return { kind: "modalLab", pid: modalLabMatch[1], labNo: modalLabMatch[2] };
+  }
+  if (rawHref && !rawHref.startsWith("javascript:") && resolvedHref) {
+    return { kind: "direct", url: resolvedHref };
+  }
+  return null;
 }
 
 // Convert a lab number / arbitrary string into a safe filename component.
@@ -240,35 +299,146 @@ function pruneStaleResults(dir, ttlMs, now = Date.now()) {
   return removed;
 }
 
-// Download one cookie-gated PDF through the Playwright request context
-// (shares cookies + TLS profile with the active browser session). Writes to
-// destPath atomically (write to .tmp then rename) so a partial file never
-// surfaces as a download_path.
-async function downloadResultPdf(page, url, destPath, maxBytes) {
-  const ctx = page.context();
-  let response;
-  try {
-    response = await ctx.request.get(url, { timeout: 30000 });
-  } catch (err) {
-    const e = new Error(`download network error: ${err.message}`);
+// Run fetch() inside the page so the request uses Chromium's network stack:
+// it inherits both the proxy (chromium reads HTTPS_PROXY env; Playwright's
+// ctx.request uses Node's HTTP stack and does NOT, so it tries to dial
+// upstream IPs directly and gets ENETUNREACH on this Docker network) AND
+// the active session cookies for the dashboard origin.
+//
+// Body is binary-safe: we base64-encode in the page (chunked to dodge the
+// String.fromCharCode arg-count limit on multi-MB PDFs) and decode in Node.
+// Returns { ok, status, headers, body: Buffer } on success or { ok: false,
+// status, statusText, error } on a transport problem.
+async function pageFetch(page, url, options = {}) {
+  const result = await page.evaluate(async ({ url, method, body, headers }) => {
+    try {
+      const opts = { method: method || "GET", credentials: "same-origin" };
+      if (headers) opts.headers = headers;
+      if (body !== undefined && body !== null) opts.body = body;
+      const r = await fetch(url, opts);
+      const respHeaders = {};
+      r.headers.forEach((v, k) => { respHeaders[k] = v; });
+      if (!r.ok) {
+        return { ok: false, status: r.status, statusText: r.statusText, headers: respHeaders };
+      }
+      const buf = new Uint8Array(await r.arrayBuffer());
+      let bin = "";
+      const chunk = 0x8000;
+      for (let i = 0; i < buf.length; i += chunk) {
+        bin += String.fromCharCode.apply(null, buf.subarray(i, i + chunk));
+      }
+      return { ok: true, status: r.status, headers: respHeaders, b64: btoa(bin) };
+    } catch (e) {
+      return { ok: false, status: 0, error: String(e.message || e) };
+    }
+  }, { url, method: options.method, body: options.body, headers: options.headers });
+  if (result && result.b64) {
+    result.body = Buffer.from(result.b64, "base64");
+    delete result.b64;
+  }
+  return result;
+}
+
+// Resolve a download_spec into the final cookie-gated URL we should GET.
+// For "direct" and "formLink" the URL is constructed from the spec alone.
+// For "modalLab" we have to do a preliminary POST through pageFetch to list
+// the test codes (see downloadHref's modalLab comment). Throws with
+// err.code = "download_failed" on any pre-flight problem.
+async function resolveDownloadUrl(page, spec) {
+  const base = new URL(page.url());
+  const origin = `${base.protocol}//${base.host}`;
+  if (spec.kind === "direct") return spec.url;
+  if (spec.kind === "formLink") return `${origin}/${spec.endpoint}?${spec.qs}`;
+  if (spec.kind === "modalLab") {
+    // Step 1: list the test-group results so we know which testCodes to
+    // include. The endpoint returns a JSON array whose entries describe
+    // both the group headers (testCodes: undefined) and the actual test
+    // rows (testCodes: "FBS", "CBCPLT", ...). We keep only the rows that
+    // carry a real testCodes value, then dedup.
+    const formBody = new URLSearchParams({
+      pid: spec.pid,
+      link_pid: "",
+      printIdx: spec.labNo,
+      labNoIdx: spec.labNo
+    }).toString();
+    const resp = await pageFetch(page, `${origin}/cumresultsfront-generateTestGroupResultForDownloadLabPdf.do`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+      body: formBody
+    });
+    if (!resp.ok) {
+      const detail = resp.error || `HTTP ${resp.status}${resp.statusText ? ` ${resp.statusText}` : ""}`;
+      const e = new Error(`lab testCodes lookup failed: ${detail}`);
+      e.code = "download_failed";
+      throw e;
+    }
+    let json;
+    try {
+      json = JSON.parse(resp.body.toString("utf8"));
+    } catch (err) {
+      const e = new Error(`lab testCodes response not JSON: ${err.message}`);
+      e.code = "download_failed";
+      throw e;
+    }
+    const codes = Array.from(
+      new Set(
+        (json.testGroupResults || [])
+          .map((g) => g && g.testCodes)
+          .filter((c) => typeof c === "string" && c.length > 0)
+      )
+    );
+    if (codes.length === 0) {
+      const e = new Error("lab testCodes list was empty — result may be unreleased or upstream changed shape");
+      e.code = "download_failed";
+      throw e;
+    }
+    // Step 2: build the final URL. lpt=P means "no cumulative" — the
+    // dashboard's "Yes please" path uses singleWithCumulativePdf.do with
+    // lpt=PWC, which we don't expose. P is the simpler/faster shape and
+    // matches what a user would pick for a one-off result download.
+    const qs = new URLSearchParams();
+    qs.append("pid", spec.pid);
+    qs.append("printIdx", spec.labNo);
+    qs.append("e", "");
+    for (const c of codes) qs.append("testCodesFilter", c);
+    qs.append("lpt", "P");
+    qs.append("link_pid", "");
+    return `${origin}/nocumresults.do?${qs.toString()}`;
+  }
+  const e = new Error(`unknown download_spec kind: ${spec && spec.kind}`);
+  e.code = "download_failed";
+  throw e;
+}
+
+// Download one cookie-gated PDF through Chromium's network stack (via
+// pageFetch — see why ctx.request is unsuitable). Writes to destPath
+// atomically (write to .tmp then rename) so a partial file never surfaces
+// as a download_path. Accepts a download_spec (see downloadHref) rather
+// than a raw URL because the LAB flow needs a preliminary POST.
+async function downloadResultPdf(page, spec, destPath, maxBytes) {
+  const url = await resolveDownloadUrl(page, spec);
+  const resp = await pageFetch(page, url, { method: "GET" });
+  if (!resp.ok) {
+    const detail = resp.error || `HTTP ${resp.status}${resp.statusText ? ` ${resp.statusText}` : ""}`;
+    const e = new Error(`download failed: ${detail}`);
     e.code = "download_failed";
     throw e;
   }
-  if (!response.ok()) {
-    const e = new Error(`download upstream returned HTTP ${response.status()}`);
+  // Defense in depth: if upstream returned HTML (e.g. a session-expired
+  // redirect that resolved to a login page with status 200), don't pass it
+  // off as a PDF. The browser would never have rendered this as a download.
+  const contentType = (resp.headers && resp.headers["content-type"]) || "application/octet-stream";
+  if (/text\/html/i.test(contentType)) {
+    const e = new Error(`download returned HTML instead of PDF (content-type=${contentType})`);
     e.code = "download_failed";
     throw e;
   }
-  // Read body fully before writing — Playwright doesn't expose a streaming
-  // body API on the request context, and we need the size for the cap check
-  // anyway. 20 MB is well within node's default heap.
-  const body = await response.body();
+  const body = resp.body;
   if (body.length > maxBytes) {
     const e = new Error(`download exceeds cap (${body.length} > ${maxBytes})`);
     e.code = "too_large";
     throw e;
   }
-  const contentType = response.headers()["content-type"] || "application/octet-stream";
   const tmpPath = `${destPath}.${process.pid}.tmp`;
   await fs.promises.writeFile(tmpPath, body);
   await fs.promises.rename(tmpPath, destPath);
@@ -301,17 +471,22 @@ async function getResults(page) {
 
   const sanitized = [];
   for (const row of rawResults) {
-    const { download_url: downloadUrl, ...rest } = row;
+    const { download_descriptor: descriptor, ...rest } = row;
     const out = { ...rest };
-    if (!downloadUrl) {
+    const spec = parseDownloadDescriptor(descriptor);
+    if (!spec) {
       out.download_status = "no_url";
       sanitized.push(out);
       continue;
     }
-    const base = safeFilenameComponent(row.lab_number) || crypto.randomBytes(8).toString("hex");
-    const destPath = path.join(outDir, `${base}.pdf`);
+    // Distinguish row types in the filename so re-runs against the same
+    // lab number (which carries up to three rows: PE, LAB, X-RAY for an
+    // APE package) don't overwrite each other on disk.
+    const typeSuffix = safeFilenameComponent(row.type) || "result";
+    const labBase = safeFilenameComponent(row.lab_number) || crypto.randomBytes(8).toString("hex");
+    const destPath = path.join(outDir, `${labBase}-${typeSuffix}.pdf`);
     try {
-      const { bytes, contentType } = await downloadResultPdf(page, downloadUrl, destPath, MAX_PDF_BYTES);
+      const { bytes, contentType } = await downloadResultPdf(page, spec, destPath, MAX_PDF_BYTES);
       out.download_path = destPath;
       out.download_bytes = bytes;
       out.download_content_type = contentType;
@@ -319,8 +494,10 @@ async function getResults(page) {
     } catch (err) {
       out.download_status = err.code || "download_failed";
       // Deliberately do NOT include err.message verbatim — Playwright errors
-      // often carry the cookie-gated URL, and the whole point of this
-      // sanitization is to keep that URL out of the LLM-visible payload.
+      // and our own resolveDownloadUrl messages often carry the cookie-gated
+      // URL, and the whole point of this sanitization is to keep that URL
+      // out of the LLM-visible payload. Operator can find the redacted
+      // version in worker stderr if we ever wire it through audit().
     }
     sanitized.push(out);
   }
@@ -361,6 +538,7 @@ module.exports = {
   // Test-only:
   matchHeaderColumn,
   normalize,
+  parseDownloadDescriptor,
   safeFilenameComponent,
   pruneStaleResults,
   siteResultsDir,

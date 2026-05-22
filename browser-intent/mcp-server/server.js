@@ -422,10 +422,84 @@ const ACTIONS = {
     description:
       "List downloadable documents available to the user on the selected site (claim forms, network lists, banking info, etc.) with their public asset URLs. Caller must call login for the site first."
   },
+  place_order: {
+    category: "extraction",
+    description:
+      "Submit a securities order on the selected site. WRITE OPERATION — mutates upstream state. dry_run defaults to true: the worker fills the order form and clicks COL Financial's native 'Preview Order' button, returning the broker's preview screen (computed fees, total amount, estimated commission) WITHOUT placing an order. Set dry_run=false to also click the post-preview confirm button and actually submit. NEVER call dry_run=false without first showing the user the dry-run preview verbatim AND getting their explicit confirmation. The worker also detects preview-page errors (insufficient funds, invalid symbol, outside market hours, board-lot violations) and surfaces them as status=needs_user_action without proceeding. Caller must call login for the site first.",
+    extra: {
+      required: ["symbol", "quantity", "side", "limit_price"],
+      properties: {
+        symbol: {
+          type: "string",
+          pattern: "^[A-Z][A-Z0-9.]{0,9}$",
+          maxLength: 10,
+          description: "PSE ticker symbol, uppercase (e.g. 'AC', 'SM', 'ALI', 'BDO', 'ACEN'). 1-10 chars, starts with a letter."
+        },
+        quantity: {
+          type: "number",
+          exclusiveMinimum: 0,
+          description: "Number of shares. Whole numbers only. MAIN board has per-symbol board-lot rules (e.g. 100 / 1,000 / 10,000); the upstream form will reject invalid quantities — see the preview output."
+        },
+        side: {
+          type: "string",
+          enum: ["buy", "sell"],
+          description: "Order side: 'buy' or 'sell'."
+        },
+        limit_price: {
+          type: "number",
+          exclusiveMinimum: 0,
+          description: "Limit price in PHP. PSE tick-size rules apply (varies by price band); the broker will reject mis-priced orders."
+        },
+        order_type: {
+          type: "string",
+          enum: ["DAY", "GTC", "ATC"],
+          description: "Order term. DAY (default, good for today only), GTC (good till cancel), ATC (at the close)."
+        },
+        board: {
+          type: "string",
+          enum: ["MAIN", "ODD"],
+          description: "PSE board. MAIN (default, regular trading) or ODD (odd lot, below the symbol's board lot)."
+        },
+        dry_run: {
+          type: "boolean",
+          description: "When true (default), fill the order form and click 'Preview Order' to return the broker's preview WITHOUT confirming. Set to false to ALSO click the confirm button and place the order for real."
+        }
+      }
+    }
+  },
   get_results: {
     category: "extraction",
     description:
       "Read the user's recent lab / imaging / test results from the selected site's results dashboard. Returns a list of result entries with lab number, branch, order date, patient identifiers, test type, and — for each row — a worker-local download_path where the result PDF has been written. The worker fetches each PDF through the active browser session itself; cookie-gated URLs are NEVER returned to the caller. Per-row download_status is \"ok\", \"too_large\", \"download_failed\", or \"no_url\". Caller must call login for the site first."
+  },
+  get_pending_acknowledgment: {
+    category: "extraction",
+    description:
+      "Fetch the COL Financial post-trading-day acknowledgment overlay's trade list. READ-ONLY: never clicks anything, never fills the password field. Returns the parsed trade table — per-fill rows (symbol, time, ticket, qty, price, amount), per-symbol subtotals, grand total, and currency — so the agent can show the user exactly what they're being asked to acknowledge. This is the read half of the trade-ack flow; the write half is submit_acknowledgment, which MUST NOT be called without explicit user approval of the data returned here. Caller must call login first AND get back status=needs_user_action / reason=pending_trade_acknowledgment."
+  },
+  submit_acknowledgment: {
+    category: "extraction",
+    description:
+      "Acknowledge COL Financial's post-trading-day trade-confirmation overlay. WRITE OPERATION — binds the user to confirming the listed transactions. The caller MUST first call get_pending_acknowledgment, show every transaction and the grand total to the user verbatim, and obtain explicit approval BEFORE calling this tool. The worker re-reads the trade table immediately before submitting and refuses if confirm_trade_count or confirm_total_value no longer match what's displayed (anti-race: a new fill landing between read and submit would otherwise be silently acknowledged). Refuses by default when the total exceeds the high-value safety threshold (env BROWSER_INTENT_ACK_HIGH_VALUE_THRESHOLD, default 100000 PHP) unless bypass_high_value=true is passed. Caller must call login first AND get back status=needs_user_action / reason=pending_trade_acknowledgment.",
+    extra: {
+      required: ["confirm_trade_count", "confirm_total_value"],
+      properties: {
+        confirm_trade_count: {
+          type: "number",
+          exclusiveMinimum: 0,
+          description: "Number of individual transactions the user approved (whole number — the worker rejects non-integers). Must equal the trade_count returned by get_pending_acknowledgment AND match what's currently rendered on the page; mismatch → status=needs_user_action / reason=acknowledgment_changed (no password is filled and no button is clicked)."
+        },
+        confirm_total_value: {
+          type: "number",
+          exclusiveMinimum: 0,
+          description: "Grand total in PHP the user approved (e.g. 56075.30). Must equal the grand_total returned by get_pending_acknowledgment AND match what's currently rendered on the page; mismatch → status=needs_user_action / reason=acknowledgment_changed."
+        },
+        bypass_high_value: {
+          type: "boolean",
+          description: "When total exceeds the high-value safety threshold (default 100000 PHP), submit refuses by default. Set true only after re-confirming the magnitude with the user. Defaults to false."
+        }
+      }
+    }
   },
 
   diagnose_login_form: {
@@ -447,6 +521,52 @@ const ACTIONS = {
     category: "diagnostic",
     description:
       "Diagnostic tool for the selected site. After login, navigates to the claim-submission form and dumps input metadata (name/id/type/autocomplete/placeholder/label), file-input selectors, button text, dropdown option counts, and form action. Does NOT submit a claim. Returns no field values, no row contents, no receipts — only structural metadata used to author or repair the submit_claim selectors. Caller must call login for the site first."
+  },
+  diagnose_order_form: {
+    category: "diagnostic",
+    description:
+      "Diagnostic tool for the selected site. After login, surfaces nav-link candidates matching trade/buy/sell/order keywords, attempts to activate one, then dumps every frame's form metadata (inputs with name/id/type/autocomplete/label/value_class, selects with option_counts but NO option labels, buttons with text). Used to author place_order selectors against the real DOM. Returns no field values, no ticker lists, no account numbers — only structural metadata. Caller must call login for the site first."
+  },
+  diagnose_order_preview: {
+    category: "diagnostic",
+    description:
+      "Diagnostic tool for the selected site. Runs the place_order fill + 'Preview Order' click flow with caller-supplied parameters, then dumps the resulting preview page's full DOM (forms, inputs, buttons with name/value/text, body excerpt) WITHOUT clicking any confirm button. Used to capture the real confirm-page selectors when place_order(dry_run=false) returns confirm_button_not_found. No order is placed — the Preview step does not commit. Caller must call login for the site first.",
+    extra: {
+      required: ["symbol", "quantity", "side", "limit_price"],
+      properties: {
+        symbol: {
+          type: "string",
+          pattern: "^[A-Z][A-Z0-9.]{0,9}$",
+          maxLength: 10,
+          description: "PSE ticker symbol, uppercase. Use the same value as the failed place_order call so the preview page renders identically."
+        },
+        quantity: {
+          type: "number",
+          exclusiveMinimum: 0,
+          description: "Same quantity as the failed place_order call."
+        },
+        side: {
+          type: "string",
+          enum: ["buy", "sell"],
+          description: "Same side as the failed place_order call."
+        },
+        limit_price: {
+          type: "number",
+          exclusiveMinimum: 0,
+          description: "Same limit price as the failed place_order call."
+        },
+        order_type: {
+          type: "string",
+          enum: ["DAY", "GTC", "ATC"],
+          description: "Optional. DAY default."
+        },
+        board: {
+          type: "string",
+          enum: ["MAIN", "ODD"],
+          description: "Optional. MAIN default."
+        }
+      }
+    }
   }
 };
 
@@ -462,240 +582,16 @@ function actionIsEnabled(spec) {
   return true;
 }
 
-// Catalog of MCP prompts. Each prompt is a parameterized workflow template
-// the LLM can fetch via prompts/get; it encodes the right tool sequence,
-// the dry-run / OTP / write-op guardrails, and the per-site enum derived
-// from the same allowedTools intersection that scopes tools. Prompts are
-// strictly compositional over the tool surface — they do NOT introduce new
-// capability and cannot be used to escape per-client site scoping.
-//
-// Shape:
-//   category:         "workflow" (always offered) | "diagnostic" (gated by
-//                     BROWSER_INTENT_ENABLE_DIAGNOSTICS, same gate as the
-//                     diagnose_* tools)
-//   description:      LLM-visible
-//   requiredActions:  list of action names; the prompt's site enum is the
-//                     intersection of (a) sites whose allowedTools contains
-//                     EVERY listed action and (b) the calling client's
-//                     allowedSites. If empty, the prompt is dropped from
-//                     prompts/list entirely.
-//   siteFilter:       optional predicate(siteObj) for further narrowing
-//                     (e.g. complete_otp_login wants loginFlow=username_otp)
-//   arguments:        MCP prompt argument descriptors. `site` is always
-//                     present and required; per-MCP-spec these carry only
-//                     name/description/required, so any enum / pattern is
-//                     re-stated in description and re-validated in render().
-//   render(args, ctx) returns { messages: [{role, content}] }; ctx carries
-//                     {site (resolved site obj), siteId, displayName}.
-const PROMPTS = {
-  submit_claim_from_receipt: {
-    category: "workflow",
-    description:
-      "Guided workflow for submitting a new insurance claim on a supported site. Walks through session check → login (with OTP if required) → dry-run preview → explicit user confirmation → real submit. Encodes the dry_run=true-by-default contract so the LLM cannot skip the preview step.",
-    requiredActions: ["check_session", "login", "submit_claim"],
-    arguments: [
-      { name: "site", description: "Site identifier. Only sites whose policy allows submit_claim and that the calling client is scoped to are accepted.", required: true },
-      { name: "treatment_date", description: "ISO date of treatment (YYYY-MM-DD).", required: true },
-      { name: "claim_amount", description: "Claim amount as a number, no currency symbol.", required: true },
-      { name: "currency", description: "ISO 4217 currency code (e.g. PHP, EUR, USD). Optional.", required: false },
-      { name: "beneficiary", description: "Beneficiary name as it appears in the portal's dropdown. Optional.", required: false },
-      { name: "provider", description: "Clinic / hospital / provider name. Optional.", required: false },
-      { name: "description", description: "Free-text reason for the claim. Optional.", required: false },
-      { name: "receipts", description: "Comma-separated worker-side receipt paths under /uploads (e.g. /uploads/from-hermes/r1.pdf,/uploads/from-hermes/r2.pdf). Optional.", required: false }
-    ],
-    render(args, ctx) {
-      const payloadLines = [
-        `  site: "${ctx.siteId}"`,
-        `  treatment_date: "${args.treatment_date}"`,
-        `  claim_amount: ${args.claim_amount}`
-      ];
-      if (args.currency) payloadLines.push(`  currency: "${args.currency}"`);
-      if (args.beneficiary) payloadLines.push(`  beneficiary: "${args.beneficiary}"`);
-      if (args.provider) payloadLines.push(`  provider: "${args.provider}"`);
-      if (args.description) payloadLines.push(`  description: ${JSON.stringify(args.description)}`);
-      if (args.receipts) {
-        const list = args.receipts.split(",").map((s) => s.trim()).filter(Boolean);
-        payloadLines.push(`  receipts: ${JSON.stringify(list)}`);
-      }
-      const payload = payloadLines.join("\n");
-      const text = [
-        `You are about to submit a new insurance claim on ${ctx.displayName} (site="${ctx.siteId}"). This is a WRITE operation; the steps below are mandatory.`,
-        "",
-        `1. Call \`check_session\` with site="${ctx.siteId}". If the response status is not "logged_in", continue to step 2; otherwise jump to step 3.`,
-        `2. Call \`login\` with site="${ctx.siteId}". If status="awaiting_otp", read the SMS code from the user and call \`provide_otp\` with that code; respect the response's \`next_action\` field — do NOT call \`login\` again if it tells you to wait. Continue only after the session is logged in.`,
-        `3. PREVIEW the submission. Call \`submit_claim\` with dry_run=true and the following payload:`,
-        "",
-        "```",
-        payload,
-        "  dry_run: true",
-        "```",
-        "",
-        "4. Show the user the dry-run snapshot the worker returns (which selectors matched, how many receipts attached, the form summary). Ask for explicit confirmation before proceeding.",
-        `5. ONLY after the user confirms in plain text, call \`submit_claim\` again with the SAME payload and dry_run=false. Do not retry on partial failure without re-running step 3 first.`,
-        "6. Report back to the user: the returned claim id (if any), the final status, and what was submitted. Surface any \`needs_extractor_update\` / \`session_expired\` / upstream-error responses verbatim — do not paper over them.",
-        "",
-        "Hard constraints: never call submit_claim with dry_run=false before showing the user the dry-run output. Never retry submit_claim with dry_run=false if the prior call returned anything other than a success status."
-      ].join("\n");
-      return { messages: [{ role: "user", content: { type: "text", text } }] };
-    }
-  },
-
-  complete_otp_login: {
-    category: "workflow",
-    description:
-      "Walk through an SMS-OTP-gated login. Handles the awaiting_otp / provide_otp handoff and the cooldown / next_action contract so the LLM does not burn rate-limit slots by re-calling login during an upstream resend cooldown.",
-    requiredActions: ["login", "provide_otp"],
-    siteFilter: (site) => site.loginFlow === "username_otp",
-    arguments: [
-      { name: "site", description: "Site identifier. Only sites whose loginFlow is username_otp and that the calling client is scoped to are accepted.", required: true }
-    ],
-    render(args, ctx) {
-      const text = [
-        `You are about to log in to ${ctx.displayName} (site="${ctx.siteId}"). This site uses an SMS OTP. Follow these steps in order.`,
-        "",
-        `1. Call \`login\` with site="${ctx.siteId}". Expect status="awaiting_otp" on success; the worker will hold the browser session open waiting for the code.`,
-        "2. Ask the user for the OTP code that arrived on their phone. Do NOT guess or generate codes.",
-        `3. Call \`provide_otp\` with site="${ctx.siteId}" and code="<the 4-8 digit code>".`,
-        "4. Inspect the response:",
-        "   - status=\"logged_in\": success — you can now call extraction tools for this site.",
-        "   - status=\"needs_user_action\", reason=\"otp_not_accepted\": read the `next_action` field — \"retry\" means ask the user for a corrected code, \"wait_then_relogin\" means wait the indicated cooldown, \"relogin\" means call `login` again. NEVER default to calling `login` when next_action says wait.",
-        "   - failure_kind=\"otp_rejected\" → wrong code, user can correct it. failure_kind=\"upstream_error\" or \"upstream_lockout\" → the request did NOT reach OTP validation; repeatedly resubmitting OTPs will not help. Surface the `next_action.note` to the user.",
-        "5. If status=\"awaiting_fresh_sms\", honor the indicated wait. DO NOT call login again until the cooldown has elapsed — a re-login during cooldown will NOT trigger a new SMS and WILL burn a rate-limit slot.",
-        "",
-        "Never log, echo, or store the OTP code outside of the provide_otp call itself."
-      ].join("\n");
-      return { messages: [{ role: "user", content: { type: "text", text } }] };
-    }
-  },
-
-  fetch_recent_results: {
-    category: "workflow",
-    description:
-      "Fetch the user's recent lab / imaging / diagnostic test results from a supported site and surface the download URLs. Ensures a fresh session before extraction.",
-    requiredActions: ["check_session", "login", "get_results"],
-    arguments: [
-      { name: "site", description: "Site identifier. Only sites whose policy allows get_results and that the calling client is scoped to are accepted.", required: true }
-    ],
-    render(args, ctx) {
-      const text = [
-        `You are about to fetch recent test results from ${ctx.displayName} (site="${ctx.siteId}").`,
-        "",
-        `1. Call \`check_session\` with site="${ctx.siteId}". If status is not \"logged_in\", call \`login\` with site="${ctx.siteId}" and wait for status=\"logged_in\". For any status of \"awaiting_otp\", \"needs_user_action\", or \"rate_limited\", surface the response to the user and stop — do not retry until told to.`,
-        `2. Call \`get_results\` with site="${ctx.siteId}". The worker downloads each result PDF through the active browser session and writes it to a worker-local volume; the response carries \`download_path\` (a path inside the worker container), \`download_bytes\`, and \`download_status\` per row — there is NO download URL in the response.`,
-        "3. For each entry the worker returns, present to the user: lab number, test type, order date, branch, and the `download_path` plus its size. If `download_status` is anything other than \"ok\" (e.g. \"too_large\", \"download_failed\", \"no_url\"), surface that status — do NOT retry the download yourself; the worker already tried.",
-        "4. Do NOT attempt to construct a URL to fetch the PDF. The path is only meaningful inside the worker container; whoever needs the file (the user, a sibling container) will read it from the mounted volume.",
-        "5. If status=\"session_expired\" comes back from get_results, return to step 1 once."
-      ].join("\n");
-      return { messages: [{ role: "user", content: { type: "text", text } }] };
-    }
-  },
-
-  check_policy_status: {
-    category: "workflow",
-    description:
-      "Pull the user's policy / account summary from a supported insurance or medical portal. Composes check_session + login + get_account_info into a single guarded call.",
-    requiredActions: ["check_session", "login", "get_account_info"],
-    arguments: [
-      { name: "site", description: "Site identifier. Only sites whose policy allows get_account_info and that the calling client is scoped to are accepted.", required: true }
-    ],
-    render(args, ctx) {
-      const text = [
-        `You are about to summarize the user's account / policy status on ${ctx.displayName} (site="${ctx.siteId}").`,
-        "",
-        `1. Call \`check_session\` with site="${ctx.siteId}". If status is not \"logged_in\", call \`login\`; for awaiting_otp follow the complete_otp_login workflow (call provide_otp with the user-supplied code).`,
-        `2. Call \`get_account_info\` with site="${ctx.siteId}". Report the user's name, contact info, and any profile-level data the response carries.`,
-        `3. If the site's policy allows it (you can check the site's allowedTools via list_browser_intent_sites), also call get_policy_info and/or get_policy_summary. Skip any tool the site does not allow — do not retry against unsupported endpoints.`,
-        "4. Summarize the result for the user as a short paragraph plus any active / inactive policy flags. Do not include cookies, raw HTML, or internal status codes in the summary."
-      ].join("\n");
-      return { messages: [{ role: "user", content: { type: "text", text } }] };
-    }
-  },
-
-  diagnose_failed_login: {
-    category: "diagnostic",
-    description:
-      "Maintainer prompt: diagnose why login is failing on a site by dumping the public login-page structure and comparing against the configured loginSelectors. Gated by BROWSER_INTENT_ENABLE_DIAGNOSTICS; not visible to non-maintainer clients.",
-    requiredActions: ["diagnose_login_form"],
-    arguments: [
-      { name: "site", description: "Site identifier. Only sites whose policy allows diagnose_login_form and that the calling client is scoped to are accepted.", required: true }
-    ],
-    render(args, ctx) {
-      const text = [
-        `Maintainer diagnostic for ${ctx.displayName} (site="${ctx.siteId}"). The site is failing login with needs_site_selector_update or a generic upstream error.`,
-        "",
-        `1. Call \`diagnose_login_form\` with site="${ctx.siteId}". This is pre-login, requires no credentials, and does not consume a rate-limit slot.`,
-        "2. Compare the dumped input metadata (name / id / type / autocomplete / label) against the configured loginSelectors for this site in policies/sites.json. Identify any selector whose target element is missing, renamed, or whose attributes have shifted.",
-        "3. Propose a minimal patch to policies/sites.json — add or update only the selectors that need to change. Do not rewrite the full block.",
-        "4. Do not include any field values, cookies, or screenshots in the report — diagnose tools deliberately return only structural metadata."
-      ].join("\n");
-      return { messages: [{ role: "user", content: { type: "text", text } }] };
-    }
-  }
-};
-
-function promptIsEnabled(spec) {
-  if (spec.category === "diagnostic" && !diagnosticsEnabled) return false;
-  return true;
-}
-
-// Compute the site enum for a prompt: sites whose allowedTools contains
-// EVERY action in requiredActions, optionally further filtered by siteFilter.
-// Result is in policy declaration order so prompts/list output is stable.
-function sitesForPrompt(spec) {
-  const policy = loadPolicy();
-  return Object.entries(policy.sites)
-    .filter(([, site]) => spec.requiredActions.every((a) => site.allowedTools.includes(a)))
-    .filter(([, site]) => (spec.siteFilter ? spec.siteFilter(site) : true))
-    .map(([siteId]) => siteId);
-}
-
-function promptsList(client) {
-  const out = [];
-  for (const [name, spec] of Object.entries(PROMPTS)) {
-    if (!promptIsEnabled(spec)) continue;
-    const policySites = sitesForPrompt(spec);
-    const sites = clientSiteIntersection(client, policySites);
-    if (sites.length === 0) continue;
-    out.push({
-      name,
-      description: `${spec.description} Allowed sites for this client: ${sites.join(", ")}.`,
-      arguments: spec.arguments
-    });
-  }
-  return out;
-}
-
-function getPrompt(client, name, args = {}) {
-  const spec = PROMPTS[name];
-  // Unknown / disabled / out-of-scope prompts all surface the same error
-  // ("unknown prompt") — don't leak which prompts exist for clients that
-  // can't see them, mirroring how readResource hides cross-client sites.
-  if (!spec || !promptIsEnabled(spec)) throw new Error(`unknown prompt: ${name}`);
-  const allowedSites = clientSiteIntersection(client, sitesForPrompt(spec));
-  if (allowedSites.length === 0) throw new Error(`unknown prompt: ${name}`);
-
-  for (const a of spec.arguments) {
-    if (a.required && (args[a.name] === undefined || args[a.name] === "")) {
-      throw new Error(`missing required argument '${a.name}' for prompt ${name}`);
-    }
-  }
-
-  const siteId = args.site;
-  if (!allowedSites.includes(siteId)) {
-    // Same phrasing as readResource — don't distinguish "site doesn't exist"
-    // from "client can't see it".
-    throw new Error(`unknown prompt: ${name}`);
-  }
-  const policy = loadPolicy();
-  const site = policy.sites[siteId];
-  const ctx = { siteId, site, displayName: site.displayName };
-
-  const rendered = spec.render(args, ctx);
-  return {
-    description: spec.description,
-    messages: rendered.messages
-  };
-}
+// PROMPTS catalog + helpers live in lib/prompts.js. Wire them here via the
+// factory so the catalog stays purely declarative; server.js injects the
+// dependencies (loadPolicy, clientSiteIntersection, diagnostics toggle).
+// The test surface is unchanged — server.{PROMPTS, sitesForPrompt,
+// promptsList, getPrompt} are re-exported below.
+const { promptIsEnabled, sitesForPrompt, promptsList, getPrompt } = createPromptsHelpers({
+  loadPolicy,
+  clientSiteIntersection,
+  diagnosticsEnabled: () => diagnosticsEnabled
+});
 
 function buildToolSchema(actionName, spec, sites) {
   const extra = spec.extra || {};

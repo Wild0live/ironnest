@@ -290,6 +290,7 @@ test("worker statusToKind: classifies worker-emitted statuses to the shared enum
   assert.equal(worker.statusToKind("needs_extractor_update"), "needs_update");
   assert.equal(worker.statusToKind("worker_auth_rejected"), "denied");
   assert.equal(worker.statusToKind("failed"), "error");
+  assert.equal(worker.statusToKind("market_closed"), "needs_user");
   assert.equal(worker.statusToKind("some_new_status"), "unknown");
   assert.equal(worker.statusToKind(""), "unknown");
   assert.equal(worker.statusToKind(null), "unknown");
@@ -387,4 +388,128 @@ test("worker statusToKind: extractor_timeout classifies as 'error'", () => {
   // Mirrors the mcp-server side. Adding the worker-emitted timeout to the
   // worker's STATUS_KIND table prevents it landing in 'unknown' on Wazuh.
   assert.equal(worker.statusToKind("extractor_timeout"), "error");
+});
+
+test("pollConfirmLoggedIn: returns true on the first check when the session is already established", async () => {
+  // Happy path — the OAuth redirect chain already settled by the time the
+  // outer wait returned; we pay zero extra latency.
+  const calls = [];
+  const ok = await worker.pollConfirmLoggedIn({}, {}, 5000, {
+    confirmFn: async () => { calls.push("call"); return true; },
+    sleep: async () => {},
+    now: () => 0
+  });
+  assert.equal(ok, true);
+  assert.equal(calls.length, 1, "happy path makes exactly one check");
+});
+
+test("pollConfirmLoggedIn: keeps retrying within the window and returns true when the redirect lands", async () => {
+  // Simulates an OAuth callback that becomes loggedIn after the third
+  // poll (i.e. the trailing 302 → /home/ completes mid-window). This is
+  // the false-positive scenario the fix targets: without polling we'd
+  // declare needs_user_action; with it, we recognize the active session.
+  let t = 0;
+  const ticks = [];
+  let attempt = 0;
+  const ok = await worker.pollConfirmLoggedIn({}, {}, 5000, {
+    intervalMs: 250,
+    confirmFn: async () => {
+      attempt += 1;
+      ticks.push(t);
+      return attempt >= 3;
+    },
+    sleep: async (ms) => { t += ms; },
+    now: () => t
+  });
+  assert.equal(ok, true, "must return true once a later check succeeds");
+  assert.equal(attempt, 3, "stops as soon as confirmFn returns true");
+});
+
+test("pollConfirmLoggedIn: returns false after exhausting the window so caller falls through to MFA detection", async () => {
+  // The genuinely-not-logged-in case must still surface as false so MFA
+  // detection / needs_user_action still fires for real failures.
+  let t = 0;
+  let attempts = 0;
+  const ok = await worker.pollConfirmLoggedIn({}, {}, 1000, {
+    intervalMs: 200,
+    confirmFn: async () => { attempts += 1; return false; },
+    sleep: async (ms) => { t += ms; },
+    now: () => t
+  });
+  assert.equal(ok, false);
+  // Window is 1000ms with 200ms intervals; expect ~5-6 attempts plus the
+  // final post-deadline check inside the function.
+  assert.ok(attempts >= 5, `expected multiple attempts, got ${attempts}`);
+});
+
+// detectPendingAction mocks the minimum page surface (`page.locator("body").innerText`)
+// so the helper can be exercised without launching Chromium.
+function mockPage(bodyText) {
+  return {
+    locator(sel) {
+      assert.equal(sel, "body");
+      return { innerText: async () => bodyText };
+    }
+  };
+}
+
+test("detectPendingAction: returns null when site has no pendingActionSignals configured", async () => {
+  const reason = await worker.detectPendingAction(mockPage("anything"), undefined);
+  assert.equal(reason, null);
+});
+
+test("detectPendingAction: returns null when body matches none of the configured signals", async () => {
+  const reason = await worker.detectPendingAction(
+    mockPage("Welcome to your dashboard. Latest trades shown below."),
+    { trade_acknowledgment: ["acknowledge receipt of confirmation"] }
+  );
+  assert.equal(reason, null);
+});
+
+test("detectPendingAction: returns the matching reason key when a configured signal is found (case-insensitive)", async () => {
+  // The COL ack screen body — verbatim text from a real post-trading-day overlay,
+  // but cased differently than the configured signal to lock in case-insensitive matching.
+  const colAckBody = "Please review your previous transactions and acknowledge receipt of confirmation. Type your password and click here to acknowledge.";
+  const reason = await worker.detectPendingAction(
+    mockPage(colAckBody),
+    {
+      trade_acknowledgment: [
+        "Type Your Password and Click Here to Acknowledge",
+        "ACKNOWLEDGE RECEIPT OF CONFIRMATION"
+      ]
+    }
+  );
+  assert.equal(reason, "trade_acknowledgment");
+});
+
+test("detectPendingAction: returns the FIRST matching reason key when multiple categories are configured", async () => {
+  // Deterministic priority — iteration order of Object.entries follows insertion order,
+  // so callers can rank by listing the most-specific reason first.
+  const reason = await worker.detectPendingAction(
+    mockPage("session expired — please log in again"),
+    {
+      session_expired: ["session expired"],
+      generic_block: ["log in"]
+    }
+  );
+  assert.equal(reason, "session_expired");
+});
+
+test("detectPendingAction: tolerates an empty body without throwing", async () => {
+  // Some interstitials render JS-driven and the body innerText sample returns
+  // empty before the DOM hydrates. Must NOT match anything in that state
+  // (returning a reason here would block legitimate logins behind a phantom ack).
+  const reason = await worker.detectPendingAction(
+    mockPage(""),
+    { trade_acknowledgment: ["acknowledge receipt of confirmation"] }
+  );
+  assert.equal(reason, null);
+});
+
+test("detectPendingAction: ignores entries whose value is not an array (defensive against bad sites.json)", async () => {
+  const reason = await worker.detectPendingAction(
+    mockPage("acknowledge receipt of confirmation"),
+    { trade_acknowledgment: "not-an-array" }
+  );
+  assert.equal(reason, null);
 });

@@ -94,6 +94,11 @@ const otpTtlMs = Number(process.env.BROWSER_INTENT_OTP_TTL_SECONDS || 300) * 100
 // the worker's only Chromium for the full MCP timeout window. 45s default
 // leaves enough headroom for real extraction work; tune per deployment.
 const extractorTimeoutMs = Number(process.env.BROWSER_INTENT_EXTRACTOR_TIMEOUT_SECONDS || 45) * 1000;
+// How long to keep polling confirmLoggedIn after the initial post-submit
+// wait fails. Covers OAuth + PKCE redirect chains that briefly park on a
+// callback URL before landing on a loggedInUrlPattern. Paid only when the
+// first check already returned false.
+const postSubmitPollMs = Number(process.env.BROWSER_INTENT_LOGIN_POLL_SECONDS || 5) * 1000;
 
 // Race a promise against a per-action timeout. On timeout the returned
 // promise rejects with an Error carrying code="extractor_timeout"; the
@@ -279,7 +284,11 @@ const STATUS_KIND = {
   success: ["ok", "logged_in", "logged_out", "dry_run", "listed_sites", "session_exists"],
   needs_user: [
     "awaiting_otp", "awaiting_fresh_sms", "needs_user_action",
-    "no_pending_otp", "otp_expired"
+    "no_pending_otp", "otp_expired",
+    "market_closed",
+    "board_lot_violation", "insufficient_buying_power", "tick_size_violation",
+    "invalid_symbol", "minimum_order_violation",
+    "insufficient_shares", "symbol_not_in_portfolio"
   ],
   session_expired: ["session_expired", "no_session"],
   rate_limited: ["rate_limited"],
@@ -346,6 +355,24 @@ async function firstVisible(page, selectors) {
 async function textSignals(page, signals) {
   const bodyText = (await page.locator("body").innerText({ timeout: 3000 }).catch(() => "")).toLowerCase();
   return (signals || []).some((signal) => bodyText.includes(signal.toLowerCase()));
+}
+
+// After a confirmed-logged-in URL, sites may still serve an interstitial that
+// requires user attention before downstream tools can transact (COL: post-
+// trading-day "acknowledge receipt of confirmation" wall — the URL matches
+// loggedInUrlPatterns but the page is a password-gated overlay, and any
+// portfolio/order call against the session would silently fail). Surfaces as
+// `needs_user_action` with a specific `reason` instead of `logged_in` so the
+// caller knows to clear it manually. Returns the matched reason key or null.
+async function detectPendingAction(page, pendingActionSignals) {
+  if (!pendingActionSignals || typeof pendingActionSignals !== "object") return null;
+  const bodyText = (await page.locator("body").innerText({ timeout: 3000 }).catch(() => "")).toLowerCase();
+  if (!bodyText) return null;
+  for (const [reason, signals] of Object.entries(pendingActionSignals)) {
+    if (!Array.isArray(signals)) continue;
+    if (signals.some((s) => bodyText.includes(String(s).toLowerCase()))) return reason;
+  }
+  return null;
 }
 
 async function mfaLikely(page) {
@@ -512,6 +539,26 @@ async function tryTotp(page, site) {
   return true;
 }
 
+// Re-check confirmLoggedIn at intervals for up to `windowMs`. Returns true
+// as soon as the URL lands on a loggedInUrlPattern (or the textSignals
+// fallback fires), or false if the window elapses. Used to absorb the
+// trailing redirect chain of an OAuth + PKCE login before the caller
+// falls through to MFA detection — without this, a slow redirect produces
+// a false-positive `needs_user_action`. Tests inject a custom `now` to
+// drive the loop deterministically.
+async function pollConfirmLoggedIn(page, site, windowMs, opts = {}) {
+  const intervalMs = opts.intervalMs ?? 250;
+  const sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const nowFn = opts.now ?? Date.now;
+  const confirmFn = opts.confirmFn ?? confirmLoggedIn;
+  const deadline = nowFn() + windowMs;
+  while (nowFn() < deadline) {
+    if (await confirmFn(page, site)) return true;
+    await sleep(intervalMs);
+  }
+  return await confirmFn(page, site);
+}
+
 async function confirmLoggedIn(page, site) {
   const currentUrl = page.url();
   // Strip query/hash before comparing to loginUrl so a bounce-back to
@@ -666,9 +713,19 @@ async function _fillLoginForm(page, site, username, password) {
         .catch(() => {});
     }
   }
+  // Default: press Enter on the password field. Real users do this and the
+  // form's onsubmit handler fires, which avoids the synthetic-click signature
+  // some bot scorers flag. Override with `submitMethod: "click"` when the
+  // visible "submit" is actually `<input type="button">` and the work is in
+  // its onclick handler (COL: onclick hashes the password into txtPasswordC
+  // and populates txtBrowser/txtSecurity; Enter bypasses it via the hidden
+  // cmdLogOn submit and the server silently rejects the half-filled POST).
+  const submitAction = site.submitMethod === "click"
+    ? submit.click()
+    : passwordInput.press("Enter");
   await Promise.allSettled([
     page.waitForLoadState("networkidle", { timeout: 15000 }),
-    passwordInput.press("Enter")
+    submitAction
   ]);
   return { ok: true };
 }
@@ -1192,6 +1249,17 @@ async function _login(siteId) {
   }
   let usedTotp = false;
   let loggedIn = await confirmLoggedIn(page, site);
+  // OAuth + PKCE flows (April International: /ipmi/login → /auth/callback?
+  // code=… → /home/) can still be redirecting at this point, with the URL
+  // briefly parked on the callback. confirmLoggedIn() would return false
+  // (the callback URL matches no loggedInUrlPattern) and mfaLikely() would
+  // trigger a false positive because the callback's `code_challenge`
+  // input matches `name*='code' i`. Poll for a few seconds so the redirect
+  // chain has room to settle BEFORE we declare an MFA gate. Cost is paid
+  // only on the would-be-failure path; the happy path returns immediately.
+  if (!loggedIn) {
+    loggedIn = await pollConfirmLoggedIn(page, site, postSubmitPollMs);
+  }
   if (!loggedIn && await mfaLikely(page)) {
     usedTotp = await tryTotp(page, site);
     if (usedTotp) loggedIn = await confirmLoggedIn(page, site);
@@ -1211,6 +1279,25 @@ async function _login(siteId) {
       returned_sensitive_data: false
     };
     audit({ action: "login", site: siteId, secretPath: site.secretPath, result: result.status, used_totp: usedTotp, returned_sensitive_data: false });
+    return result;
+  }
+
+  // Even on a logged-in URL, the site may serve a post-login interstitial
+  // (COL: trade-acknowledgment wall after a market session with activity).
+  // Surface it instead of returning `logged_in` so downstream tool calls
+  // don't act on a half-usable session. The browser session stays open so
+  // the user can drive the ack manually (or a future tool can clear it).
+  const pendingReason = await detectPendingAction(page, site.pendingActionSignals).catch(() => null);
+  if (pendingReason) {
+    const snapshot = await snapshotPage(page).catch(() => null);
+    const result = {
+      site: siteId,
+      status: "needs_user_action",
+      reason: `pending_${pendingReason}`,
+      snapshot,
+      returned_sensitive_data: false
+    };
+    audit({ action: "login", site: siteId, secretPath: site.secretPath, result: result.status, pending_reason: pendingReason, used_totp: usedTotp, returned_sensitive_data: false });
     return result;
   }
 
@@ -1261,6 +1348,21 @@ async function _checkSession(siteId) {
   if (!stillActive) {
     await _logout(siteId);
     return { site: siteId, status: "logged_out", returned_sensitive_data: false };
+  }
+  // Same pending-action check as _login. A session that passed login cleanly
+  // can hit an interstitial later (rare, but possible if the user keeps the
+  // session open across a trading-day boundary).
+  const pendingReason = await detectPendingAction(session.page, site.pendingActionSignals).catch(() => null);
+  if (pendingReason) {
+    const snapshot = await snapshotPage(session.page).catch(() => null);
+    session.lastActivity = Date.now();
+    return {
+      site: siteId,
+      status: "needs_user_action",
+      reason: `pending_${pendingReason}`,
+      snapshot,
+      returned_sensitive_data: false
+    };
   }
   session.lastActivity = Date.now();
   return { site: siteId, status: "logged_in", returned_sensitive_data: false };
@@ -1679,7 +1781,22 @@ async function _extract(siteId, action, args) {
   const isDiagnostic = action.startsWith("diagnose_");
   if (!isDiagnostic) {
     const sessionStatus = await _checkSession(siteId);
-    if (sessionStatus.status !== "logged_in") {
+    // Most actions require a clean logged_in session. The exception is
+    // `actionsAllowedWhilePending` in sites.json — actions that exist to
+    // CLEAR a pending-user-action interstitial (e.g. COL trade-ack flow:
+    // get_pending_acknowledgment, submit_acknowledgment). Without this
+    // exception we'd reject the very tools the caller needs to call to
+    // exit the needs_user_action state, creating a permanent dead end
+    // until the user logs in manually — the opposite of what the flow
+    // exists for. Strictly opt-in per-site; an action not listed here is
+    // still gated to logged_in only.
+    const allowedDuringPending = Array.isArray(site.actionsAllowedWhilePending)
+      ? site.actionsAllowedWhilePending
+      : [];
+    const okDuringPending =
+      sessionStatus.status === "needs_user_action" &&
+      allowedDuringPending.includes(action);
+    if (sessionStatus.status !== "logged_in" && !okDuringPending) {
       audit({ action, site: siteId, result: "session_expired", returned_sensitive_data: false });
       return { site: siteId, status: "session_expired", returned_sensitive_data: false };
     }
@@ -1888,6 +2005,8 @@ module.exports = {
   resolveLoginUrl,
   URL_PLACEHOLDERS,
   withActionTimeout,
+  pollConfirmLoggedIn,
+  detectPendingAction,
   __setSmsCooldownForTest(siteId, untilMs, smsLikelyFresh) {
     smsCooldown.set(siteId, { until: untilMs, smsLikelyFresh });
   },
