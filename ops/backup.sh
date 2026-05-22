@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Daily backup of the platform.
 # Target: G:\rancher-stack-backups\<YYYY-MM-DD_HHMMSS>\
-# Retention: 14 days.
+# Retention: keep the 3 most recent snapshots.
 #
 # Covers:
 #   - Infisical Postgres (logical dump)
@@ -29,7 +29,7 @@ to_win() { echo "$1" | sed -E 's|^/([a-zA-Z])/|\U\1:/|'; }
 #   IRONNEST_BACKUP_ROOT=/e/backups bash ops/backup.sh
 PLATFORM_DIR="${IRONNEST_PLATFORM_DIR:-/d/claude-workspace/platform}"
 BACKUP_ROOT="${IRONNEST_BACKUP_ROOT:-/g/rancher-stack-backups}"
-RETENTION_DAYS=14
+RETENTION_COUNT="${IRONNEST_RETENTION_COUNT:-3}"
 STAMP="$(date +%Y-%m-%d_%H%M%S)"
 DEST="$BACKUP_ROOT/$STAMP"
 LOG="$BACKUP_ROOT/backup.log"
@@ -97,9 +97,16 @@ log "backup size: $(du -sh "$DEST" | cut -f1)"
 log "artifacts:"
 ls -la "$DEST" | tee -a "$LOG"
 
-# Retention
-log "pruning backups older than $RETENTION_DAYS days"
-find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -mtime "+$RETENTION_DAYS" \
-  -exec rm -rf {} + 2>/dev/null || true
+# Retention: keep only the $RETENTION_COUNT newest snapshot directories.
+# Names are sortable timestamps (YYYY-MM-DD_HHMMSS), so lexical sort == chronological.
+log "pruning all but the $RETENTION_COUNT most recent backups"
+ls -1 "$BACKUP_ROOT" 2>/dev/null \
+  | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}$' \
+  | sort -r \
+  | tail -n "+$((RETENTION_COUNT + 1))" \
+  | while IFS= read -r old; do
+      log "  pruning $old"
+      rm -rf "$BACKUP_ROOT/$old"
+    done
 
 log "=== backup complete ==="

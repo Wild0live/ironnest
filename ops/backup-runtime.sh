@@ -37,7 +37,33 @@ LOG="$BACKUP_ROOT/backup-runtime.log"
 mkdir -p "$DEST"
 log() { echo "[$(date -Iseconds)] $*" | tee -a "$LOG"; }
 
+# Self-cleanup: if this run exits before MANIFEST.txt is written, the snapshot
+# is partial — remove it so future restores can't pick it up by mistake and so
+# the retention prune doesn't count it.
+cleanup_partial() {
+  local rc=$?
+  set +e
+  if [[ -n "${DEST:-}" && -d "$DEST" && ! -f "$DEST/MANIFEST.txt" ]]; then
+    if declare -F log >/dev/null 2>&1; then
+      log "cleanup: removing incomplete $DEST (exit code $rc)"
+    fi
+    rm -rf "$DEST"
+  fi
+  exit $rc
+}
+trap cleanup_partial EXIT
+
 log "=== runtime backup start → $DEST ==="
+
+# Sweep orphan partials left behind by previous failed runs (no MANIFEST.txt).
+for d in "$BACKUP_ROOT"/*/; do
+  [ -d "$d" ] || continue
+  [ "${d%/}" = "$DEST" ] && continue                  # never touch current run
+  if [ ! -f "${d}MANIFEST.txt" ]; then
+    log "removing orphan incomplete snapshot: $d"
+    rm -rf "$d"
+  fi
+done
 
 # 1. Snapshot WSL state and refuse to run if either distro is live.
 log "checking WSL distro state"
