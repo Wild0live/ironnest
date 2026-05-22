@@ -23,3 +23,11 @@
 .idea/
 *.swp
 *.bak
+
+# Local diagnostic artifacts (build logs, one-off parse scripts, diag captures)
+**/.build-*.log
+**/*-diag.json
+**/diag-output.json
+browser-intent/parse-*.py
+browser-intent/test.sh
+/diag/
