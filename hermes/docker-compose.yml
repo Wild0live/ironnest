@@ -1,20 +1,22 @@
 # Hermes Agent — NousResearch hermes-agent v2026.5.7 + ttyd browser terminal.
 # On-demand stack: start with ./hermes/start.sh (do not add to bootstrap.sh).
 #
-# Five services:
-#   1. hermes-ttyd:           ttyd wrapping `hermes` TUI (browser-accessible terminal)
-#   2. hermes-gateway:        persistent messaging gateway for the `default` profile (@DrSmithVBot)
-#   3. hermes-gateway-wifey:  persistent messaging gateway for the `wifey`   profile (@may192007_bot)
-#   4. hermes-gateway-steve:  persistent messaging gateway for the `steve`   profile
-#   5. hermes-gateway-mark:   persistent messaging gateway for the `mark`    profile
+# Six services:
+#   1. hermes-ttyd:               ttyd wrapping `hermes` TUI (browser-accessible terminal)
+#   2. hermes-gateway:            persistent messaging gateway for the `default`   profile (@DrSmithVBot)
+#   3. hermes-gateway-wifey:      persistent messaging gateway for the `wifey`     profile (@may192007_bot)
+#   4. hermes-gateway-steve:      persistent messaging gateway for the `steve`     profile
+#   5. hermes-gateway-mark:       persistent messaging gateway for the `mark`      profile
+#   6. hermes-gateway-littlejohn: persistent messaging gateway for the `littlejohn` profile
 #
 # Each gateway = one Telegram bot. Tokens are scoped per-profile in Infisical
 # (NOT in /opt/data/profiles/<p>/.env — those files exist but are shadowed by
 # Infisical injection):
-#   default: Infisical path /          → @DrSmithVBot
-#   wifey:   Infisical path /wifey     → @may192007_bot
-#   steve:   Infisical path /steve     → @SteveArmstrongBot
-#   mark:    Infisical path /mark      → @MarkGordonBot
+#   default:    Infisical path /             → @DrSmithVBot
+#   wifey:      Infisical path /wifey        → @may192007_bot
+#   steve:      Infisical path /steve        → @SteveArmstrongBot
+#   mark:       Infisical path /mark         → @MarkGordonBot
+#   littlejohn: Infisical path /littlejohn   → @LittleJohnArmstrongBot
 #
 # Each non-default folder has a Secret Link (import) from / so shared keys
 # (OPENROUTER_API_KEY, GEMINI_API_KEY, …) flow through. The per-folder
@@ -414,6 +416,71 @@ services:
           memory: 512M
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f 'hermes -p mark gateway run' >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ── Hermes messaging gateway — `littlejohn` profile ───────────────────────
+  # Fifth Hermes gateway, runs against the `littlejohn` profile so a separate
+  # Telegram bot (token in Infisical at /littlejohn) gets its own poller.
+  # Shares the hermes-data volume with the other gateways; lock contention is
+  # avoided because each profile has its own gateway.lock under its profile dir.
+  hermes-gateway-littlejohn:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: platform/hermes-agent:v2026.5.7-patched
+    container_name: hermes-gateway-littlejohn
+    restart: unless-stopped
+    command:
+      - with-infisical
+      - sh
+      - -c
+      - |
+        export TELEGRAM_HOME_CHANNEL="$${TELEGRAM_HOME_CHANNEL:-$${TELEGRAM_ALLOWED_USERS:-}}"
+        export TELEGRAM_HOME_CHANNEL_NAME="$${TELEGRAM_HOME_CHANNEL_NAME:-IronNest Hermes (littlejohn)}"
+        exec hermes -p littlejohn gateway run
+    env_file:
+      - path: ./.env
+    environment:
+      HERMES_UID: "10000"
+      HERMES_GID: "10000"
+      INFISICAL_PROJECT_ID: "2777cf9a-8ed7-43d0-84ed-8cb48f9b03ad"
+      INFISICAL_PATH: "/littlejohn"      # per-profile bot token at /littlejohn; shared keys imported from /
+      PATH: "/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      TERMINAL_ENV: "local"
+      HTTPS_PROXY: "http://squid:3128"
+      HTTP_PROXY: "http://squid:3128"
+      NO_PROXY: "infisical,adguard,squid,socket-proxy,browser-intent-mcp,browser-intent-worker,localhost,127.0.0.1,.local"
+      https_proxy: "http://squid:3128"
+      http_proxy: "http://squid:3128"
+      no_proxy: "infisical,adguard,squid,socket-proxy,browser-intent-mcp,browser-intent-worker,localhost,127.0.0.1,.local"
+    logging: *default-logging
+    volumes:
+      - hermes-data:/opt/data
+      - hermes-to-browser-intent:/opt/uploads-out
+      - browser-intent-to-hermes:/opt/uploads-in:ro
+    networks:
+      - platform-net
+    dns:
+      - 172.30.0.10
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'hermes -p littlejohn gateway run' >/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 3
