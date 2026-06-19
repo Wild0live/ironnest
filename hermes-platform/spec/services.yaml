@@ -1,0 +1,412 @@
+# services.yaml - service inventory for hermes-platform
+#
+# Machine-readable mirror of docker-compose.yml. Used by:
+#   - docs/02-SERVICES.md
+#   - external monitoring/observability tools
+#   - AI rebuild agents (spec/rebuild-checklist.yaml references this)
+#
+# Current as of 2026-06-14.
+
+stack_name: hermes-platform
+stack_kind: on-demand
+description: Multi-profile Hermes runtime + OpenViking long-term memory + Mission Control.
+service_count: 14
+hermes_agent_image: platform/hermes-agent:v2026.6.5-patched
+profile_startup_model: s6-overlay image entrypoint; no Compose entrypoint override.
+
+networks:
+  - name: platform-net
+    external: true
+    members:
+      - ollama
+      - memory-gateway
+      - mission-control
+      - hermes-platform-ttyd
+      - hermes-pf-default
+      - hermes-pf-mark
+      - hermes-pf-steve
+      - hermes-pf-qa
+      - hermes-pf-littlejohn
+      - hermes-pf-jaime
+      - hermes-pf-bigbert
+      - hermes-pf-octo
+    notes: AdGuard DNS at 172.30.0.10, Squid at squid:3128, Infisical at infisical:8090, Traefik routes Mission Control.
+  - name: platform-egress
+    external: true
+    members: [openviking-infisical-agent]
+    notes: Used by the OpenViking Infisical sidecar to reach Infisical Universal Auth.
+  - name: hermes-platform-mem-net
+    internal: true
+    members: [ollama, openviking, memory-gateway]
+    notes: OpenViking/Ollama memory tier. Hermes profile containers are NOT joined here.
+  - name: hermes-platform-app-net
+    internal: true
+    members: [memory-gateway, hermes-pf-default, hermes-pf-mark, hermes-pf-steve, hermes-pf-qa, hermes-pf-littlejohn, hermes-pf-jaime, hermes-pf-bigbert, hermes-pf-octo]
+    notes: The only profile-agent path to memory-gateway.
+  - name: ingress
+    internal: false
+    members: [memory-gateway, hermes-platform-ttyd]
+    notes: Stack-local bridge for 127.0.0.1 publishes only.
+
+volumes:
+  - name: hermes-platform_openviking-workspace
+    mount: /var/lib/openviking
+    services: [openviking]
+  - name: hermes-platform_ollama-models
+    mount: /root/.ollama
+    services: [ollama]
+  - name: hermes-platform_openviking-secrets-runtime
+    mount: /secrets
+    services: [openviking-infisical-agent, openviking]
+  - name: hermes-platform_memory-gateway-log
+    mount: /var/log/gateway
+    services: [memory-gateway, mission-control]
+    notes: mission-control mounts this read-only.
+  - name: hermes-platform_mission-control-state
+    mount: /var/lib/mission-control
+    services: [mission-control]
+  - name: hermes-platform_kanban-shared
+    mount: /opt/kanban
+    services: [hermes-platform-ttyd, hermes-pf-default, hermes-pf-mark, hermes-pf-steve, hermes-pf-qa, hermes-pf-littlejohn, hermes-pf-jaime, hermes-pf-bigbert, hermes-pf-octo]
+    notes: Shared Hermes Kanban board root (kanban.db, boards, workspaces, logs). Deliberately cross-profile and secret-free.
+  - name: hermes-platform_data-default
+    mount: /opt/data
+    services: [hermes-pf-default, hermes-platform-ttyd]
+  - name: hermes-platform_data-mark
+    mount: /opt/data
+    services: [hermes-pf-mark, hermes-platform-ttyd]
+  - name: hermes-platform_data-steve
+    mount: /opt/data
+    services: [hermes-pf-steve, hermes-platform-ttyd]
+  - name: hermes-platform_data-qa
+    mount: /opt/data
+    services: [hermes-pf-qa, hermes-platform-ttyd]
+  - name: hermes-platform_data-littlejohn
+    mount: /opt/data
+    services: [hermes-pf-littlejohn, hermes-platform-ttyd]
+  - name: hermes-platform_data-jaime
+    mount: /opt/data
+    services: [hermes-pf-jaime, hermes-platform-ttyd]
+  - name: hermes-platform_data-bigbert
+    mount: /opt/data
+    services: [hermes-pf-bigbert, hermes-platform-ttyd]
+  - name: hermes-platform_data-octo
+    mount: /opt/data
+    services: [hermes-pf-octo, hermes-platform-ttyd]
+  - name: browser-intent-to-hermes
+    external: true
+    mount: /opt/uploads-in
+    services: [hermes-platform-ttyd]
+  - name: hermes-to-browser-intent
+    external: true
+    mount: /opt/uploads-out
+    services: [hermes-platform-ttyd]
+
+host_binds:
+  - path: ./shared
+    role: shared artifact exchange
+    services: [hermes-platform-ttyd, hermes-pf-default, hermes-pf-mark, hermes-pf-steve, hermes-pf-qa, hermes-pf-littlejohn, hermes-pf-jaime, hermes-pf-bigbert, hermes-pf-octo]
+    notes: Agents mount own slice rw at /opt/shared/mine and whole tree ro at /opt/shared/all; ttyd mounts whole tree rw.
+  - path: ./hermes-plugin/ironnest_gateway
+    role: in-process Hermes MemoryProvider
+    services: [hermes-platform-ttyd, hermes-pf-default, hermes-pf-mark, hermes-pf-steve, hermes-pf-qa, hermes-pf-littlejohn, hermes-pf-jaime, hermes-pf-bigbert, hermes-pf-octo]
+  - path: ./agent-bridge/agent-chat-bridge.py
+    role: Mission Control profile chat bridge
+    services: [hermes-pf-default, hermes-pf-mark, hermes-pf-steve, hermes-pf-qa, hermes-pf-littlejohn, hermes-pf-jaime, hermes-pf-bigbert, hermes-pf-octo]
+
+services:
+  - name: openviking-infisical-agent
+    container_name: hermes-platform-openviking-infisical-agent
+    image: infisical/cli@sha256:dba406b35e5819632412c561bfa46e6185e04c6d76175dc82bf97c4ff53745d7
+    role: secrets sidecar for OpenViking
+    listens: []
+    publishes: []
+    networks: [platform-egress]
+    healthcheck: "test -f /secrets/.env"
+    resources:
+      cpus: "0.25"
+      memory: 64M
+
+  - name: ollama
+    container_name: hermes-platform-ollama
+    image: ollama/ollama:0.4.6
+    role: local embedding inference for OpenViking
+    listens: ["11434/tcp"]
+    publishes: []
+    networks: [hermes-platform-mem-net, platform-net]
+    persistent_model: mxbai-embed-large
+    healthcheck: "ollama list contains mxbai-embed-large"
+    resources:
+      cpus: "5.0"
+      memory: 2G
+    notes: Joins platform-net so first-boot model pull can egress through Squid; steady-state OpenViking traffic is on mem-net.
+
+  - name: openviking
+    container_name: hermes-platform-openviking
+    image: platform/hermes-platform-openviking:0.1.0
+    upstream: https://github.com/volcengine/OpenViking
+    role: long-term memory backend
+    listens: ["1933/tcp"]
+    publishes: []
+    networks: [hermes-platform-mem-net]
+    healthcheck: GET http://127.0.0.1:1933/health
+    resources:
+      cpus: "2.0"
+      memory: 4G
+    notes: No host ports; only memory-gateway can call it.
+
+  - name: memory-gateway
+    container_name: hermes-platform-memory-gateway
+    image: platform/hermes-platform-memory-gateway:0.1.0
+    role: policy-enforcing front door for OpenViking
+    listens: ["8080/tcp"]
+    publishes: ["127.0.0.1:18080:8080"]
+    networks: [platform-net, hermes-platform-mem-net, hermes-platform-app-net, ingress]
+    healthcheck: GET http://127.0.0.1:8080/health
+    resources:
+      cpus: "1.0"
+      memory: 512M
+
+  - name: mission-control
+    container_name: hermes-platform-mission-control
+    image: platform/hermes-platform-mission-control:0.1.0
+    role: standalone ops dashboard and browser chat control plane
+    listens: ["8080/tcp"]
+    publishes: []
+    networks: [platform-net]
+    route: https://mission.ironnest.local/
+    healthcheck: GET http://127.0.0.1:8080/healthz
+    resources:
+      cpus: "0.5"
+      memory: 128M
+    security:
+      secrets: none
+      rootfs: read_only
+      capabilities: drop_all
+      no_new_privileges: true
+    reads:
+      - registry/profiles-registry.yaml:ro
+      - policies/:ro
+      - hermes-platform_memory-gateway-log:/var/log/gateway:ro
+    owns:
+      - hermes-platform_mission-control-state:/var/lib/mission-control
+    calls:
+      - target: agent-chat bridge
+        url_pattern: http://hermes-pf-<profile>:8011
+        auth: MISSION_CONTROL_BRIDGE_TOKEN
+        features: [chat, token_streaming, file_downloads, soul_edit, model_switch, role_summary, kanban_proxy, manual_task_run, task_decompose, autodispatch_controls]
+
+  - name: hermes-platform-ttyd
+    container_name: hermes-platform-ttyd
+    image: platform/hermes-agent:v2026.6.5-patched
+    role: browser terminal and Hermes dashboard management sidecar
+    profile: default
+    listens: ["7682/tcp", "9119/tcp"]
+    publishes: ["127.0.0.1:8123:7682", "127.0.0.1:8124:9119"]
+    routes:
+      - https://hermes-platform.ironnest.local/
+      - https://hermes-platform-dashboard.ironnest.local/
+    networks: [platform-net, ingress]
+    mounts:
+      - hermes-platform_data-default:/opt/data
+      - hermes-platform_data-mark:/opt/data/profiles/mark
+      - hermes-platform_data-steve:/opt/data/profiles/steve
+      - hermes-platform_data-qa:/opt/data/profiles/qa
+      - hermes-platform_data-littlejohn:/opt/data/profiles/littlejohn
+      - hermes-platform_data-jaime:/opt/data/profiles/jaime
+      - hermes-platform_data-bigbert:/opt/data/profiles/bigbert
+      - hermes-platform_data-octo:/opt/data/profiles/octo
+      - browser-intent-to-hermes:/opt/uploads-in:ro
+      - hermes-to-browser-intent:/opt/uploads-out
+      - hermes-platform_kanban-shared:/opt/kanban
+      - ./shared:/opt/shared/all
+    healthcheck: "pgrep -f 'ttyd --port=7682' && pgrep -f 'hermes dashboard'"
+    notes: Trusted management plane; can see all profile volumes by design.
+
+  - name: hermes-pf-default
+    container_name: hermes-pf-default
+    image: platform/hermes-agent:v2026.6.5-patched
+    role: profile agent
+    profile: default
+    listens: ["8011/tcp"]
+    publishes: []
+    networks: [platform-net, hermes-platform-app-net]
+    memory_provider: ironnest_gateway
+    memory_provider_mount: ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
+    kanban:
+      home: /opt/kanban
+      volume: hermes-platform_kanban-shared
+      role: shared board participant
+    mission_control_bridge: ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
+    shared_artifacts:
+      own_rw: /opt/shared/mine
+      all_ro: /opt/shared/all
+    healthcheck: "pgrep -f 'hermes gateway run'"
+    resources:
+      cpus: "2.0"
+      memory: 768M
+
+  - name: hermes-pf-mark
+    container_name: hermes-pf-mark
+    image: platform/hermes-agent:v2026.6.5-patched
+    role: profile agent
+    profile: mark
+    listens: ["8011/tcp"]
+    publishes: []
+    networks: [platform-net, hermes-platform-app-net]
+    memory_provider: ironnest_gateway
+    memory_provider_mount: ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
+    kanban:
+      home: /opt/kanban
+      volume: hermes-platform_kanban-shared
+      role: shared board participant
+    mission_control_bridge: ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
+    shared_artifacts:
+      own_rw: /opt/shared/mine
+      all_ro: /opt/shared/all
+    healthcheck: "pgrep -f 'hermes gateway run'"
+    resources:
+      cpus: "2.0"
+      memory: 768M
+
+  - name: hermes-pf-steve
+    container_name: hermes-pf-steve
+    image: platform/hermes-agent:v2026.6.5-patched
+    role: profile agent
+    profile: steve
+    listens: ["8011/tcp"]
+    publishes: []
+    networks: [platform-net, hermes-platform-app-net]
+    memory_provider: ironnest_gateway
+    memory_provider_mount: ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
+    kanban:
+      home: /opt/kanban
+      volume: hermes-platform_kanban-shared
+      role: shared board participant
+    mission_control_bridge: ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
+    shared_artifacts:
+      own_rw: /opt/shared/mine
+      all_ro: /opt/shared/all
+    healthcheck: "pgrep -f 'hermes gateway run'"
+    resources:
+      cpus: "2.0"
+      memory: 768M
+
+  - name: hermes-pf-qa
+    container_name: hermes-pf-qa
+    image: platform/hermes-agent:v2026.6.5-patched
+    role: profile agent
+    profile: qa
+    listens: ["8011/tcp"]
+    publishes: []
+    networks: [platform-net, hermes-platform-app-net]
+    memory_provider: ironnest_gateway
+    memory_provider_mount: ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
+    kanban:
+      home: /opt/kanban
+      volume: hermes-platform_kanban-shared
+      role: shared board participant
+    mission_control_bridge: ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
+    shared_artifacts:
+      own_rw: /opt/shared/mine
+      all_ro: /opt/shared/all
+    healthcheck: "pgrep -f 'hermes gateway run'"
+    resources:
+      cpus: "2.0"
+      memory: 768M
+
+  - name: hermes-pf-littlejohn
+    container_name: hermes-pf-littlejohn
+    image: platform/hermes-agent:v2026.6.5-patched
+    role: profile agent
+    profile: littlejohn
+    listens: ["8011/tcp"]
+    publishes: []
+    networks: [platform-net, hermes-platform-app-net]
+    memory_provider: ironnest_gateway
+    memory_provider_mount: ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
+    kanban:
+      home: /opt/kanban
+      volume: hermes-platform_kanban-shared
+      role: shared board participant
+    mission_control_bridge: ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
+    shared_artifacts:
+      own_rw: /opt/shared/mine
+      all_ro: /opt/shared/all
+    healthcheck: "pgrep -f 'hermes gateway run'"
+    resources:
+      cpus: "2.0"
+      memory: 768M
+
+  - name: hermes-pf-jaime
+    container_name: hermes-pf-jaime
+    image: platform/hermes-agent:v2026.6.5-patched
+    role: profile agent
+    profile: jaime
+    listens: ["8011/tcp"]
+    publishes: []
+    networks: [platform-net, hermes-platform-app-net]
+    memory_provider: ironnest_gateway
+    memory_provider_mount: ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
+    kanban:
+      home: /opt/kanban
+      volume: hermes-platform_kanban-shared
+      role: shared board participant
+    mission_control_bridge: ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
+    shared_artifacts:
+      own_rw: /opt/shared/mine
+      all_ro: /opt/shared/all
+    healthcheck: "pgrep -f 'hermes gateway run'"
+    resources:
+      cpus: "2.0"
+      memory: 768M
+    source_fragment: services.d/hermes-pf-jaime.yml
+
+  - name: hermes-pf-bigbert
+    container_name: hermes-pf-bigbert
+    image: platform/hermes-agent:v2026.6.5-patched
+    role: profile agent
+    profile: bigbert
+    listens: ["8011/tcp"]
+    publishes: []
+    networks: [platform-net, hermes-platform-app-net]
+    memory_provider: ironnest_gateway
+    memory_provider_mount: ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
+    kanban:
+      home: /opt/kanban
+      volume: hermes-platform_kanban-shared
+      role: shared board participant
+    mission_control_bridge: ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
+    shared_artifacts:
+      own_rw: /opt/shared/mine
+      all_ro: /opt/shared/all
+    healthcheck: "pgrep -f 'hermes gateway run'"
+    resources:
+      cpus: "2.0"
+      memory: 768M
+    source_fragment: services.d/hermes-pf-bigbert.yml
+
+  - name: hermes-pf-octo
+    container_name: hermes-pf-octo
+    image: platform/hermes-agent:v2026.6.5-patched
+    role: profile agent
+    profile: octo
+    listens: ["8011/tcp"]
+    publishes: []
+    networks: [platform-net, hermes-platform-app-net]
+    memory_provider: ironnest_gateway
+    memory_provider_mount: ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
+    kanban:
+      home: /opt/kanban
+      volume: hermes-platform_kanban-shared
+      role: shared board participant
+    mission_control_bridge: ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
+    shared_artifacts:
+      own_rw: /opt/shared/mine
+      all_ro: /opt/shared/all
+    healthcheck: "pgrep -f 'hermes gateway run'"
+    resources:
+      cpus: "2.0"
+      memory: 768M
+    source_fragment: services.d/hermes-pf-octo.yml
+    notes: Platform-ops profile; added 2026-06-12.

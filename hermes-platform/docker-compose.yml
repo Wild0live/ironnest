@@ -1,0 +1,794 @@
+# hermes-platform — multi-profile Hermes runtime + OpenViking long-term memory
+#
+# On-demand stack: start with ./hermes-platform/start.sh
+# (do NOT add to bootstrap.sh — see platform/bootstrap.sh).
+#
+# Services:
+#   openviking-infisical-agent   sidecar: renders /secrets/.env for openviking from Infisical /hermes-platform/openviking
+#   openviking                   long-term memory backend (volcengine/OpenViking on :1933)
+#   memory-gateway               policy-enforcing front door (FastAPI on :8080)
+#   hermes-platform-ttyd         browser terminal + dashboard for the default profile
+#   hermes-pf-default
+#   hermes-pf-mark
+#   hermes-pf-steve              one container per profile;
+#   hermes-pf-qa                 each mounts its OWN named volume (per-profile isolation).
+#   hermes-pf-littlejohn
+#   hermes-pf-jaime              dynamic profile, from services.d/hermes-pf-jaime.yml
+#   hermes-pf-bigbert            dynamic profile, from services.d/hermes-pf-bigbert.yml
+#
+# Network segmentation:
+#   hermes-platform-mem-net (internal:true)
+#     ↳ openviking + memory-gateway ONLY. Hermes containers have no route here.
+#   hermes-platform-app-net (internal:true)
+#     ↳ memory-gateway + every hermes-pf-* container. The only path from the
+#       agents to memory.
+#   platform-net (external)
+#     ↳ memory-gateway (needs Infisical) and hermes-pf-* (need Squid for
+#       LLM provider egress).
+#
+# Critical security invariant: openviking publishes NO host ports and is
+# unreachable from any hermes-pf-* container. Verify with:
+#   docker exec hermes-pf-mark curl -m 5 -sf http://openviking:1933/
+# → must FAIL (connection refused / DNS NX) for the architecture to hold.
+
+name: hermes-platform
+
+networks:
+  # Existing IronNest networks
+  platform-net:
+    external: true             # AdGuard DNS @ 172.30.0.10, Squid proxy, Infisical
+  platform-egress:
+    external: true             # Used ONLY by openviking-infisical-agent sidecar
+
+  # Stack-private internal networks
+  hermes-platform-mem-net:
+    driver: bridge
+    internal: true
+    name: hermes-platform-mem-net
+  hermes-platform-app-net:
+    driver: bridge
+    internal: true
+    name: hermes-platform-app-net
+
+  # Stack-local bridge for publishing the memory-gateway port to 127.0.0.1
+  # (admin/diagnostic access only).
+  ingress:
+    driver: bridge
+
+volumes:
+  # ── OpenViking workspace (entire viking://resources/ tree lives here) ────
+  openviking-workspace:
+    name: hermes-platform_openviking-workspace
+
+  # ── Ollama model storage (persistent across container restarts) ─────────
+  ollama-models:
+    name: hermes-platform_ollama-models
+
+  # ── Per-profile Hermes data — full ISOLATION at the volume layer ─────────
+  # Each container mounts ONLY its own volume. A kernel escape in
+  # hermes-pf-mark cannot reach hermes-pf-steve's SOUL.md because the
+  # volume is not mounted.
+  hermes-platform-data-default:
+    name: hermes-platform_data-default
+  hermes-platform-data-mark:
+    name: hermes-platform_data-mark
+  hermes-platform-data-steve:
+    name: hermes-platform_data-steve
+  hermes-platform-data-qa:
+    name: hermes-platform_data-qa
+  hermes-platform-data-littlejohn:
+    name: hermes-platform_data-littlejohn
+  hermes-platform-data-jaime:
+    name: hermes-platform_data-jaime
+  hermes-platform-data-bigbert:
+    name: hermes-platform_data-bigbert
+
+  # Shared Kanban board — the ONE deliberate cross-profile read-write surface.
+  # Mounted at /opt/kanban in every hermes container with HERMES_KANBAN_HOME set
+  # so all profiles + the operator terminal collapse onto a single board
+  # (kanban.db + boards/ + workspaces/). Keep it SECRET-FREE. Per-profile auth/
+  # memory/SOUL stay isolated (HERMES_HOME is untouched). See mission-control/
+  # KANBAN-PHASE1-PLAN.md.
+  kanban-shared:
+    name: hermes-platform_kanban-shared
+
+  # Gateway audit log — kept on a named volume so logs survive container
+  # restarts. fluent-bit mirrors them via stderr.
+  memory-gateway-log:
+    name: hermes-platform_memory-gateway-log
+
+  # Mission Control's own tasks/schedules store (isolated from the gateway).
+  mission-control-state:
+    name: hermes-platform_mission-control-state
+
+  # Infisical sidecar render dir for openviking
+  openviking-secrets-runtime:
+    name: hermes-platform_openviking-secrets-runtime
+
+  # Shared handoff volumes with Browser Intent MCP. These are owned by the
+  # browser-intent stack; Hermes only joins them for upload/download handoff.
+  browser-intent-to-hermes:
+    external: true
+    name: browser-intent-to-hermes
+  hermes-to-browser-intent:
+    external: true
+    name: hermes-to-browser-intent
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# ─── Environment shared by every hermes-pf-* service ────────────────────────
+# YAML merge keys (<<) deep-merge at the MAPPING level only when both sides
+# are mappings. We define the common env as its own anchor so each service
+# can do  `environment: { <<: *hermes-env-common, INFISICAL_PATH: "/..." }`.
+x-hermes-env-common: &hermes-env-common
+  TZ: "Asia/Manila"
+  HERMES_UID: "10000"
+  HERMES_GID: "10000"
+  INFISICAL_PROJECT_ID: "${HERMES_PLATFORM_INFISICAL_PROJECT_ID:?missing HERMES_PLATFORM_INFISICAL_PROJECT_ID in .env}"
+  PATH: "/opt/hermes/.venv/bin:/opt/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  TERMINAL_ENV: "local"
+  HERMES_GATEWAY_NO_SUPERVISE: "1"
+  HTTPS_PROXY: "http://squid:3128"
+  HTTP_PROXY:  "http://squid:3128"
+  NO_PROXY:    "memory-gateway,browser-intent-mcp,infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+  https_proxy: "http://squid:3128"
+  http_proxy:  "http://squid:3128"
+  no_proxy:    "memory-gateway,browser-intent-mcp,infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+  MEMORY_GATEWAY_URL: "http://memory-gateway:8080"
+  # Shared Kanban board root (kanban.db + boards/ + workspaces/). Overrides the
+  # per-profile default of $HERMES_HOME so all profiles join ONE board. Paired
+  # with the `kanban-shared` volume mounted at /opt/kanban.
+  HERMES_KANBAN_HOME: "/opt/kanban"
+  # Only respond in group chats when explicitly @mentioned.
+  TELEGRAM_REQUIRE_MENTION: "true"
+  # MEMORY_GATEWAY_TOKEN is injected by with-infisical from
+  # Infisical /hermes-platform/<profile>; not declared here.
+
+# ─── Service-level common config for hermes-pf-* ────────────────────────────
+x-hermes-pf-base: &hermes-pf-base
+  image: platform/hermes-agent:v2026.6.5-patched  # REUSE existing image (built by hermes/build.sh)
+  restart: unless-stopped
+  # No entrypoint override — image's /init + main-wrapper.sh handles bootstrap
+  # (uid remap, chown, config seed) via s6-overlay cont-init.d, then drops to
+  # hermes user via s6-setuidgid before exec'ing the CMD (with-infisical ...).
+  # The old tini+hermes-profile-entrypoint.sh pattern was removed in v0.15.0.
+  env_file:
+    - path: ./.env                                    # Infisical machine-identity creds
+  logging: *default-logging
+  networks:
+    - platform-net               # Squid egress to LLM providers
+    - hermes-platform-app-net    # memory-gateway access
+  dns:
+    - 172.30.0.10                # AdGuard
+  cap_drop: [ALL]
+  cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE]
+  security_opt:
+    - no-new-privileges:true
+  deploy:
+    resources:
+      limits:
+        cpus: "2.0"          # was 0.50 — a chat turn runs `hermes acp` token/MCP
+                             # processing alongside `hermes gateway run`; 0.5 core
+                             # starved it. Host has 8.
+        # 768M (was 512M): headroom for a transient warm `hermes acp` chat
+        # process (~120-250M) alongside `hermes gateway run`. Idle-timed-out by
+        # the chat bridge, so this ceiling is only approached while chatting.
+        memory: 768M
+
+services:
+
+  # ════════════════════════════════════════════════════════════════════════
+  # OpenViking — long-term memory backend
+  # ════════════════════════════════════════════════════════════════════════
+
+  openviking-infisical-agent:
+    image: infisical/cli@sha256:dba406b35e5819632412c561bfa46e6185e04c6d76175dc82bf97c4ff53745d7
+    container_name: hermes-platform-openviking-infisical-agent
+    restart: unless-stopped
+    entrypoint: ["sh", "/agent-config/entrypoint.sh"]
+    env_file: ./.env
+    environment:
+      INFISICAL_PATH: "/hermes-platform/openviking"
+      INFISICAL_DOMAIN: "http://infisical:8090"
+    logging: *default-logging
+    volumes:
+      - ./openviking/agent-config:/agent-config:ro
+      - openviking-secrets-runtime:/secrets
+    tmpfs:
+      - /tmp:size=1m,mode=0700
+    networks:
+      - platform-egress
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /secrets/.env"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 10s
+
+  # ── Ollama — local embedding inference (no external API) ────────────────
+  # Hosts mxbai-embed-large (137M, 768-dim) for OpenViking's embedding
+  # provider. Joins platform-egress ONCE for the model pull on first
+  # boot; steady-state traffic is mem-net only (openviking → ollama).
+  ollama:
+    image: ollama/ollama:0.4.6
+    container_name: hermes-platform-ollama
+    restart: unless-stopped
+    entrypoint:
+      - sh
+      - -c
+      - |
+        # Start the ollama server in background, wait for it, pull the
+        # embedding model if not yet present, then foreground the server.
+        /bin/ollama serve &
+        srv=$$!
+        sleep 3
+        until /bin/ollama list >/dev/null 2>&1; do sleep 1; done
+        if ! /bin/ollama list | grep -q mxbai-embed-large; then
+            echo "ollama: pulling mxbai-embed-large (~670MB, one-time)"
+            /bin/ollama pull mxbai-embed-large
+        else
+            echo "ollama: mxbai-embed-large already present"
+        fi
+        echo "ollama: ready"
+        wait $$srv
+    environment:
+      OLLAMA_HOST: "0.0.0.0:11434"
+      OLLAMA_KEEP_ALIVE: "24h"
+      # GPU offload via WSL2: ollama's bundled cuda_v12 runner loads the host
+      # driver libcuda.so from the mounted /usr/lib/wsl/lib (see volumes + devices).
+      LD_LIBRARY_PATH: "/usr/lib/wsl/lib"
+      # Route the model-pull egress through Squid (matches IronNest pattern).
+      # Squid is on platform-net at squid:3128 — needs platform-net membership.
+      HTTPS_PROXY: "http://squid:3128"
+      HTTP_PROXY:  "http://squid:3128"
+      NO_PROXY:    "openviking,memory-gateway,infisical,adguard,squid,localhost,127.0.0.1,0.0.0.0,.local"
+      https_proxy: "http://squid:3128"
+      http_proxy:  "http://squid:3128"
+      no_proxy:    "openviking,memory-gateway,infisical,adguard,squid,localhost,127.0.0.1,0.0.0.0,.local"
+    logging: *default-logging
+    volumes:
+      - ollama-models:/root/.ollama
+      # WSL2 GPU passthrough: WSL VM's CUDA driver libs (libcuda.so, libdxcore.so)
+      # PLUS the mapped Windows DriverStore — libcuda.so is a shim that dlopens the
+      # real nvcuda driver from /usr/lib/wsl/drivers, so BOTH mounts are required
+      # (lib alone enumerates 0 devices). Read-only binds; no data is copied.
+      - /usr/lib/wsl/lib:/usr/lib/wsl/lib:ro
+      - /usr/lib/wsl/drivers:/usr/lib/wsl/drivers:ro
+    devices:
+      - "/dev/dxg:/dev/dxg"   # WSL2 GPU (DirectX kernel) device — enables CUDA offload
+    networks:
+      - hermes-platform-mem-net   # serves openviking (steady state)
+      - platform-net              # AdGuard DNS at 172.30.0.10 + Squid at squid:3128
+    dns:
+      - 172.30.0.10
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "5.0"          # was 2.0 — embeddings are CPU-bound; the memory
+                               # search that gates every chat turn was ~7.4s/op
+                               # pinned at 2 cores. Host has 8.
+          memory: 2G
+    healthcheck:
+      # Healthy only when the embedding model is present AND server responds.
+      test: ["CMD-SHELL", "/bin/ollama list 2>/dev/null | grep -q mxbai-embed-large"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s          # generous — first-boot pull can take ~30s
+
+  openviking:
+    build:
+      context: ./openviking
+      dockerfile: Dockerfile
+    image: platform/hermes-platform-openviking:0.1.0
+    container_name: hermes-platform-openviking
+    restart: unless-stopped
+    depends_on:
+      openviking-infisical-agent: { condition: service_healthy }
+      ollama:                     { condition: service_healthy }
+    logging: *default-logging
+    volumes:
+      - openviking-workspace:/var/lib/openviking
+      - openviking-secrets-runtime:/secrets:ro
+    networks:
+      # Single network — dockerized Ollama is on mem-net too, so no
+      # internet egress needed from openviking. server.root_api_key
+      # (from Infisical) provides defense in depth even though network
+      # alone already prevents non-gateway access.
+      #
+      # NOTE: We tried native Windows GPU Ollama (task #16) but
+      # Rancher Desktop's WSL2 networking blocks docker containers
+      # from reaching the Windows host. See docs/16-DECISION-LOG.md.
+      - hermes-platform-mem-net
+    dns:
+      - 172.30.0.10
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          # 2G was too small once the vector store grew (~2026-06-07): service
+          # initialize()'s working set hit ~2G anon-rss and the cgroup OOM-killer
+          # SIGKILLed openviking-serv mid-init every ~2.5min (container OOMKilled
+          # flag stayed false because the child PID died, not tini/PID1).
+          memory: 4G
+    # Healthcheck override: Dockerfile uses GET / (returns 404), but the
+    # actual liveness endpoint is /health. Also bumping start_period to
+    # accommodate slow first-boot Ollama embeddings (~5-10s each, ~12 calls
+    # at minimum for system bootstrap collections).
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:1933/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Memory Gateway — the ONLY service that can talk to OpenViking
+  # ════════════════════════════════════════════════════════════════════════
+
+  memory-gateway:
+    build:
+      context: .                  # stack root, so policies/ + registry/ + spec/ are in context
+      dockerfile: gateway/Dockerfile
+    image: platform/hermes-platform-memory-gateway:0.1.0
+    container_name: hermes-platform-memory-gateway
+    restart: unless-stopped
+    depends_on:
+      openviking: { condition: service_healthy }
+    command:
+      - with-infisical
+      - sh
+      - -c
+      - |
+        if [ -z "$${MEMORY_GATEWAY_PROFILE_TOKENS_JSON:-}" ]; then
+          echo "FATAL: MEMORY_GATEWAY_PROFILE_TOKENS_JSON missing from Infisical /hermes-platform/gateway" >&2
+          exit 1
+        fi
+        if [ -z "$${MEMORY_GATEWAY_ADMIN_TOKEN:-}" ]; then
+          echo "FATAL: MEMORY_GATEWAY_ADMIN_TOKEN missing from Infisical /hermes-platform/gateway" >&2
+          exit 1
+        fi
+        if [ -z "$${MEMORY_GATEWAY_OPENVIKING_API_KEY:-}" ]; then
+          echo "FATAL: MEMORY_GATEWAY_OPENVIKING_API_KEY missing from Infisical /hermes-platform/gateway" >&2
+          echo "       (this is the bearer the gateway sends to OpenViking; must match openviking's server.root_api_key)" >&2
+          exit 1
+        fi
+        exec uvicorn app.main:app --host 0.0.0.0 --port 8080 \
+          --log-config /app/app/logging.json --proxy-headers
+    env_file:
+      - path: ./.env
+    environment:
+      TZ: "Asia/Manila"
+      INFISICAL_PROJECT_ID: "${HERMES_PLATFORM_INFISICAL_PROJECT_ID:?missing HERMES_PLATFORM_INFISICAL_PROJECT_ID in .env}"
+      INFISICAL_PATH: "/hermes-platform/gateway"
+      MEMORY_GATEWAY_OPENVIKING_URL: "http://openviking:1933"
+      MEMORY_GATEWAY_POLICIES_DIR:   "/etc/hermes-platform/policies"
+      MEMORY_GATEWAY_REGISTRY_FILE:  "/etc/hermes-platform/registry/profiles-registry.yaml"
+      MEMORY_GATEWAY_POLICIES_SCHEMA_FILE: "/etc/hermes-platform/spec/policies.schema.json"
+      MEMORY_GATEWAY_REGISTRY_SCHEMA_FILE: "/etc/hermes-platform/spec/registry.schema.json"
+      MEMORY_GATEWAY_AUDIT_LOG:      "/var/log/gateway/audit.log"
+      MEMORY_GATEWAY_AUDIT_TO_STDERR: "true"
+      MEMORY_GATEWAY_RATE_CAPACITY:   "120"
+      MEMORY_GATEWAY_RATE_REFILL_PER_SEC: "2.0"
+    logging: *default-logging
+    volumes:
+      - ./policies:/etc/hermes-platform/policies:ro
+      - ./registry:/etc/hermes-platform/registry:ro
+      - ./spec:/etc/hermes-platform/spec:ro
+      - memory-gateway-log:/var/log/gateway
+    ports:
+      # 127.0.0.1-only admin/diagnostic port. hermes-pf-* containers reach
+      # the gateway via internal DNS at http://memory-gateway:8080 on
+      # hermes-platform-app-net.
+      - "127.0.0.1:18080:8080"
+    networks:
+      - platform-net                # Infisical at infisical:8090
+      - hermes-platform-mem-net     # OpenViking
+      - hermes-platform-app-net     # Hermes profile containers
+      - ingress                     # 127.0.0.1 publish
+    dns:
+      - 172.30.0.10
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    # Healthcheck baked into Dockerfile
+
+  # ── Mission Control (standalone ops dashboard) ────────────────────────────
+  # Decoupled from the memory-gateway policy kernel: holds NO secrets, is on
+  # platform-net ONLY (so Traefik can route to it — NOT on the agent/OpenViking
+  # nets), and reads exactly two gateway-owned files read-only: the profile
+  # registry and the audit log. Owns its own tasks/schedules JSON on a private
+  # volume. Routed at https://mission.ironnest.local (behind Authelia FIDO).
+  mission-control:
+    build:
+      context: ./mission-control
+      dockerfile: Dockerfile
+    image: platform/hermes-platform-mission-control:0.1.0
+    container_name: hermes-platform-mission-control
+    restart: unless-stopped
+    environment:
+      TZ: "Asia/Manila"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      MISSION_CONTROL_REGISTRY_FILE: "/etc/hermes-platform/registry/profiles-registry.yaml"
+      MISSION_CONTROL_POLICIES_DIR:  "/etc/hermes-platform/policies"
+      MISSION_CONTROL_AUDIT_LOG:     "/var/log/gateway/audit.log"
+      MISSION_CONTROL_STATE_FILE:    "/var/lib/mission-control/state.json"
+      # Optional bearer gate on writes. Unset = Authelia FIDO gate is the auth
+      # boundary (writes allowed for any authenticated operator session).
+      MISSION_CONTROL_ADMIN_TOKEN:   "${MISSION_CONTROL_ADMIN_TOKEN:-}"
+      # Shared secret for calling the per-profile agent chat bridges.
+      MISSION_CONTROL_BRIDGE_TOKEN:  "${MISSION_CONTROL_BRIDGE_TOKEN:-}"
+    volumes:
+      - ./registry:/etc/hermes-platform/registry:ro
+      - ./policies:/etc/hermes-platform/policies:ro
+      - memory-gateway-log:/var/log/gateway:ro
+      - mission-control-state:/var/lib/mission-control
+    networks:
+      - platform-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+
+  # ── Sandboxed static-app server ───────────────────────────────────────────
+  # Serves COMPLETE webapp deliverables (folders with an index.html) from the
+  # shared Kanban artifacts volume, LIVE, on a SEPARATE origin
+  # (apps.ironnest.local) so agent-authored HTML/JS runs isolated from Mission
+  # Control. A dumb, read-only nginx file server: no API, no secrets, no write
+  # path. CSP (in artifact-apps/default.conf) blocks the served app from calling
+  # back into MC or any external host. Behind the same Authelia FIDO gate.
+  artifact-apps:
+    image: nginxinc/nginx-unprivileged:alpine
+    container_name: hermes-platform-artifact-apps
+    restart: unless-stopped
+    environment:
+      TZ: "Asia/Manila"
+    volumes:
+      - kanban-shared:/srv/kanban:ro
+      - ./artifact-apps/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - platform-net               # Traefik routes to it here
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp                        # nginx-unprivileged writes pid + temp here
+      - /var/cache/nginx
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 64M
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Hermes profile containers — one per profile, per-profile isolated volume
+  # ════════════════════════════════════════════════════════════════════════
+
+  hermes-platform-ttyd:
+    <<: *hermes-pf-base
+    container_name: hermes-platform-ttyd
+    depends_on:
+      memory-gateway: { condition: service_healthy }
+    environment:
+      <<: *hermes-env-common
+      INFISICAL_PATH: "/hermes-platform/default"
+      HERMES_PROFILE: "default"
+    networks:
+      - ingress
+      - platform-net
+    command:
+      - with-infisical
+      - sh
+      - -c
+      - |
+        mkdir -p /opt/data/home /opt/data/workspace
+        export TELEGRAM_HOME_CHANNEL="$${TELEGRAM_HOME_CHANNEL:-$${TELEGRAM_ALLOWED_USERS:-}}"
+        export TELEGRAM_HOME_CHANNEL_NAME="$${TELEGRAM_HOME_CHANNEL_NAME:-IronNest Hermes Platform}"
+        touch /opt/data/.profile /opt/data/home/.profile
+        for profile in /opt/data/.profile /opt/data/home/.profile; do
+          if ! grep -Fq '/opt/hermes/.venv/bin' "$$profile"; then
+            printf '\n# IronNest: expose Hermes CLI to ttyd and local tool subprocesses.\nexport PATH="/opt/hermes/.venv/bin:$$PATH"\n' >> "$$profile"
+          fi
+        done
+        curl -fsS -H "Authorization: Bearer $${MEMORY_GATEWAY_TOKEN}" http://memory-gateway:8080/health \
+          >/dev/null || { echo "memory-gateway unreachable from hermes-platform-ttyd" >&2; exit 1; }
+        /opt/hermes/.venv/bin/hermes dashboard --host 0.0.0.0 --insecure --no-open &
+        # ttyd Basic Auth deliberately disabled when fronted by Authelia.
+        # Authelia's ForwardAuth middleware sees any incoming `Authorization:
+        # Basic ...` header and tries to validate it against Authelia's own
+        # user store (which is passkey-only — no `hermes` user exists), so the
+        # request returns 401 from Authelia and never reaches ttyd. Authelia
+        # FIDO/WebAuthn is strictly stronger than Basic Auth, so stacking is
+        # not just redundant — it actively breaks access. Re-enable only if
+        # this route is ever exposed WITHOUT the authelia middleware.
+        unset HERMES_TTYD_USERNAME HERMES_TTYD_PASSWORD
+        if [ -n "$${HERMES_TTYD_USERNAME:-}" ] && [ -n "$${HERMES_TTYD_PASSWORD:-}" ]; then
+          exec ttyd --port=7682 --writable --credential "$${HERMES_TTYD_USERNAME}:$${HERMES_TTYD_PASSWORD}" \
+            bash -lc 'cd /opt/data/workspace; echo "IronNest Hermes Platform terminal. Default profile: hermes-pf-default"; exec bash'
+        fi
+        exec ttyd --port=7682 --writable \
+          bash -lc 'cd /opt/data/workspace; echo "IronNest Hermes Platform terminal. Default profile: hermes-pf-default"; exec bash'
+    volumes:
+      - hermes-platform-data-default:/opt/data
+      - hermes-platform-data-mark:/opt/data/profiles/mark
+      - hermes-platform-data-steve:/opt/data/profiles/steve
+      - hermes-platform-data-qa:/opt/data/profiles/qa
+      - hermes-platform-data-littlejohn:/opt/data/profiles/littlejohn
+      - hermes-platform-data-jaime:/opt/data/profiles/jaime
+      - hermes-platform-data-bigbert:/opt/data/profiles/bigbert
+      - browser-intent-to-hermes:/opt/uploads-in:ro
+      - hermes-to-browser-intent:/opt/uploads-out
+      - kanban-shared:/opt/kanban   # shared Kanban board (HERMES_KANBAN_HOME)
+      - ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
+      - ./hermes-profile-entrypoint.sh:/opt/ironnest/hermes-profile-entrypoint.sh:ro
+      # Shared artifact exchange — operator gets the WHOLE tree read-write
+      # for housekeeping/staging from the ttyd terminal.
+      - ./shared:/opt/shared/all
+    tmpfs:
+      # Hide the upstream "example-dashboard" stub plugin. Its manifest declares
+      # an "entry": "dist/index.js" frontend bundle that the image never ships
+      # (it exists only to give the upstream test suite a backend API route for
+      # auth coverage), so the dashboard lists an "Example" tab whose script
+      # 404s at /dashboard-plugins/example/dist/index.js — "Could not load this
+      # plugin's script." Mounting an empty tmpfs over the plugin dir removes its
+      # manifest.json from discovery, so the dashboard stops listing the tab.
+      # The dir is baked into the image (root-owned, not a volume), so this is
+      # the persistent way to suppress it without rebuilding.
+      - /opt/hermes/plugins/example-dashboard:mode=0755
+    ports:
+      - "127.0.0.1:8123:7682"
+      - "127.0.0.1:8124:9119"
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'ttyd --port=7682' >/dev/null && pgrep -f 'hermes dashboard' >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  hermes-pf-default:
+    <<: *hermes-pf-base
+    container_name: hermes-pf-default
+    depends_on:
+      memory-gateway: { condition: service_healthy }
+    environment:
+      <<: *hermes-env-common
+      INFISICAL_PATH: "/hermes-platform/default"
+      HERMES_PROFILE: "default"
+    command:
+      - with-infisical
+      - sh
+      - -c
+      - |
+        export TELEGRAM_HOME_CHANNEL="$${TELEGRAM_HOME_CHANNEL:-$${TELEGRAM_ALLOWED_USERS:-}}"
+        export TELEGRAM_HOME_CHANNEL_NAME="$${TELEGRAM_HOME_CHANNEL_NAME:-IronNest Hermes (default)}"
+        curl -fsS -H "Authorization: Bearer $${MEMORY_GATEWAY_TOKEN}" http://memory-gateway:8080/health \
+          >/dev/null || { echo "memory-gateway unreachable from hermes-pf-default" >&2; exit 1; }
+        hermes config set memory.memory_enabled true >/dev/null
+        hermes config set memory.user_profile_enabled true >/dev/null
+        hermes config set memory.provider ironnest_gateway >/dev/null
+        # Mission Control chat bridge — background co-process; a crash here
+        # never affects the foreground agent below.
+        /usr/bin/python3 /opt/ironnest/agent-chat-bridge.py &
+        exec hermes gateway run
+    volumes:
+      - hermes-platform-data-default:/opt/data
+      # Shared artifact exchange — write-own (/opt/shared/mine) + read-all (/opt/shared/all, ro)
+      - ./shared/default:/opt/shared/mine
+      - ./shared:/opt/shared/all:ro
+      - kanban-shared:/opt/kanban   # shared Kanban board (HERMES_KANBAN_HOME)
+      - ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
+      - ./hermes-profile-entrypoint.sh:/opt/ironnest/hermes-profile-entrypoint.sh:ro
+      - ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
+      # NOTE: Reports "Publish to Wiki" (Layer 3) previously bind-mounted the LLM
+      # Wiki admin token from D:\LLM Wiki cross-stack here. That coupled this core
+      # board gateway to an optional feature's secret file — a missing source made
+      # Docker auto-create a directory and the container failed to start (exit 127).
+      # Removed; the token is now delivered via Infisical as env WIKI_ADMIN_TOKEN.
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  hermes-pf-mark:
+    <<: *hermes-pf-base
+    container_name: hermes-pf-mark
+    depends_on:
+      memory-gateway: { condition: service_healthy }
+    environment:
+      <<: *hermes-env-common
+      INFISICAL_PATH: "/hermes-platform/mark"
+      HERMES_PROFILE: "mark"
+    command:
+      - with-infisical
+      - sh
+      - -c
+      - |
+        export TELEGRAM_HOME_CHANNEL="$${TELEGRAM_HOME_CHANNEL:-$${TELEGRAM_ALLOWED_USERS:-}}"
+        export TELEGRAM_HOME_CHANNEL_NAME="$${TELEGRAM_HOME_CHANNEL_NAME:-IronNest Hermes (mark)}"
+        curl -fsS -H "Authorization: Bearer $${MEMORY_GATEWAY_TOKEN}" http://memory-gateway:8080/health \
+          >/dev/null || { echo "memory-gateway unreachable from hermes-pf-mark" >&2; exit 1; }
+        hermes config set memory.memory_enabled true >/dev/null
+        hermes config set memory.user_profile_enabled true >/dev/null
+        hermes config set memory.provider ironnest_gateway >/dev/null
+        /usr/bin/python3 /opt/ironnest/agent-chat-bridge.py &
+        exec hermes gateway run
+    volumes:
+      - hermes-platform-data-mark:/opt/data
+      # Shared artifact exchange — write-own (/opt/shared/mine) + read-all (/opt/shared/all, ro)
+      - ./shared/mark:/opt/shared/mine
+      - ./shared:/opt/shared/all:ro
+      - ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
+      - kanban-shared:/opt/kanban   # shared Kanban board (HERMES_KANBAN_HOME)
+      - ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
+      - ./hermes-profile-entrypoint.sh:/opt/ironnest/hermes-profile-entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  hermes-pf-steve:
+    <<: *hermes-pf-base
+    container_name: hermes-pf-steve
+    depends_on:
+      memory-gateway: { condition: service_healthy }
+    environment:
+      <<: *hermes-env-common
+      INFISICAL_PATH: "/hermes-platform/steve"
+      HERMES_PROFILE: "steve"
+    command:
+      - with-infisical
+      - sh
+      - -c
+      - |
+        export TELEGRAM_HOME_CHANNEL="$${TELEGRAM_HOME_CHANNEL:-$${TELEGRAM_ALLOWED_USERS:-}}"
+        export TELEGRAM_HOME_CHANNEL_NAME="$${TELEGRAM_HOME_CHANNEL_NAME:-IronNest Hermes (steve)}"
+        curl -fsS -H "Authorization: Bearer $${MEMORY_GATEWAY_TOKEN}" http://memory-gateway:8080/health \
+          >/dev/null || { echo "memory-gateway unreachable from hermes-pf-steve" >&2; exit 1; }
+        hermes config set memory.memory_enabled true >/dev/null
+        hermes config set memory.user_profile_enabled true >/dev/null
+        hermes config set memory.provider ironnest_gateway >/dev/null
+        /usr/bin/python3 /opt/ironnest/agent-chat-bridge.py &
+        exec hermes gateway run
+    volumes:
+      - hermes-platform-data-steve:/opt/data
+      # Shared artifact exchange — write-own (/opt/shared/mine) + read-all (/opt/shared/all, ro)
+      - ./shared/steve:/opt/shared/mine
+      - ./shared:/opt/shared/all:ro
+      - ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
+      - kanban-shared:/opt/kanban   # shared Kanban board (HERMES_KANBAN_HOME)
+      - ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
+      - ./hermes-profile-entrypoint.sh:/opt/ironnest/hermes-profile-entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  hermes-pf-qa:
+    <<: *hermes-pf-base
+    container_name: hermes-pf-qa
+    depends_on:
+      memory-gateway: { condition: service_healthy }
+    environment:
+      <<: *hermes-env-common
+      INFISICAL_PATH: "/hermes-platform/qa"
+      HERMES_PROFILE: "qa"
+    command:
+      - with-infisical
+      - sh
+      - -c
+      - |
+        export TELEGRAM_HOME_CHANNEL="$${TELEGRAM_HOME_CHANNEL:-$${TELEGRAM_ALLOWED_USERS:-}}"
+        export TELEGRAM_HOME_CHANNEL_NAME="$${TELEGRAM_HOME_CHANNEL_NAME:-IronNest Hermes (qa)}"
+        curl -fsS -H "Authorization: Bearer $${MEMORY_GATEWAY_TOKEN}" http://memory-gateway:8080/health \
+          >/dev/null || { echo "memory-gateway unreachable from hermes-pf-qa" >&2; exit 1; }
+        hermes config set memory.memory_enabled true >/dev/null
+        hermes config set memory.user_profile_enabled true >/dev/null
+        hermes config set memory.provider ironnest_gateway >/dev/null
+        /usr/bin/python3 /opt/ironnest/agent-chat-bridge.py &
+        exec hermes gateway run
+    volumes:
+      - hermes-platform-data-qa:/opt/data
+      # Shared artifact exchange — write-own (/opt/shared/mine) + read-all (/opt/shared/all, ro)
+      - ./shared/qa:/opt/shared/mine
+      - ./shared:/opt/shared/all:ro
+      - ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
+      - kanban-shared:/opt/kanban   # shared Kanban board (HERMES_KANBAN_HOME)
+      - ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
+      - ./hermes-profile-entrypoint.sh:/opt/ironnest/hermes-profile-entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  hermes-pf-littlejohn:
+    <<: *hermes-pf-base
+    container_name: hermes-pf-littlejohn
+    depends_on:
+      memory-gateway: { condition: service_healthy }
+    environment:
+      <<: *hermes-env-common
+      INFISICAL_PATH: "/hermes-platform/littlejohn"
+      HERMES_PROFILE: "littlejohn"
+    command:
+      - with-infisical
+      - sh
+      - -c
+      - |
+        export TELEGRAM_HOME_CHANNEL="$${TELEGRAM_HOME_CHANNEL:-$${TELEGRAM_ALLOWED_USERS:-}}"
+        export TELEGRAM_HOME_CHANNEL_NAME="$${TELEGRAM_HOME_CHANNEL_NAME:-IronNest Hermes (littlejohn)}"
+        curl -fsS -H "Authorization: Bearer $${MEMORY_GATEWAY_TOKEN}" http://memory-gateway:8080/health \
+          >/dev/null || { echo "memory-gateway unreachable from hermes-pf-littlejohn" >&2; exit 1; }
+        hermes config set memory.memory_enabled true >/dev/null
+        hermes config set memory.user_profile_enabled true >/dev/null
+        hermes config set memory.provider ironnest_gateway >/dev/null
+        /usr/bin/python3 /opt/ironnest/agent-chat-bridge.py &
+        exec hermes gateway run
+    volumes:
+      - hermes-platform-data-littlejohn:/opt/data
+      # Shared artifact exchange — write-own (/opt/shared/mine) + read-all (/opt/shared/all, ro)
+      - ./shared/littlejohn:/opt/shared/mine
+      - ./shared:/opt/shared/all:ro
+      - ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
+      - kanban-shared:/opt/kanban   # shared Kanban board (HERMES_KANBAN_HOME)
+      - ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
+      - ./hermes-profile-entrypoint.sh:/opt/ironnest/hermes-profile-entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

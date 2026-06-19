@@ -1,0 +1,24 @@
+# Policy for the `default` profile.
+#
+# Validated against spec/policies.schema.json at gateway startup and on
+# POST /admin/reload-policies. See docs/06-NAMESPACE-AND-POLICY-MODEL.md.
+
+profile: default
+description: |
+  Default Hermes profile (formerly the root /opt/data/SOUL.md persona).
+  May read the shared org/project/knowledge tree and its own private
+  namespace; may write its own private namespace and its own
+  shared-approved sub-tree.
+
+read:
+  # Default-deny is IMPLICIT. Listing only what's allowed is enough.
+  # Explicit `deny:` rules are reserved for NARROWER exclusions inside
+  # an allow (e.g. allow viking://shared/** but deny viking://shared/security/**).
+  allow:
+    - "viking://shared/**"
+    - "viking://profiles/default/**"
+
+write:
+  allow:
+    - "viking://profiles/default/**"
+    - "viking://shared/approved/default/**"

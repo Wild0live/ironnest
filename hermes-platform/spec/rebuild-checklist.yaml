@@ -1,0 +1,107 @@
+# rebuild-checklist.yaml — ordered steps to rebuild hermes-platform from scratch.
+#
+# Designed for an LLM agent. Each step has:
+#   id          — stable identifier
+#   command     — exact shell command to run (in Git Bash on Windows)
+#   expects     — natural-language description of expected outcome
+#   validates   — script or curl that proves the step succeeded
+#   manual      — true when the step requires a human (token rotation, etc.)
+
+version: 1
+target_platform: D:\claude-workspace\platform\
+
+steps:
+
+  - id: R-01
+    command: |
+      bash D:/claude-workspace/platform/bootstrap.sh
+    expects: all 18 always-on IronNest containers healthy
+    validates: |
+      docker ps --format '{{.Names}}\t{{.Status}}' | grep -E 'infisical|adguard|squid' | grep -v 'Up.*healthy' && exit 1; exit 0
+
+  - id: R-02
+    command: |
+      bash D:/claude-workspace/platform/hermes/build.sh
+    expects: platform/hermes-agent:v2026.6.5-patched image present
+    validates: |
+      docker image inspect platform/hermes-agent:v2026.6.5-patched >/dev/null
+
+  - id: R-03
+    command: |
+      cp D:/claude-workspace/platform/hermes-platform/.env.example D:/claude-workspace/platform/hermes-platform/.env
+      # Then fill in INFISICAL_UNIVERSAL_AUTH_CLIENT_ID, _SECRET, and INFISICAL_PROJECT_ID
+    expects: hermes-platform/.env populated with valid Universal Auth creds
+    manual: true
+
+  - id: R-04
+    command: |
+      # In Infisical UI: create project "hermes-platform" and folders:
+      #   /hermes-platform/                  (shared keys)
+      #   /hermes-platform/openviking        (EMBEDDING_API_KEY, VLM_API_KEY)
+      #   /hermes-platform/gateway           (MEMORY_GATEWAY_PROFILE_TOKENS_JSON, MEMORY_GATEWAY_ADMIN_TOKEN)
+      #   /hermes-platform/default           (MEMORY_GATEWAY_TOKEN)
+      #   /hermes-platform/mark              (MEMORY_GATEWAY_TOKEN)
+      #   /hermes-platform/steve             (MEMORY_GATEWAY_TOKEN)
+      #   /hermes-platform/qa                (MEMORY_GATEWAY_TOKEN)   # renamed from /wifey 2026-06-14
+      #   /hermes-platform/littlejohn        (MEMORY_GATEWAY_TOKEN)
+      #   /hermes-platform/jaime             (MEMORY_GATEWAY_TOKEN)
+      #   /hermes-platform/bigbert           (MEMORY_GATEWAY_TOKEN)
+      #   /hermes-platform/octo              (MEMORY_GATEWAY_TOKEN)
+      # Generate every token with: openssl rand -hex 32
+      # Then create a Machine Identity scoped to project hermes-platform and put
+      # its client-id/client-secret into hermes-platform/.env
+      # See: scripts/rotate-profile-token.sh for the rotation procedure.
+    expects: Infisical contains the full secret tree under /hermes-platform/
+    manual: true
+
+  - id: R-05
+    command: |
+      bash D:/claude-workspace/platform/hermes-platform/build.sh
+    expects: openviking + memory-gateway + mission-control images built
+    validates: |
+      docker image inspect platform/hermes-platform-openviking:0.1.0 >/dev/null \
+        && docker image inspect platform/hermes-platform-memory-gateway:0.1.0 >/dev/null \
+        && docker image inspect platform/hermes-platform-mission-control:0.1.0 >/dev/null
+
+  - id: R-06
+    command: |
+      bash D:/claude-workspace/platform/hermes-platform/start.sh
+    expects: 13 stack containers healthy; openviking unreachable from hermes-pf-mark; Mission Control can reach profile bridges
+    validates: |
+      bash D:/claude-workspace/platform/hermes-platform/scripts/healthcheck.sh
+
+  - id: R-07
+    command: |
+      bash D:/claude-workspace/platform/hermes-platform/scripts/migrate-from-shared-volume.sh --dry-run
+    expects: dry-run reports file counts for each of the 5 profiles
+    validates: 'echo OK'
+
+  - id: R-08
+    command: |
+      bash D:/claude-workspace/platform/hermes-platform/scripts/migrate-from-shared-volume.sh
+    expects: every file SHA-256 matches src → dst
+    validates: 'echo OK'
+
+  - id: R-09
+    command: |
+      bash D:/claude-workspace/platform/hermes-platform/scripts/patch-souls.sh --dry-run
+    expects: diff shows the OpenViking Memory Policy section being appended
+    validates: 'echo OK'
+
+  - id: R-10
+    command: |
+      bash D:/claude-workspace/platform/hermes-platform/scripts/patch-souls.sh
+    expects: each SOUL.md gets a .bak.<epoch> sibling and ends with the policy section
+    validates: 'echo OK'
+
+  - id: R-11
+    command: |
+      bash D:/claude-workspace/platform/hermes-platform/scripts/validate-isolation.sh
+    expects: all isolation cases PASS
+    validates: 'echo OK'
+
+  - id: R-12
+    command: |
+      bash D:/claude-workspace/platform/hermes-platform/scripts/validate-sharing.sh
+    expects: all sharing cases PASS
+    validates: 'echo OK'

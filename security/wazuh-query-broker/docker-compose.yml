@@ -1,0 +1,43 @@
+# Wazuh Query Broker — read-only SIEM access for Octo + Little John.
+#
+# Deploy:   docker compose -f docker-compose.yml up -d --build
+# Network:  platform-net only — it both reaches wazuh.indexer/manager and is
+#           reached by the hermes-pf agents on the same bridge. It does NOT join
+#           platform-egress (no internet) and is NOT published to the host.
+#
+# Secrets:  provide via .env (see .env.example) or wire to the Infisical agent
+#           the rest of the Wazuh stack uses. Prefer the dedicated read-only
+#           OpenSearch user `broker_ro` (see setup-readonly-user.md), NOT admin.
+
+services:
+  wazuh-query:
+    build: .
+    image: ironnest/wazuh-query-broker:1.0.0
+    container_name: wazuh-query
+    restart: unless-stopped
+    networks:
+      - platform-net
+    environment:
+      WAZUH_INDEXER_URL: "https://wazuh.indexer:9200"
+      WAZUH_INDEXER_USERNAME: "${WAZUH_BROKER_INDEXER_USER:-broker_ro}"
+      WAZUH_INDEXER_PASSWORD: "${WAZUH_BROKER_INDEXER_PASSWORD:?set in .env}"
+      WAZUH_API_URL: "https://wazuh.manager:55000"
+      WAZUH_API_USERNAME: "${WAZUH_API_USERNAME:-wazuh-wui}"
+      WAZUH_API_PASSWORD: "${WAZUH_API_PASSWORD:?set in .env}"
+      WAZUH_QUERY_BROKER_TOKENS: "${WAZUH_QUERY_BROKER_TOKENS:?set in .env}"
+      WAZUH_BROKER_VERIFY_TLS: "false"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+networks:
+  platform-net:
+    external: true

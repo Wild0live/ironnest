@@ -1,0 +1,18 @@
+# Policy for the `mark` profile (PSE swing-trading operator).
+# See docs/06-NAMESPACE-AND-POLICY-MODEL.md.
+
+profile: mark
+description: |
+  Mark — swing trading. May read shared memory + its own private
+  namespace; may write its own private + its own approved-shared sub-tree.
+
+read:
+  # Default-deny is implicit. See docs/06-NAMESPACE-AND-POLICY-MODEL.md.
+  allow:
+    - "viking://shared/**"
+    - "viking://profiles/mark/**"
+
+write:
+  allow:
+    - "viking://profiles/mark/**"
+    - "viking://shared/approved/mark/**"

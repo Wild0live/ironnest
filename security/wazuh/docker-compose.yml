@@ -13,8 +13,10 @@ name: wazuh
 networks:
   platform-net:
     external: true              # reach socket-proxy for the Docker listener
+                                # + auth.ironnest.local (traefik alias) for OIDC
   platform-egress:
     external: true              # raw TCP threat feeds / package updates
+                                # + wazuh-infisical-agent path to infisical:8090
   wazuh-internal:
     driver: bridge
     internal: true              # indexer/manager/dashboard private mesh
@@ -36,6 +38,14 @@ volumes:
   wazuh-indexer-data:
   wazuh-dashboard-config:
   wazuh-dashboard-custom:
+  # Note: WAZUH_OIDC_CLIENT_SECRET is rendered to ./secrets-runtime/.env on
+  # the host (bind-mount, not a named volume). Compose's env_file directive
+  # is processed host-side at `up` time, so the dashboard cannot env_file out
+  # of a container-internal volume — bind-mount is the cleanest path.
+  # ./secrets-runtime/ is gitignored.
+  traefik-certs:                # mounted read-only into indexer+dashboard so they
+    external: true              # trust Traefik's self-signed cert when reaching
+    name: ingress_traefik-certs # https://auth.ironnest.local/.well-known/...
 
 x-logging: &default-logging
   driver: json-file
@@ -45,9 +55,44 @@ x-logging: &default-logging
 
 services:
 
+  # ── Infisical Agent sidecar ──────────────────────────────────────────────────
+  # Renders WAZUH_OIDC_CLIENT_SECRET (raw, NOT the PBKDF2 hash) into
+  # /secrets/.env. wazuh.dashboard loads that as env_file and the prestart
+  # hook copies it into the OpenSearch Dashboards keystore at the key
+  # `opensearch_security.openid.client_secret`.
+  wazuh-infisical-agent:
+    image: platform/infisical-cli:0.43.76-patched
+    container_name: wazuh-infisical-agent
+    restart: unless-stopped
+    entrypoint: ["sh", "/agent-config/entrypoint.sh"]
+    env_file: ./.env
+    logging: *default-logging
+    volumes:
+      - ./agent-config:/agent-config:ro
+      - ./secrets-runtime:/secrets
+    tmpfs:
+      - /tmp:size=1m,mode=0700
+    networks:
+      - platform-egress         # Infisical reach
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /secrets/.env"]
+      interval: 5s
+      timeout: 3s
+      retries: 24               # up to 2 min for Infisical on first boot
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+
   # ── Wazuh manager ────────────────────────────────────────────────────────────
   wazuh.manager:
-    image: wazuh/wazuh-manager:4.14.4
+    image: wazuh/wazuh-manager:4.14.5
     container_name: wazuh.manager
     hostname: wazuh.manager
     restart: unless-stopped
@@ -109,7 +154,7 @@ services:
 
   # ── Wazuh indexer (OpenSearch) ───────────────────────────────────────────────
   wazuh.indexer:
-    image: wazuh/wazuh-indexer:4.14.4
+    image: wazuh/wazuh-indexer:4.14.5
     container_name: wazuh.indexer
     hostname: wazuh.indexer
     restart: unless-stopped
@@ -129,6 +174,23 @@ services:
       - ./config/wazuh_indexer_ssl_certs/admin-key.pem:/usr/share/wazuh-indexer/config/certs/admin-key.pem:ro
       - ./config/wazuh_indexer/wazuh.indexer.yml:/usr/share/wazuh-indexer/config/opensearch.yml:ro
       - ./config/wazuh_indexer/internal_users.yml:/usr/share/wazuh-indexer/config/opensearch-security/internal_users.yml:ro
+      # OIDC + roles mapping — pushed via securityadmin.sh after first start.
+      - ./config/wazuh_indexer/config.yml:/usr/share/wazuh-indexer/config/opensearch-security/config.yml:ro
+      - ./config/wazuh_indexer/roles_mapping.yml:/usr/share/wazuh-indexer/config/opensearch-security/roles_mapping.yml:ro
+      # Trust anchor for Traefik's self-signed cert (CN=ironnest.local,
+      # SAN *.ironnest.local) so the openid plugin can fetch JWKS over HTTPS.
+      - traefik-certs:/usr/share/wazuh-indexer/config/certs/traefik:ro
+    # Symlink server.crt to traefik-ca.pem so the path in config.yml resolves.
+    # (Can't bind-mount a single file out of a volume; the directory mount is
+    # the cleanest path, then we expose the cert under its expected filename.)
+    # Override entrypoint to run the symlink before the upstream entrypoint.
+    entrypoint:
+      - bash
+      - -c
+      - |
+        ln -sf /usr/share/wazuh-indexer/config/certs/traefik/server.crt \
+               /usr/share/wazuh-indexer/config/certs/traefik-ca.pem
+        exec /entrypoint.sh opensearchwrapper
     healthcheck:
       test: ["CMD-SHELL", "curl -sk -u \"admin:${WAZUH_INDEXER_PASSWORD}\" -o /dev/null -w '%{http_code}' https://localhost:9200/ | grep -q 200"]
       interval: 30s
@@ -136,7 +198,11 @@ services:
       retries: 5
       start_period: 120s
     networks:
-      - wazuh-internal           # indexer is not host-reachable
+      - wazuh-internal           # indexer ↔ manager/dashboard private mesh
+      - platform-net             # reach auth.ironnest.local (traefik alias)
+                                 # for OIDC discovery + JWKS fetch
+    dns:
+      - 172.30.0.10              # AdGuard (filtered DNS)
     deploy:
       resources:
         limits:
@@ -145,13 +211,29 @@ services:
 
   # ── Wazuh dashboard ──────────────────────────────────────────────────────────
   wazuh.dashboard:
-    image: wazuh/wazuh-dashboard:4.14.4
+    image: wazuh/wazuh-dashboard:4.14.5
     container_name: wazuh.dashboard
     hostname: wazuh.dashboard
     restart: unless-stopped
     logging: *default-logging
-    ports:
-      - "127.0.0.1:8443:5601"    # dashboard UI — localhost only
+    # Loopback port closed 2026-05-27 per the platform-wide port-closure pass.
+    # Dashboard is reachable only via Traefik at https://wazuh.ironnest.local/.
+    # ports:
+    #   - "127.0.0.1:8443:5601"
+    entrypoint: ["/usr/share/wazuh-dashboard/config/prestart.sh"]
+    env_file: ./.env
+    # NOTE: WAZUH_OIDC_CLIENT_SECRET is intentionally NOT injected via
+    # env_file from ./secrets-runtime/.env — compose evaluates env_file at
+    # `up` time, but the agent renders the file asynchronously after that.
+    # Instead, the secrets-runtime/ directory is bind-mounted at
+    # /opt/oidc-secrets and prestart.sh sources .env at container start.
+    depends_on:
+      wazuh-infisical-agent:
+        condition: service_healthy
+      wazuh.indexer:
+        condition: service_healthy
+      wazuh.manager:
+        condition: service_healthy
     environment:
       INDEXER_USERNAME: "admin"
       INDEXER_PASSWORD: "${WAZUH_INDEXER_PASSWORD:-SecretPassword}"
@@ -162,12 +244,26 @@ services:
       API_PASSWORD: "${WAZUH_API_PASSWORD:-MyS3cr37P450r.*-}"
       # Node.js doesn't pick up the CA from opensearch.ssl.certificateAuthorities
       # when the CA has no CN field; NODE_EXTRA_CA_CERTS injects it at the runtime level.
-      NODE_EXTRA_CA_CERTS: "/usr/share/wazuh-dashboard/certs/root-ca.pem"
+      # Path is the combined bundle built by build-ca-bundle.sh on prestart
+      # (Wazuh internal CA + Traefik self-signed cert merged into one PEM).
+      NODE_EXTRA_CA_CERTS: "/tmp/ca-bundle/ca-bundle.pem"
     volumes:
       - ./config/wazuh_indexer_ssl_certs/wazuh.dashboard.pem:/usr/share/wazuh-dashboard/certs/wazuh-dashboard.pem:ro
       - ./config/wazuh_indexer_ssl_certs/wazuh.dashboard-key.pem:/usr/share/wazuh-dashboard/certs/wazuh-dashboard-key.pem:ro
       - ./config/wazuh_indexer_ssl_certs/root-ca.pem:/usr/share/wazuh-dashboard/certs/root-ca.pem:ro
-      - ./config/wazuh_dashboard/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml:ro
+      # OIDC-enabled dashboard config + prestart hooks (CA bundle build,
+      # OIDC keystore load). The .oidc file becomes the live config.
+      - ./config/wazuh_dashboard/opensearch_dashboards.yml.oidc:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml:ro
+      - ./config/wazuh_dashboard/prestart.sh:/usr/share/wazuh-dashboard/config/prestart.sh:ro
+      - ./config/wazuh_dashboard/build-ca-bundle.sh:/usr/share/wazuh-dashboard/config/build-ca-bundle.sh:ro
+      - ./config/wazuh_dashboard/load-oidc-keystore.sh:/usr/share/wazuh-dashboard/config/load-oidc-keystore.sh:ro
+      # Traefik self-signed cert for Node's TLS trust (combined with Wazuh
+      # CA into a single bundle by build-ca-bundle.sh; pointed at by
+      # NODE_EXTRA_CA_CERTS below).
+      - traefik-certs:/usr/share/wazuh-dashboard/certs/traefik:ro
+      # Rendered OIDC client secret — sourced by prestart.sh into the env
+      # before the upstream entrypoint runs.
+      - ./secrets-runtime:/opt/oidc-secrets:ro
       - ./config/wazuh_dashboard/wazuh.yml:/usr/share/wazuh-dashboard/data/wazuh/config/wazuh.yml:ro
       - wazuh-dashboard-config:/usr/share/wazuh-dashboard/data/wazuh/config
       - wazuh-dashboard-custom:/usr/share/wazuh-dashboard/plugins/wazuh/public/assets/custom
@@ -181,11 +277,6 @@ services:
       - wazuh-internal
       - platform-net             # reachable by Traefik ingress proxy
       - ingress                  # port publishing
-    depends_on:
-      wazuh.indexer:
-        condition: service_healthy
-      wazuh.manager:
-        condition: service_healthy
     deploy:
       resources:
         limits:

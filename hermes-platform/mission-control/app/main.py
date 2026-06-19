@@ -1,0 +1,1839 @@
+"""Hermes Mission Control — standalone localhost ops dashboard.
+
+This service is INTENTIONALLY decoupled from the memory-gateway (the policy
+kernel). It holds none of the gateway's secrets and is not on the agent or
+OpenViking networks. It reads two of the gateway's files read-only:
+
+    - the profile registry  (registry/profiles-registry.yaml, bind-mounted ro)
+    - the audit log          (memory-gateway-log volume, mounted ro)
+
+…and owns a small JSON store for tasks/schedules on its own volume. Writes are
+optionally gated by MISSION_CONTROL_ADMIN_TOKEN; when unset, the Authelia FIDO
+gate in front of this host is the auth boundary.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import io
+import json
+import os
+import re
+import threading
+import time
+import zipfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Literal
+
+import yaml
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+
+# ── Settings (env, with sane container defaults) ────────────────────────────
+REGISTRY_FILE = Path(os.environ.get("MISSION_CONTROL_REGISTRY_FILE",
+                                    "/etc/hermes-platform/registry/profiles-registry.yaml"))
+POLICIES_DIR = Path(os.environ.get("MISSION_CONTROL_POLICIES_DIR",
+                                   "/etc/hermes-platform/policies"))
+AUDIT_LOG = Path(os.environ.get("MISSION_CONTROL_AUDIT_LOG", "/var/log/gateway/audit.log"))
+STATE_FILE = Path(os.environ.get("MISSION_CONTROL_STATE_FILE",
+                                 "/var/lib/mission-control/state.json"))
+ADMIN_TOKEN = os.environ.get("MISSION_CONTROL_ADMIN_TOKEN", "").strip()
+
+# Per-profile agent chat bridge (listener inside each hermes-pf-* container).
+BRIDGE_TOKEN = os.environ.get("MISSION_CONTROL_BRIDGE_TOKEN", "").strip()
+BRIDGE_PORT = int(os.environ.get("AGENT_BRIDGE_PORT", "8011"))
+BRIDGE_TIMEOUT = int(os.environ.get("AGENT_BRIDGE_PROXY_TIMEOUT", "270"))
+
+# Sandboxed origin that serves complete static webapp artifacts LIVE (a separate
+# host = a separate browser origin, so agent-authored HTML/JS can't script the
+# Mission Control page; served by the read-only `artifact-apps` nginx container,
+# behind the same Authelia FIDO gate). MC only builds links to it — it never
+# serves app bytes itself.
+APPS_BASE = os.environ.get("MISSION_CONTROL_APPS_BASE",
+                           "https://apps.ironnest.local").rstrip("/")
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+_STORE_LOCK = threading.Lock()
+
+TaskStatus = Literal["backlog", "active", "waiting", "done"]
+TaskPriority = Literal["low", "normal", "high", "critical"]
+
+
+class TaskCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=160)
+    assignee: str = Field(default="default", min_length=1, max_length=64)
+    priority: TaskPriority = "normal"
+    project: str = Field(default="General", max_length=80)
+    detail: str = Field(default="", max_length=2000)
+    status: TaskStatus = "backlog"
+    due: str | None = Field(default=None, max_length=40)
+
+
+class TaskPatch(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=160)
+    assignee: str | None = Field(default=None, min_length=1, max_length=64)
+    priority: TaskPriority | None = None
+    project: str | None = Field(default=None, max_length=80)
+    detail: str | None = Field(default=None, max_length=2000)
+    status: TaskStatus | None = None
+    due: str | None = Field(default=None, max_length=40)
+
+
+class ScheduleCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=160)
+    owner: str = Field(default="default", min_length=1, max_length=64)
+    cadence: str = Field(default="manual", max_length=120)
+    next_run: str | None = Field(default=None, max_length=60)
+    detail: str = Field(default="", max_length=1000)
+
+
+class Attachment(BaseModel):
+    name: str = Field(default="file", max_length=120)
+    mime: str = Field(default="application/octet-stream", max_length=120)
+    content_b64: str = Field(default="", max_length=34_000_000)  # ~25MB raw
+
+
+class AgentChat(BaseModel):
+    message: str = Field(default="", max_length=8000)
+    session: str | None = Field(default=None, max_length=60)
+    attachments: list[Attachment] = Field(default_factory=list)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def require_admin(authorization: str | None = Header(default=None)) -> None:
+    """If a token is configured, enforce it on writes. If not, the Authelia
+    FIDO gate in front of this host is the auth boundary — allow."""
+    if not ADMIN_TOKEN:
+        return
+    expected = f"Bearer {ADMIN_TOKEN}"
+    if authorization != expected:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="admin token required")
+
+
+# ── Persistent store (tasks + schedules) ────────────────────────────────────
+def _default_store() -> dict[str, Any]:
+    return {
+        "tasks": [
+            {
+                "id": "seed-observe-agents",
+                "title": "Review Hermes profile health",
+                "assignee": "default",
+                "priority": "high",
+                "project": "IronNest Operations",
+                "detail": "Use Mission Control to spot missing profiles, stale activity, or denied memory calls.",
+                "status": "active",
+                "due": None,
+                "created_at": _now(),
+                "updated_at": _now(),
+            },
+        ],
+        "schedules": [],
+    }
+
+
+def _read_store() -> dict[str, Any]:
+    with _STORE_LOCK:
+        if not STATE_FILE.exists():
+            return _default_store()
+        try:
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return _default_store()
+    if not isinstance(data, dict):
+        return _default_store()
+    data.setdefault("tasks", [])
+    data.setdefault("schedules", [])
+    return data
+
+
+def _write_store(data: dict[str, Any]) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+    body = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True)
+    with _STORE_LOCK:
+        tmp.write_text(body, encoding="utf-8")
+        os.replace(tmp, STATE_FILE)
+
+
+# ── Read-only views of gateway-owned files ──────────────────────────────────
+def _profiles() -> list[dict[str, Any]]:
+    try:
+        doc = yaml.safe_load(REGISTRY_FILE.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return []
+    out: list[dict[str, Any]] = []
+    for p in doc.get("profiles", []):
+        if not isinstance(p, dict) or not p.get("name"):
+            continue
+        policy_file = p.get("policy_file", "")
+        policy_loaded = bool(policy_file) and (POLICIES_DIR / policy_file).exists()
+        out.append({
+            "name": p.get("name"),
+            "namespace": p.get("namespace", ""),
+            "approved_shared_namespace": p.get("approved_shared_namespace", ""),
+            "container_name": p.get("container_name", ""),
+            "status": p.get("status", "unknown"),
+            "tags": list(p.get("tags", []) or []),
+            "notes": p.get("notes", "") or "",
+            "created_at": p.get("created_at", "") or "",
+            "policy_loaded": policy_loaded,
+        })
+    return sorted(out, key=lambda item: item["name"])
+
+
+def _recent_activity(limit: int = 40) -> list[dict[str, Any]]:
+    if not AUDIT_LOG.exists():
+        return []
+    try:
+        lines = AUDIT_LOG.read_text(encoding="utf-8").splitlines()[-limit:]
+    except OSError:
+        return []
+    activity: list[dict[str, Any]] = []
+    for line in reversed(lines):
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        activity.append({
+            "ts": item.get("ts"),
+            "profile": item.get("profile", "unknown"),
+            "operation": item.get("operation", "unknown"),
+            "decision": item.get("decision", "unknown"),
+            "uri": item.get("uri", ""),
+            "reason": item.get("reason", ""),
+            "latency_ms": item.get("latency_ms"),
+        })
+    return activity
+
+
+def _metrics(profiles: list[dict[str, Any]], tasks: list[dict[str, Any]],
+             activity: list[dict[str, Any]]) -> dict[str, Any]:
+    open_tasks = [t for t in tasks if t.get("status") != "done"]
+    denied = [a for a in activity if a.get("decision") == "deny"]
+    return {
+        "agents": len(profiles),
+        "enabled_agents": len([p for p in profiles if p.get("status") == "enabled"]),
+        "open_tasks": len(open_tasks),
+        "active_tasks": len([t for t in tasks if t.get("status") == "active"]),
+        "recent_events": len(activity),
+        "recent_denies": len(denied),
+    }
+
+
+# ── Routes ──────────────────────────────────────────────────────────────────
+router = APIRouter()
+
+
+# ── Per-profile, per-conversation chat history ──────────────────────────────
+# Layout on the mission-control-state volume:
+#   history/<profile>/index.json            -> {"conversations": [{id,title,...}]}
+#   history/<profile>/conv-<id>.json        -> {"messages": [...]}
+HISTORY_DIR = STATE_FILE.parent / "history"
+HISTORY_MAX = 400
+_HIST_LOCK = threading.Lock()
+_SAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _safe(value: str, fallback: str) -> str:
+    return _SAFE.sub("_", value or "")[:64] or fallback
+
+
+def _safe_rel(rel: str) -> str | None:
+    """Validate a client-supplied relative artifact path (may contain '/'). Returns
+    the normalised 'a/b/c' form, or None if any segment is empty/'.'/'..'/dotfile/
+    charset-violating. Mirrors the bridge's `_safe_rel_parts` so MC rejects a bad
+    path before it ever reaches the bridge (defence in depth)."""
+    parts = [p for p in (rel or "").strip().strip("/").split("/") if p != ""]
+    if not parts:
+        return None
+    for seg in parts:
+        if seg in (".", "..") or seg.startswith(".") or _SAFE.search(seg):
+            return None
+    return "/".join(parts)
+
+
+def _profile_dir(profile: str) -> Path:
+    return HISTORY_DIR / _safe(profile, "profile")
+
+
+def _index_path(profile: str) -> Path:
+    return _profile_dir(profile) / "index.json"
+
+
+def _conv_path(profile: str, conv: str) -> Path:
+    return _profile_dir(profile) / f"conv-{_safe(conv, 'default')}.json"
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_json(path: Path, obj: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _conv_title_from(text: str) -> str:
+    return " ".join((text or "").split())[:48] or "New chat"
+
+
+def _snippet(text: str, query: str, width: int = 70) -> str:
+    low = text.lower()
+    i = low.find(query)
+    if i < 0:
+        return text[:width].strip()
+    start = max(0, i - width // 2)
+    end = min(len(text), i + len(query) + width // 2)
+    out = text[start:end].strip()
+    return ("…" if start > 0 else "") + out + ("…" if end < len(text) else "")
+
+
+def search_profile(profile: str, query: str, limit: int = 50) -> list[dict[str, Any]]:
+    q = query.strip().lower()
+    if not q:
+        return []
+    results: list[dict[str, Any]] = []
+    for c in list_conversations(profile):  # already sorted newest-first
+        cid = c.get("id", "")
+        title = c.get("title", "") or ""
+        title_hit = q in title.lower()
+        matches = 0
+        snippet = ""
+        for m in conv_history(profile, cid):
+            text = m.get("text", "") or ""
+            if q in text.lower():
+                matches += 1
+                if not snippet:
+                    snippet = _snippet(text, q)
+        if title_hit or matches:
+            results.append({"id": cid, "title": title, "updated_at": c.get("updated_at", ""),
+                            "snippet": snippet or title, "matches": matches})
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _att_meta(attachments: Any) -> list[dict[str, str]]:
+    """Persist only attachment metadata (name/mime), never the base64 payload."""
+    out = []
+    for a in attachments or []:
+        d = a if isinstance(a, dict) else a.model_dump()
+        out.append({"name": d.get("name", "file"), "mime": d.get("mime", "")})
+    return out
+
+
+def list_conversations(profile: str) -> list[dict[str, Any]]:
+    with _HIST_LOCK:
+        convs = _read_json(_index_path(profile)).get("conversations", [])
+    return sorted(convs, key=lambda c: c.get("updated_at", ""), reverse=True)
+
+
+def create_conversation(profile: str, title: str | None = None) -> dict[str, Any]:
+    with _HIST_LOCK:
+        idx = _read_json(_index_path(profile))
+        convs = idx.get("conversations", [])
+        entry = {"id": f"c-{uuid.uuid4().hex[:12]}", "title": title or "New chat",
+                 "created_at": _now(), "updated_at": _now()}
+        convs.append(entry)
+        _write_json(_index_path(profile), {"conversations": convs})
+    return entry
+
+
+def rename_conversation(profile: str, conv: str, title: str) -> None:
+    with _HIST_LOCK:
+        idx = _read_json(_index_path(profile))
+        convs = idx.get("conversations", [])
+        for c in convs:
+            if c.get("id") == conv:
+                c["title"] = title[:80] or c.get("title", "New chat")
+                c["updated_at"] = _now()
+                c["title_auto"] = False   # manual rename locks out auto-titling
+        _write_json(_index_path(profile), {"conversations": convs})
+
+
+def set_conversation_archived(profile: str, conv: str, archived: bool) -> bool:
+    """Flip a conversation's archived flag. Returns True if the conv was found."""
+    with _HIST_LOCK:
+        idx = _read_json(_index_path(profile))
+        convs = idx.get("conversations", [])
+        entry = next((c for c in convs if c.get("id") == conv), None)
+        if entry is None:
+            return False
+        entry["archived"] = bool(archived)
+        entry["updated_at"] = _now()
+        _write_json(_index_path(profile), {"conversations": convs})
+    return True
+
+
+def delete_conversation(profile: str, conv: str) -> None:
+    with _HIST_LOCK:
+        idx = _read_json(_index_path(profile))
+        convs = [c for c in idx.get("conversations", []) if c.get("id") != conv]
+        _write_json(_index_path(profile), {"conversations": convs})
+        try:
+            _conv_path(profile, conv).unlink()
+        except OSError:
+            pass
+
+
+def conv_history(profile: str, conv: str) -> list[dict[str, Any]]:
+    with _HIST_LOCK:
+        return _read_json(_conv_path(profile, conv)).get("messages", [])
+
+
+def conv_append(profile: str, conv: str, message: dict[str, Any],
+                autotitle: str | None = None) -> None:
+    with _HIST_LOCK:
+        data = _read_json(_conv_path(profile, conv))
+        messages = data.get("messages", [])
+        messages.append(message)
+        if len(messages) > HISTORY_MAX:
+            messages = messages[-HISTORY_MAX:]
+        _write_json(_conv_path(profile, conv), {"messages": messages})
+        # keep the index in sync: create-on-first-use, bump updated_at, auto-title
+        idx = _read_json(_index_path(profile))
+        convs = idx.get("conversations", [])
+        entry = next((c for c in convs if c.get("id") == conv), None)
+        if entry is None:
+            entry = {"id": conv, "title": autotitle or "New chat",
+                     "created_at": _now(), "updated_at": _now(), "title_auto": True}
+            convs.append(entry)
+        else:
+            entry["updated_at"] = _now()
+            if autotitle and entry.get("title") in (None, "", "New chat"):
+                entry["title"] = autotitle
+        _write_json(_index_path(profile), {"conversations": convs})
+
+
+def set_auto_title(profile: str, conv: str, title: str) -> bool:
+    """Upgrade a conversation's title to an LLM-generated one — but ONLY if it's
+    still auto (the user hasn't renamed it) and hasn't already been LLM-titled.
+    Returns True if the title was changed."""
+    title = " ".join((title or "").split())[:80]
+    if not title:
+        return False
+    with _HIST_LOCK:
+        idx = _read_json(_index_path(profile))
+        convs = idx.get("conversations", [])
+        entry = next((c for c in convs if c.get("id") == conv), None)
+        if entry is None or not entry.get("title_auto", False) or entry.get("title_llm"):
+            return False
+        entry["title"] = title
+        entry["title_llm"] = True          # generated once; don't regenerate
+        entry["updated_at"] = _now()
+        _write_json(_index_path(profile), {"conversations": convs})
+    return True
+
+
+def _bridge_reset(profile: str, conv: str | None = None) -> None:
+    """Best-effort: tell the profile bridge to drop a conversation's ACP session
+    (conv given) or its whole process (conv=None)."""
+    by_name = {p["name"]: p for p in _profiles()}
+    p = by_name.get(profile)
+    if p is None:
+        return
+    host = p.get("container_name") or f"hermes-pf-{profile}"
+    headers = {"Content-Type": "application/json"}
+    if BRIDGE_TOKEN:
+        headers["Authorization"] = f"Bearer {BRIDGE_TOKEN}"
+    body = json.dumps({"conv": conv} if conv else {}).encode("utf-8")
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(f"http://{host}:{BRIDGE_PORT}/reset", data=body,
+                                   headers=headers, method="POST"), timeout=10)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _bridge_title(profile: str, user: str, reply: str) -> str | None:
+    """Ask the profile's bridge to generate a short topic title for the first
+    exchange. Returns a cleaned title or None on any failure."""
+    by_name = {p["name"]: p for p in _profiles()}
+    p = by_name.get(profile)
+    if p is None:
+        return None
+    host = p.get("container_name") or f"hermes-pf-{profile}"
+    headers = {"Content-Type": "application/json"}
+    if BRIDGE_TOKEN:
+        headers["Authorization"] = f"Bearer {BRIDGE_TOKEN}"
+    body = json.dumps({"user": user[:1500], "reply": reply[:1500]}).encode("utf-8")
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(f"http://{host}:{BRIDGE_PORT}/title", data=body,
+                                   headers=headers, method="POST"), timeout=120) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 — unreachable bridge, timeout, model error
+        return None
+    title = (payload or {}).get("title") if payload.get("ok") else None
+    return title or None
+
+
+# ── Per-task drawer chat history ────────────────────────────────────────────
+# Chat threads attached to a specific kanban task. Stored in MC's state volume
+# (MC never touches the board's SQLite, so this lives alongside MC state, not
+# in /opt/kanban). One JSONL per task: tasks/<id>/chat.jsonl.
+TASK_CHAT_DIR = STATE_FILE.parent / "task-chat"
+TASK_CHAT_MAX = 400
+
+
+def _task_chat_path(task_id: str) -> Path:
+    return TASK_CHAT_DIR / _safe(task_id, "task") / "chat.jsonl"
+
+
+def task_chat_history(task_id: str) -> list[dict[str, Any]]:
+    p = _task_chat_path(task_id)
+    if not p.exists():
+        return []
+    msgs: list[dict[str, Any]] = []
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msgs.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    return msgs[-TASK_CHAT_MAX:]
+
+
+def task_chat_append(task_id: str, entry: dict[str, Any]) -> None:
+    p = _task_chat_path(task_id)
+    with _HIST_LOCK:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+@router.get("/healthz")
+async def healthz() -> JSONResponse:
+    return JSONResponse(content={"ok": True})
+
+
+# Always-revalidate so a freshly-built UI is never masked by a stale browser
+# cache (the page ships no asset versioning). ETag/Last-Modified still make the
+# revalidation cheap (304 when unchanged).
+_NOCACHE = {"Cache-Control": "no-cache"}
+
+
+@router.get("/")
+async def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html", headers=_NOCACHE)
+
+
+@router.get("/assets/{filename}")
+async def asset(filename: str) -> FileResponse:
+    allowed = {"app.js", "styles.css"}
+    if filename not in allowed:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="asset not found")
+    return FileResponse(STATIC_DIR / filename, headers=_NOCACHE)
+
+
+@router.get("/api/state")
+async def state() -> JSONResponse:
+    store = _read_store()
+    profiles = _profiles()
+    activity = _recent_activity()
+    tasks = list(store.get("tasks", []))
+    schedules = list(store.get("schedules", []))
+    return JSONResponse(content={
+        "generated_at": _now(),
+        "profiles": profiles,
+        "tasks": tasks,
+        "schedules": schedules,
+        "activity": activity,
+        "metrics": _metrics(profiles, tasks, activity),
+    })
+
+
+@router.post("/api/tasks", status_code=201)
+async def create_task(req: TaskCreate, _: None = Depends(require_admin)) -> JSONResponse:
+    store = _read_store()
+    task = {"id": f"task-{uuid.uuid4().hex[:12]}", **req.model_dump(),
+            "created_at": _now(), "updated_at": _now()}
+    store["tasks"].append(task)
+    _write_store(store)
+    return JSONResponse(status_code=201, content={"ok": True, "task": task})
+
+
+@router.patch("/api/tasks/{task_id}")
+async def patch_task(task_id: str, req: TaskPatch, _: None = Depends(require_admin)) -> JSONResponse:
+    store = _read_store()
+    patch = {k: v for k, v in req.model_dump().items() if v is not None}
+    for task in store["tasks"]:
+        if task.get("id") == task_id:
+            task.update(patch)
+            task["updated_at"] = _now()
+            _write_store(store)
+            return JSONResponse(content={"ok": True, "task": task})
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="task not found")
+
+
+@router.post("/api/schedules", status_code=201)
+async def create_schedule(req: ScheduleCreate, _: None = Depends(require_admin)) -> JSONResponse:
+    store = _read_store()
+    schedule = {"id": f"schedule-{uuid.uuid4().hex[:12]}", **req.model_dump(),
+                "created_at": _now(), "updated_at": _now()}
+    store["schedules"].append(schedule)
+    _write_store(store)
+    return JSONResponse(status_code=201, content={"ok": True, "schedule": schedule})
+
+
+@router.get("/api/agents")
+def agents() -> JSONResponse:
+    """Profiles that can be chatted with (same roster as /api/state)."""
+    return JSONResponse(content={"agents": _profiles()})
+
+
+@router.post("/api/agent/{profile}/chat")
+def agent_chat(profile: str, req: AgentChat) -> JSONResponse:
+    """Proxy a one-shot agent turn to the profile's in-container chat bridge.
+
+    Sync def on purpose: the bridge call blocks ~20s+, so FastAPI runs this in
+    its threadpool. Profile is validated against the registry; the bridge host
+    is the profile's container_name on platform-net.
+    """
+    by_name = {p["name"]: p for p in _profiles()}
+    p = by_name.get(profile)
+    if p is None:
+        raise HTTPException(status_code=404, detail="unknown profile")
+    host = p.get("container_name") or f"hermes-pf-{profile}"
+    url = f"http://{host}:{BRIDGE_PORT}/chat"
+    body = json.dumps(req.model_dump()).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if BRIDGE_TOKEN:
+        headers["Authorization"] = f"Bearer {BRIDGE_TOKEN}"
+    conv = req.session or "default"
+    user_entry = {"role": "user", "text": req.message,
+                  "attachments": _att_meta(req.attachments), "ts": _now()}
+    title = _conv_title_from(req.message)
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=BRIDGE_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+            busy = (not payload.get("ok")) and "busy" in str(payload.get("error", "")).lower()
+            if not busy:
+                conv_append(profile, conv, user_entry, autotitle=title)
+                if payload.get("ok") and payload.get("reply"):
+                    conv_append(profile, conv, {"role": "agent", "text": payload["reply"], "ts": _now()})
+            return JSONResponse(status_code=resp.status, content=payload)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            detail = {"ok": False, "error": f"bridge returned HTTP {exc.code}"}
+        if exc.code != 429:  # 429 = busy; client retries, so don't persist (avoids dupes)
+            conv_append(profile, conv, user_entry, autotitle=title)
+        return JSONResponse(status_code=exc.code, content=detail)
+    except Exception as exc:  # noqa: BLE001 — unreachable bridge, timeout, etc.
+        conv_append(profile, conv, user_entry, autotitle=title)
+        return JSONResponse(status_code=502,
+                            content={"ok": False, "error": f"bridge unreachable: {exc}"})
+
+
+@router.post("/api/agent/{profile}/chat/stream")
+def agent_chat_stream(profile: str, req: AgentChat) -> StreamingResponse:
+    """Stream a turn as Server-Sent Events, relaying the profile bridge's SSE
+    (token chunks + a final done/error event) straight through to the browser."""
+    by_name = {p["name"]: p for p in _profiles()}
+    p = by_name.get(profile)
+    if p is None:
+        raise HTTPException(status_code=404, detail="unknown profile")
+    host = p.get("container_name") or f"hermes-pf-{profile}"
+    url = f"http://{host}:{BRIDGE_PORT}/chat/stream"
+    body = json.dumps(req.model_dump()).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if BRIDGE_TOKEN:
+        headers["Authorization"] = f"Bearer {BRIDGE_TOKEN}"
+
+    conv = req.session or "default"
+    user_entry = {"role": "user", "text": req.message,
+                  "attachments": _att_meta(req.attachments), "ts": _now()}
+    title = _conv_title_from(req.message)
+
+    def relay():
+        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            resp = urllib.request.urlopen(request, timeout=BRIDGE_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 — connect/HTTP error before stream starts
+            conv_append(profile, conv, user_entry, autotitle=title)
+            yield f"data: {json.dumps({'type': 'error', 'error': f'bridge unreachable: {exc}'})}\n\n"
+            return
+        assembled: list[str] = []
+        flags = {"user": False, "agent": False}
+
+        def save_user():
+            if not flags["user"]:
+                conv_append(profile, conv, user_entry, autotitle=title)
+                flags["user"] = True
+
+        try:
+            for line in resp:
+                if not line:
+                    continue
+                text = line.decode("utf-8", "replace")
+                yield text
+                s = text.strip()
+                if not s.startswith("data:"):
+                    continue
+                try:
+                    evt = json.loads(s[5:].strip())
+                except json.JSONDecodeError:
+                    continue
+                etype = evt.get("type")
+                if etype == "chunk":
+                    save_user()  # turn is really proceeding now
+                    assembled.append(evt.get("text", ""))
+                elif etype == "done":
+                    save_user()
+                    # The bridge sends a rewritten `reply` when it turned a
+                    # MEDIA: directive into a download link; persist that so the
+                    # saved history carries the link, not the raw streamed text.
+                    final = evt.get("reply") or "".join(assembled) or "(empty reply)"
+                    conv_append(profile, conv, {"role": "agent",
+                                                "text": final,
+                                                "ts": _now()})
+                    flags["agent"] = True
+                elif etype == "error":
+                    err = evt.get("error", "stream error")
+                    if "busy" in err.lower():
+                        # transient: agent occupied by another turn; client retries.
+                        # Persist NOTHING so the message isn't duplicated on retry.
+                        continue
+                    save_user()
+                    conv_append(profile, conv, {"role": "error", "text": err, "ts": _now()})
+                    flags["agent"] = True
+        finally:
+            resp.close()
+            if flags["user"] and not flags["agent"] and assembled:  # client disconnected mid-stream
+                conv_append(profile, conv, {"role": "agent", "text": "".join(assembled), "ts": _now()})
+
+    return StreamingResponse(relay(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@router.get("/api/agents/health")
+def agents_health() -> JSONResponse:
+    """Liveness of each profile's in-container chat bridge.
+
+    Pings `http://hermes-pf-<profile>:8011/healthz` for all profiles in parallel
+    (short timeout). `true` = bridge answered 200 (container up + bridge running,
+    so dashboard chat will work); `false` = unreachable. Drives the avatar
+    online/offline dot. `/healthz` is unauthenticated on the bridge.
+    """
+    profiles = _profiles()
+
+    def probe(p: dict[str, Any]) -> tuple[str, bool]:
+        host = p.get("container_name") or f"hermes-pf-{p['name']}"
+        url = f"http://{host}:{BRIDGE_PORT}/healthz"
+        try:
+            with urllib.request.urlopen(url, timeout=2.5) as resp:
+                return p["name"], resp.status == 200
+        except Exception:  # noqa: BLE001 — any failure = offline
+            return p["name"], False
+
+    health: dict[str, bool] = {}
+    if profiles:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            for name, ok in ex.map(probe, profiles):
+                health[name] = ok
+    return JSONResponse(content={"health": health})
+
+
+# ── Token-usage analytics — AGGREGATED across ALL agents ─────────────────────
+# Each profile's bridge reads its own state.db `sessions` table and returns its
+# own usage; Mission Control sums them. This is true platform-wide usage (the
+# Hermes dashboard only ever reports the `default` profile's HERMES_HOME).
+_USAGE_TTL = 30
+_USAGE_WINDOW_DAYS = int(os.environ.get("MISSION_CONTROL_USAGE_DAYS", "30"))
+_usage_cache: dict[str, Any] = {"ts": 0.0, "data": None}
+_usage_lock = threading.Lock()
+
+
+def _fetch_agent_usage(p: dict[str, Any]) -> dict[str, Any] | None:
+    host = p.get("container_name") or f"hermes-pf-{p['name']}"
+    headers = {}
+    if BRIDGE_TOKEN:
+        headers["Authorization"] = f"Bearer {BRIDGE_TOKEN}"
+    req = urllib.request.Request(f"http://{host}:{BRIDGE_PORT}/usage", headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 — agent down/unreachable; just skip it in the sum
+        return None
+
+
+@router.get("/api/usage")
+def usage() -> JSONResponse:
+    """Platform-wide token usage = sum of every agent's own state.db usage.
+    Cached ~30s; serves stale on a transient hiccup rather than flapping."""
+    now = time.time()
+    with _usage_lock:
+        cached = _usage_cache["data"]
+        if cached and now - _usage_cache["ts"] < _USAGE_TTL:
+            return JSONResponse(content=cached)
+
+    profiles = _profiles()
+    inp = out_t = sessions = calls = 0
+    daily: dict[str, dict[str, int]] = {}
+    got_any = False
+    if profiles:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            for u in ex.map(_fetch_agent_usage, profiles):
+                if not u or not u.get("ok"):
+                    continue
+                got_any = True
+                inp += int(u.get("input", 0) or 0)
+                out_t += int(u.get("output", 0) or 0)
+                sessions += int(u.get("sessions", 0) or 0)
+                calls += int(u.get("api_calls", 0) or 0)
+                for d in (u.get("daily") or []):
+                    day = d.get("day", "")
+                    if not day:
+                        continue
+                    slot = daily.setdefault(day, {"input": 0, "output": 0})
+                    slot["input"] += int(d.get("input", 0) or 0)
+                    slot["output"] += int(d.get("output", 0) or 0)
+
+    if not got_any:
+        with _usage_lock:
+            if _usage_cache["data"]:
+                return JSONResponse(content=_usage_cache["data"])
+        return JSONResponse(content={"ok": False})
+
+    out = {
+        "ok": True,
+        "total_tokens": inp + out_t,
+        "input_tokens": inp,
+        "output_tokens": out_t,
+        "total_sessions": sessions,
+        "api_calls": calls,
+        "period_days": _USAGE_WINDOW_DAYS,
+        "daily": [{"day": d, **daily[d]} for d in sorted(daily)],
+    }
+    with _usage_lock:
+        _usage_cache.update(ts=now, data=out)
+    return JSONResponse(content=out)
+
+
+# ── Scheduled cron jobs — AGGREGATED across ALL agents ───────────────────────
+# Each profile's bridge reads its own /opt/data/cron/jobs.json and returns the
+# trimmed job list; Mission Control tags each with its owner profile and unions
+# them. This surfaces the REAL scheduled scripts (Hermes' own scheduler) on the
+# calendar, not just MC's manual schedule store.
+_CRON_TTL = 30
+_cron_cache: dict[str, Any] = {"ts": 0.0, "data": None}
+_cron_lock = threading.Lock()
+
+
+def _fetch_agent_cron(p: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    host = p.get("container_name") or f"hermes-pf-{p['name']}"
+    headers = {}
+    if BRIDGE_TOKEN:
+        headers["Authorization"] = f"Bearer {BRIDGE_TOKEN}"
+    req = urllib.request.Request(f"http://{host}:{BRIDGE_PORT}/cron", headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=6) as r:
+            return p["name"], json.loads(r.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 — agent down/unreachable; just skip it
+        return p["name"], None
+
+
+@router.get("/api/schedules/cron")
+def schedules_cron() -> JSONResponse:
+    """Every profile's Hermes cron jobs, each tagged with its owner. Cached ~30s;
+    serves stale on a transient hiccup rather than flapping to empty."""
+    now = time.time()
+    with _cron_lock:
+        cached = _cron_cache["data"]
+        if cached and now - _cron_cache["ts"] < _CRON_TTL:
+            return JSONResponse(content=cached)
+
+    profiles = _profiles()
+    jobs: list[dict[str, Any]] = []
+    got_any = False
+    if profiles:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            for prof, payload in ex.map(_fetch_agent_cron, profiles):
+                if not payload or not payload.get("ok"):
+                    continue
+                got_any = True
+                for j in payload.get("jobs") or []:
+                    jobs.append({**j, "owner": prof})
+
+    if not got_any:
+        with _cron_lock:
+            if _cron_cache["data"]:
+                return JSONResponse(content=_cron_cache["data"])
+        return JSONResponse(content={"ok": False, "jobs": []})
+
+    out = {"ok": True, "generated_at": _now(), "jobs": jobs}
+    with _cron_lock:
+        _cron_cache.update(ts=now, data=out)
+    return JSONResponse(content=out)
+
+
+@router.get("/api/agent/{profile}/file/{name}")
+def agent_file(profile: str, name: str) -> Response:
+    """Download a file the agent produced in its uploads dir, via the bridge.
+
+    The browser cannot reach `sandbox:/opt/data/...` paths inside the agent
+    container, so this proxies the bridge's token-gated `/file` endpoint and
+    streams the bytes back as an attachment. `name` is sanitised to a basename
+    here AND re-validated by the bridge (defence in depth).
+    """
+    by_name = {p["name"]: p for p in _profiles()}
+    p = by_name.get(profile)
+    if p is None:
+        raise HTTPException(status_code=404, detail="unknown profile")
+    safe = os.path.basename(name)
+    if not safe or safe in (".", "..") or _SAFE.search(safe):
+        raise HTTPException(status_code=400, detail="bad file name")
+    host = p.get("container_name") or f"hermes-pf-{profile}"
+    url = f"http://{host}:{BRIDGE_PORT}/file?name={urllib.parse.quote(safe)}"
+    headers = {}
+    if BRIDGE_TOKEN:
+        headers["Authorization"] = f"Bearer {BRIDGE_TOKEN}"
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=60) as resp:
+            data = resp.read()
+            ctype = resp.headers.get("Content-Type", "application/octet-stream")
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(status_code=exc.code if exc.code in (400, 401, 404) else 502,
+                            detail="file not available")
+    except Exception as exc:  # noqa: BLE001 — unreachable bridge, timeout, etc.
+        raise HTTPException(status_code=502, detail=f"bridge unreachable: {exc}")
+    return Response(content=data, media_type=ctype,
+                    headers={"Content-Disposition": f'attachment; filename="{safe}"'})
+
+
+class ConvRename(BaseModel):
+    title: str = Field(..., min_length=1, max_length=80)
+
+
+class ConvArchive(BaseModel):
+    archived: bool = True
+
+
+@router.get("/api/agent/{profile}/conversations")
+def conversations_list(profile: str) -> JSONResponse:
+    return JSONResponse(content={"conversations": list_conversations(profile)})
+
+
+@router.post("/api/agent/{profile}/conversations", status_code=201)
+def conversations_create(profile: str) -> JSONResponse:
+    return JSONResponse(status_code=201, content={"conversation": create_conversation(profile)})
+
+
+@router.patch("/api/agent/{profile}/conversations/{conv}")
+def conversations_rename(profile: str, conv: str, req: ConvRename) -> JSONResponse:
+    rename_conversation(profile, conv, req.title)
+    return JSONResponse(content={"ok": True})
+
+
+@router.post("/api/agent/{profile}/conversations/{conv}/autotitle")
+def conversation_autotitle(profile: str, conv: str) -> JSONResponse:
+    """Generate a short topic title from the first exchange (LLM via the bridge)
+    and apply it — once, and only if the user hasn't renamed the conversation.
+    Idempotent: re-calls return the existing title without hitting the bridge.
+
+    Called by the client after the first reply lands; runs in the FastAPI
+    threadpool (the bridge call blocks a few seconds)."""
+    convs = {c.get("id"): c for c in list_conversations(profile)}
+    entry = convs.get(conv)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="unknown conversation")
+    if not entry.get("title_auto", False) or entry.get("title_llm"):
+        return JSONResponse(content={"ok": False, "title": entry.get("title", ""),
+                                     "reason": "locked or already titled"})
+    msgs = conv_history(profile, conv)
+    user = next((m.get("text", "") for m in msgs if m.get("role") == "user"), "")
+    reply = next((m.get("text", "") for m in msgs if m.get("role") == "agent"), "")
+    if not user.strip() or not reply.strip():
+        return JSONResponse(content={"ok": False, "reason": "no exchange yet"})
+    title = _bridge_title(profile, user, reply)
+    if title and set_auto_title(profile, conv, title):
+        return JSONResponse(content={"ok": True, "title": title})
+    return JSONResponse(content={"ok": False, "reason": "title generation failed"})
+
+
+@router.post("/api/agent/{profile}/conversations/{conv}/archive")
+def conversations_archive(profile: str, conv: str, req: ConvArchive) -> JSONResponse:
+    if not set_conversation_archived(profile, conv, req.archived):
+        raise HTTPException(status_code=404, detail="unknown conversation")
+    return JSONResponse(content={"ok": True, "archived": req.archived})
+
+
+@router.post("/api/agent/{profile}/conversations/{conv}/reset")
+def conversation_reset(profile: str, conv: str) -> JSONResponse:
+    """Clear the agent's context for this thread (drop its ACP session) WITHOUT
+    deleting the saved transcript. Backs the chat `/clear` slash command."""
+    _bridge_reset(profile, conv)
+    return JSONResponse(content={"ok": True})
+
+
+@router.delete("/api/agent/{profile}/conversations/{conv}")
+def conversations_delete(profile: str, conv: str) -> JSONResponse:
+    delete_conversation(profile, conv)
+    _bridge_reset(profile, conv)
+    return JSONResponse(content={"ok": True})
+
+
+@router.get("/api/agent/{profile}/conversations/{conv}/history")
+def conversation_history(profile: str, conv: str) -> JSONResponse:
+    return JSONResponse(content={"messages": conv_history(profile, conv)})
+
+
+@router.get("/api/agent/{profile}/search")
+def search_conversations(profile: str, q: str = "") -> JSONResponse:
+    return JSONResponse(content={"results": search_profile(profile, q)})
+
+
+# ── Per-agent avatar (emoji or uploaded image; default is generated client-side)
+AGENT_META_FILE = STATE_FILE.parent / "agent-meta.json"
+_META_LOCK = threading.Lock()
+
+
+def _read_agent_meta() -> dict[str, Any]:
+    return _read_json(AGENT_META_FILE).get("agents", {})
+
+
+class AvatarSet(BaseModel):
+    emoji: str | None = Field(default=None, max_length=16)
+    image: str | None = Field(default=None, max_length=700_000)  # ~500KB data URL
+
+
+class LabelSet(BaseModel):
+    # Operator-facing display name shown on the agent card in place of the
+    # profile id. The id (e.g. "default") stays the canonical key everywhere
+    # else (container, volume, registry, tokens); this is purely presentation.
+    label: str | None = Field(default=None, max_length=64)
+
+
+@router.get("/api/agents/meta")
+def agents_meta() -> JSONResponse:
+    return JSONResponse(content={"meta": _read_agent_meta()})
+
+
+@router.put("/api/agent/{profile}/avatar")
+def set_avatar(profile: str, req: AvatarSet) -> JSONResponse:
+    if req.image and req.image.startswith("data:image/"):
+        icon = {"image": req.image}
+    elif req.emoji and req.emoji.strip():
+        icon = {"emoji": req.emoji.strip()[:8]}
+    else:
+        raise HTTPException(status_code=400, detail="provide an emoji or a data:image/ image")
+    with _META_LOCK:
+        meta = _read_agent_meta()
+        # Merge the icon into the existing entry — the icon is image XOR emoji,
+        # so drop both then apply the new one, but preserve a `label` if set.
+        entry = dict(meta.get(profile, {}))
+        entry.pop("image", None)
+        entry.pop("emoji", None)
+        entry.update(icon)
+        meta[profile] = entry
+        _write_json(AGENT_META_FILE, {"agents": meta})
+    return JSONResponse(content={"ok": True, "avatar": entry})
+
+
+@router.delete("/api/agent/{profile}/avatar")
+def clear_avatar(profile: str) -> JSONResponse:
+    with _META_LOCK:
+        meta = _read_agent_meta()
+        # Clear only the icon; keep a `label` if the agent has one.
+        entry = dict(meta.get(profile, {}))
+        entry.pop("image", None)
+        entry.pop("emoji", None)
+        if entry:
+            meta[profile] = entry
+        else:
+            meta.pop(profile, None)
+        _write_json(AGENT_META_FILE, {"agents": meta})
+    return JSONResponse(content={"ok": True})
+
+
+@router.put("/api/agent/{profile}/label")
+def set_label(profile: str, req: LabelSet) -> JSONResponse:
+    label = (req.label or "").strip()[:64]
+    with _META_LOCK:
+        meta = _read_agent_meta()
+        entry = dict(meta.get(profile, {}))
+        if label:
+            entry["label"] = label
+        else:
+            entry.pop("label", None)
+        if entry:
+            meta[profile] = entry
+        else:
+            meta.pop(profile, None)
+        _write_json(AGENT_META_FILE, {"agents": meta})
+    return JSONResponse(content={"ok": True, "meta": entry})
+
+
+# ── Per-agent SOUL.md + model (proxied to the profile bridge) ────────────────
+def _bridge_host(profile: str) -> str:
+    by_name = {p["name"]: p for p in _profiles()}
+    p = by_name.get(profile)
+    if p is None:
+        raise HTTPException(status_code=404, detail="unknown profile")
+    return p.get("container_name") or f"hermes-pf-{profile}"
+
+
+def _bridge_json(profile: str, method: str, path: str,
+                 body: dict[str, Any] | None = None,
+                 timeout: int = 30) -> tuple[int, dict[str, Any]]:
+    """Call the profile bridge and relay (status, json). 502 on unreachable."""
+    url = f"http://{_bridge_host(profile)}:{BRIDGE_PORT}{path}"
+    headers = {"Content-Type": "application/json"}
+    if BRIDGE_TOKEN:
+        headers["Authorization"] = f"Bearer {BRIDGE_TOKEN}"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, json.loads(exc.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return exc.code, {"ok": False, "error": f"bridge HTTP {exc.code}"}
+    except Exception as exc:  # noqa: BLE001 — unreachable bridge, timeout, etc.
+        return 502, {"ok": False, "error": f"bridge unreachable: {exc}"}
+
+
+class SoulSet(BaseModel):
+    text: str = Field(..., max_length=200_000)
+
+
+class ModelSet(BaseModel):
+    model_config = {"protected_namespaces": ()}
+    model: str = Field(..., min_length=1, max_length=120)
+    # Optional: the provider the chosen model belongs to. Sent by the model
+    # picker so a cross-provider selection also switches model.provider. Omitted
+    # for same-provider switches (the common case).
+    provider: str | None = Field(default=None, max_length=60)
+
+
+@router.get("/api/agent/{profile}/meta")
+def agent_meta_view(profile: str) -> JSONResponse:
+    """Model + SOUL.md summary shown on the agent card."""
+    code, payload = _bridge_json(profile, "GET", "/meta")
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.get("/api/agent/{profile}/soul")
+def agent_soul_get(profile: str) -> JSONResponse:
+    code, payload = _bridge_json(profile, "GET", "/soul")
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.get("/api/agent/{profile}/models")
+def agent_models(profile: str) -> JSONResponse:
+    """Available providers + models for the picker (same source as `/model`)."""
+    code, payload = _bridge_json(profile, "GET", "/models")
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.put("/api/agent/{profile}/soul")
+def agent_soul_put(profile: str, req: SoulSet, _: None = Depends(require_admin)) -> JSONResponse:
+    code, payload = _bridge_json(profile, "PUT", "/soul", {"text": req.text})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.put("/api/agent/{profile}/model")
+def agent_model_put(profile: str, req: ModelSet, _: None = Depends(require_admin)) -> JSONResponse:
+    body: dict[str, Any] = {"model": req.model}
+    if req.provider:
+        body["provider"] = req.provider
+    code, payload = _bridge_json(profile, "PUT", "/model", body)
+    return JSONResponse(status_code=code, content=payload)
+
+
+# ── Shared Kanban board (proxied to a board-gateway profile's bridge) ────────
+# MC stays decoupled: it never mounts the SQLite file. All board reads/writes go
+# through one profile's `/kanban` bridge endpoint (a pure `hermes kanban` CLI op,
+# NOT an agent turn). `default` is the board gateway; any profile would do since
+# they all share /opt/kanban.
+def _board_profile() -> str:
+    names = [p["name"] for p in _profiles()]
+    return "default" if "default" in names else (names[0] if names else "default")
+
+
+def _orchestrator() -> str:
+    """The agent that runs `decompose` (the orchestrator role). Configurable and
+    persisted in the store's settings; falls back to the board gateway."""
+    chosen = (_read_store().get("settings") or {}).get("orchestrator") or ""
+    return chosen if chosen in {p["name"] for p in _profiles()} else _board_profile()
+
+
+def _kanban_bridge(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    return _bridge_json(_board_profile(), "POST", "/kanban", body, timeout=40)
+
+
+class KanbanCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    body: str = Field(default="", max_length=4000)
+    assignee: str = Field(default="", max_length=64)
+    priority: int | None = None
+    parent: str = Field(default="", max_length=64)
+    workspace: str = Field(default="", max_length=200)
+    triage: bool = False
+
+
+class KanbanComment(BaseModel):
+    text: str = Field(..., min_length=1, max_length=4000)
+
+
+class KanbanMove(BaseModel):
+    model_config = {"populate_by_name": True}
+    to: str = Field(..., max_length=20)
+    from_: str = Field(default="", max_length=20, alias="from")
+    result: str = Field(default="", max_length=2000)
+
+
+class KanbanAssign(BaseModel):
+    assignee: str = Field(..., min_length=1, max_length=64)
+
+
+def _annotate_links(tasks: list[Any]) -> None:
+    """Tag each board task as the GOAL of a decomposed effort or one of its
+    SUBTASKS, so the board can show the hierarchy. One cheap `links` read from the
+    board bridge (the whole task_links DAG) — NOT a per-task `show` N+1, so it's
+    safe on the 15s board poll.
+
+    The board models an effort as a dependency DAG: `decompose` keeps the original
+    triage task as the GOAL and makes the pieces its prerequisites. So in
+    task_links (parent_id = prerequisite, child_id = dependent) the goal is the
+    terminal node — it has prerequisites but nothing depends on it. This mirrors
+    the drawer's `isGoal`. Every other linked task is a subtask; unlinked tasks are
+    standalone (no label). The goal's `subtask_count` is its prerequisite count."""
+    code, payload = _kanban_bridge({"action": "links"})
+    if code != 200 or not payload.get("ok"):
+        return
+    is_prereq: set[str] = set()        # appears as parent_id -> prerequisite of something
+    has_prereqs: set[str] = set()      # appears as child_id  -> depends on something
+    prereq_count: dict[str, int] = {}  # task id -> how many prerequisites it has
+    for edge in payload.get("links") or []:
+        p, c = edge.get("parent"), edge.get("child")
+        if p:
+            is_prereq.add(p)
+        if c:
+            has_prereqs.add(c)
+            prereq_count[c] = prereq_count.get(c, 0) + 1
+    for t in tasks:
+        if not isinstance(t, dict):
+            continue
+        tid = t.get("id")
+        linked = tid in is_prereq or tid in has_prereqs
+        is_goal = tid in has_prereqs and tid not in is_prereq
+        t["is_goal"] = is_goal
+        t["is_subtask"] = linked and not is_goal
+        t["subtask_count"] = prereq_count.get(tid, 0) if is_goal else 0
+        t["link_role"] = "goal" if is_goal else ("subtask" if linked else "")
+
+
+@router.get("/api/kanban")
+def kanban_list(status: str = "", assignee: str = "", archived: bool = False) -> JSONResponse:
+    code, payload = _kanban_bridge({"action": "list", "status": status,
+                                    "assignee": assignee, "archived": archived})
+    if code == 200 and payload.get("ok") and isinstance(payload.get("data"), list):
+        _annotate_links(payload["data"])
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.get("/api/kanban/{task_id}")
+def kanban_show(task_id: str) -> JSONResponse:
+    code, payload = _kanban_bridge({"action": "show", "id": task_id})
+    return JSONResponse(status_code=code, content=payload)
+
+
+# Window in which an identical create is treated as an accidental repeat (a
+# double-click or a client retry) rather than a deliberate second task.
+_KANBAN_DEDUP_WINDOW_SEC = 90
+
+
+def _recent_kanban_duplicate(req: KanbanCreate) -> dict[str, Any] | None:
+    """Return a just-created board task identical to `req` (same title +
+    assignee, and body when the listing carries one) within the dedup window, so
+    an accidental double-submit is idempotent instead of minting a twin.
+
+    Returns None — and the create proceeds normally — whenever we can't be sure:
+    the list call fails, or the candidate carries no timestamp (`_task_updated`
+    falls back to 0, which is always older than the window). So this only ever
+    suppresses a create when timestamps positively confirm a recent twin; it
+    never blocks a legitimate, later identical task."""
+    code, payload = _kanban_bridge({"action": "list", "archived": False})
+    if code != 200 or not payload.get("ok") or not isinstance(payload.get("data"), list):
+        return None
+    now = int(time.time())
+    title = req.title.strip()
+    assignee = (req.assignee or "").strip()
+    body = (req.body or "").strip()
+    for t in payload["data"]:
+        if not isinstance(t, dict):
+            continue
+        if now - _task_updated(t) > _KANBAN_DEDUP_WINDOW_SEC:
+            continue
+        if str(t.get("title", "")).strip() != title:
+            continue
+        if str(t.get("assignee", "")).strip() != assignee:
+            continue
+        # The list summary may omit the body; only compare it when present so a
+        # body-less listing still dedups on title+assignee.
+        if "body" in t and str(t.get("body", "")).strip() != body:
+            continue
+        return t
+    return None
+
+
+@router.post("/api/kanban")
+def kanban_create(req: KanbanCreate, _: None = Depends(require_admin)) -> JSONResponse:
+    dup = _recent_kanban_duplicate(req)
+    if dup is not None:
+        return JSONResponse(status_code=200, content={"ok": True, "data": dup, "deduped": True})
+    code, payload = _kanban_bridge({"action": "create", **req.model_dump()})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/kanban/{task_id}/comment")
+def kanban_comment(task_id: str, req: KanbanComment, _: None = Depends(require_admin)) -> JSONResponse:
+    code, payload = _kanban_bridge({"action": "comment", "id": task_id, "text": req.text})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/kanban/{task_id}/move")
+def kanban_move(task_id: str, req: KanbanMove, _: None = Depends(require_admin)) -> JSONResponse:
+    code, payload = _kanban_bridge({"action": "move", "id": task_id,
+                                    "to": req.to, "from": req.from_, "result": req.result})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/kanban/{task_id}/assign")
+def kanban_assign(task_id: str, req: KanbanAssign, _: None = Depends(require_admin)) -> JSONResponse:
+    code, payload = _kanban_bridge({"action": "assign", "id": task_id, "assignee": req.assignee})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/kanban/{task_id}/archive")
+def kanban_archive(task_id: str, _: None = Depends(require_admin)) -> JSONResponse:
+    code, payload = _kanban_bridge({"action": "archive", "id": task_id})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/kanban/{task_id}/archive-tree")
+def kanban_archive_tree(task_id: str, _: None = Depends(require_admin)) -> JSONResponse:
+    """Archive a whole effort: the goal + every task connected to it (parents +
+    children, transitively). Keeps the Done column lean without grouping the
+    board. Idempotent-ish: already-archived tasks just re-archive harmlessly."""
+    cache: dict[str, dict] = {}
+    seen: set[str] = set()
+    queue = [task_id]
+    while queue:                                   # BFS the connected component
+        cur = queue.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        data = _show_task(cur, cache)
+        for k in (data.get("parents") or []) + (data.get("children") or []):
+            if k not in seen:
+                queue.append(k)
+    archived: list[str] = []
+    errors: list[dict[str, Any]] = []
+    for tid in sorted(seen):
+        c, p = _kanban_bridge({"action": "archive", "id": tid})
+        if c == 200 and p.get("ok"):
+            archived.append(tid)
+        else:
+            errors.append({"id": tid, "error": p.get("error", f"HTTP {c}")})
+    return JSONResponse(content={"ok": bool(archived) and not errors,
+                                 "archived": archived, "count": len(archived),
+                                 "errors": errors})
+
+
+@router.post("/api/kanban/{task_id}/run")
+def kanban_run(task_id: str, _: None = Depends(require_admin)) -> JSONResponse:
+    """Phase 2a manual run: route execution to the task's ASSIGNEE bridge so the
+    worker runs in that profile's own container (correct secrets/isolation)."""
+    code, payload = _kanban_bridge({"action": "show", "id": task_id})
+    if code != 200 or not payload.get("ok"):
+        return JSONResponse(status_code=code, content=payload)
+    assignee = str(((payload.get("data") or {}).get("task") or {}).get("assignee") or "").strip()
+    if not assignee:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "task has no assignee"})
+    code, payload = _bridge_json(assignee, "POST", "/kanban", {"action": "run", "id": task_id}, timeout=40)
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/kanban/{task_id}/stop")
+def kanban_stop(task_id: str, _: None = Depends(require_admin)) -> JSONResponse:
+    """Stop a running worker: route to the task's ASSIGNEE bridge (the worker
+    process only exists in that profile's container) so it can kill the worker's
+    process group and block the task. Mirrors the routing of /run."""
+    code, payload = _kanban_bridge({"action": "show", "id": task_id})
+    if code != 200 or not payload.get("ok"):
+        return JSONResponse(status_code=code, content=payload)
+    assignee = str(((payload.get("data") or {}).get("task") or {}).get("assignee") or "").strip()
+    if not assignee:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "task has no assignee"})
+    code, payload = _bridge_json(assignee, "POST", "/kanban", {"action": "stop", "id": task_id}, timeout=40)
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.get("/api/kanban/{task_id}/log")
+def kanban_log(task_id: str) -> JSONResponse:
+    """Worker stdout for a task. Logs sit on the shared volume → read via the
+    board gateway regardless of which agent ran it."""
+    code, payload = _kanban_bridge({"action": "log", "id": task_id, "tail": 16000})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.get("/api/kanban/{task_id}/artifacts")
+def kanban_artifacts(task_id: str) -> JSONResponse:
+    """List the durable deliverables a task produced. Artifacts sit on the shared
+    volume → listed via the board gateway regardless of which agent ran it."""
+    code, payload = _kanban_bridge({"action": "artifacts", "id": task_id})
+    return JSONResponse(status_code=code, content=payload)
+
+
+def _fetch_artifact_bytes(task_id: str, name: str) -> tuple[bytes, str]:
+    """Fetch one artifact file's bytes via the board gateway's token-gated
+    /kanban_artifact endpoint. `name` must already be a sanitised basename. Raises
+    HTTPException on a bad name, a 4xx from the bridge, or an unreachable bridge."""
+    safe = os.path.basename(name)
+    if not safe or safe in (".", "..") or _SAFE.search(safe):
+        raise HTTPException(status_code=400, detail="bad file name")
+    host = _bridge_host(_board_profile())
+    url = (f"http://{host}:{BRIDGE_PORT}/kanban_artifact"
+           f"?id={urllib.parse.quote(task_id)}&name={urllib.parse.quote(safe)}")
+    headers = {}
+    if BRIDGE_TOKEN:
+        headers["Authorization"] = f"Bearer {BRIDGE_TOKEN}"
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=60) as resp:
+            return resp.read(), resp.headers.get("Content-Type", "application/octet-stream")
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(status_code=exc.code if exc.code in (400, 401, 404) else 502,
+                            detail="artifact not available")
+    except Exception as exc:  # noqa: BLE001 — unreachable bridge, timeout, etc.
+        raise HTTPException(status_code=502, detail=f"bridge unreachable: {exc}")
+
+
+@router.get("/api/kanban/{task_id}/artifact/{name}")
+def kanban_artifact(task_id: str, name: str) -> Response:
+    """Stream one artifact file back to the browser. Proxies the board gateway's
+    token-gated /kanban_artifact endpoint. `name` is sanitised here to a basename
+    AND re-validated by the bridge (defence in depth)."""
+    data, ctype = _fetch_artifact_bytes(task_id, name)
+    # Inline content-type so the UI can fetch + render markdown; the UI's Download
+    # link uses the <a download> attribute to force a save when wanted.
+    return Response(content=data, media_type=ctype)
+
+
+# ── Per-task drawer chat (Q&A with the task's current assignee) ──────────────
+# A chat thread attached to a kanban task. Persisted in MC's state volume (see
+# task_chat_*). Each turn is proxied to the assignee's profile bridge with a
+# task-scoped session id so the agent has continuity per task. If `anchor` is
+# true the message is prefixed with a re-read hint pointing at the shared
+# artifact tree, so the agent reads the file rather than recalling.
+class TaskChat(BaseModel):
+    message: str = Field(..., min_length=1, max_length=8000)
+    anchor: bool = True
+
+
+@router.get("/api/kanban/{task_id}/chat")
+def kanban_chat_history(task_id: str) -> JSONResponse:
+    return JSONResponse(content={"messages": task_chat_history(task_id)})
+
+
+def _resolve_task_assignee(task_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return (task, profile). Raises HTTPException on any failure."""
+    code, payload = _kanban_bridge({"action": "show", "id": task_id})
+    if code != 200 or not payload.get("ok"):
+        raise HTTPException(status_code=404, detail="task not found")
+    t = (payload.get("data") or {}).get("task") or {}
+    assignee = (t.get("assignee") or "").strip()
+    if not assignee:
+        raise HTTPException(status_code=409, detail="task has no assignee")
+    p = {prof["name"]: prof for prof in _profiles()}.get(assignee)
+    if p is None:
+        raise HTTPException(status_code=404, detail=f"assignee '{assignee}' not found")
+    return t, p
+
+
+@router.post("/api/kanban/{task_id}/chat/stream")
+def kanban_chat_stream(task_id: str, req: TaskChat) -> StreamingResponse:
+    t, p = _resolve_task_assignee(task_id)
+    if (t.get("status") or "") == "running":
+        # Bridge serialises per profile too (429 busy), but reject early so the
+        # composer can show a clean "wait for the worker" message instead of a
+        # generic stream error.
+        return JSONResponse(status_code=409,
+                            content={"ok": False,
+                                     "error": "task is running; chat available when the worker finishes"})
+    assignee = p["name"]
+    host = p.get("container_name") or f"hermes-pf-{assignee}"
+    url = f"http://{host}:{BRIDGE_PORT}/chat/stream"
+
+    # Anchor prefix: tells the agent to re-read the artifact tree rather than
+    # answer from memory. /opt/shared/all/<assignee>/ is the read-side mirror of
+    # the producer's /opt/shared/mine in the shared-artifact volume.
+    msg = req.message
+    if req.anchor:
+        anchor = (f"[task {task_id}] Before answering, re-read any relevant files under "
+                  f"/opt/shared/mine/ (your own outputs) or /opt/shared/all/ (other agents' outputs). "
+                  f"Ground your answer in the actual file contents, not recollection.\n\n")
+        msg = anchor + msg
+    body = json.dumps({"message": msg, "session": f"task-{task_id}", "attachments": []}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if BRIDGE_TOKEN:
+        headers["Authorization"] = f"Bearer {BRIDGE_TOKEN}"
+
+    user_entry = {"role": "user", "text": req.message,
+                  "anchored": bool(req.anchor), "assignee": assignee, "ts": _now()}
+
+    def relay():
+        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            resp = urllib.request.urlopen(request, timeout=BRIDGE_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            task_chat_append(task_id, user_entry)
+            yield f"data: {json.dumps({'type': 'error', 'error': f'bridge unreachable: {exc}'})}\n\n"
+            return
+        assembled: list[str] = []
+        flags = {"user": False, "agent": False}
+
+        def save_user():
+            if not flags["user"]:
+                task_chat_append(task_id, user_entry)
+                flags["user"] = True
+
+        try:
+            for line in resp:
+                if not line:
+                    continue
+                text = line.decode("utf-8", "replace")
+                yield text
+                s = text.strip()
+                if not s.startswith("data:"):
+                    continue
+                try:
+                    evt = json.loads(s[5:].strip())
+                except json.JSONDecodeError:
+                    continue
+                etype = evt.get("type")
+                if etype == "chunk":
+                    save_user()
+                    assembled.append(evt.get("text", ""))
+                elif etype == "done":
+                    save_user()
+                    final = evt.get("reply") or "".join(assembled) or "(empty reply)"
+                    task_chat_append(task_id, {"role": "agent", "text": final,
+                                               "assignee": assignee, "ts": _now()})
+                    flags["agent"] = True
+                elif etype == "error":
+                    err = evt.get("error", "stream error")
+                    if "busy" in err.lower():
+                        # Transient; client retries — persist nothing to avoid dupes.
+                        continue
+                    save_user()
+                    task_chat_append(task_id, {"role": "error", "text": err,
+                                               "assignee": assignee, "ts": _now()})
+                    flags["agent"] = True
+        finally:
+            resp.close()
+            if flags["user"] and not flags["agent"] and assembled:
+                task_chat_append(task_id, {"role": "agent", "text": "".join(assembled),
+                                           "assignee": assignee, "ts": _now()})
+
+    return StreamingResponse(relay(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ── Recursive artifact trees + complete-deliverable (webapp) access ──────────
+# The flat `/artifacts` + `/artifact/{name}` pair only sees a task's top-level
+# files. These add: a recursive tree, nested-path file serving, per-(sub)folder
+# zip download, and a library-wide list of runnable static apps. The LIVE app is
+# served by the separate `artifact-apps` origin (see APPS_BASE) — these routes
+# are for browsing/downloading the files through Mission Control.
+@router.get("/api/kanban/{task_id}/tree")
+def kanban_tree(task_id: str) -> JSONResponse:
+    """Recursive file tree for a task + which folders are runnable static apps."""
+    code, payload = _kanban_bridge({"action": "artifacts_tree", "id": task_id})
+    if code == 200 and isinstance(payload, dict):
+        payload = {**payload, "apps_base": APPS_BASE}
+    return JSONResponse(status_code=code, content=payload)
+
+
+def _bridge_get_bytes(query_path: str, timeout: int = 90) -> tuple[bytes, str, str]:
+    """GET raw bytes from the board gateway's bridge (token-gated). Returns
+    (body, content_type, content_disposition). Used for nested artifact files and
+    folder zips, which don't fit the JSON `_kanban_bridge` relay."""
+    host = _bridge_host(_board_profile())
+    url = f"http://{host}:{BRIDGE_PORT}{query_path}"
+    headers = {}
+    if BRIDGE_TOKEN:
+        headers["Authorization"] = f"Bearer {BRIDGE_TOKEN}"
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            return (resp.read(),
+                    resp.headers.get("Content-Type", "application/octet-stream"),
+                    resp.headers.get("Content-Disposition", ""))
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(status_code=exc.code if exc.code in (400, 401, 404) else 502,
+                            detail="artifact not available")
+    except Exception as exc:  # noqa: BLE001 — unreachable bridge, timeout, etc.
+        raise HTTPException(status_code=502, detail=f"bridge unreachable: {exc}")
+
+
+@router.get("/api/kanban/{task_id}/file")
+def kanban_file(task_id: str, path: str) -> Response:
+    """Serve one NESTED artifact file (relative `path` may contain '/'). Each path
+    segment is sanitised here AND re-validated by the bridge (defence in depth)."""
+    if _safe_rel(path) is None:
+        raise HTTPException(status_code=400, detail="bad path")
+    qp = (f"/kanban_artifact?id={urllib.parse.quote(task_id)}"
+          f"&path={urllib.parse.quote(path)}")
+    data, ctype, _disp = _bridge_get_bytes(qp)
+    return Response(content=data, media_type=ctype)
+
+
+@router.get("/api/kanban/{task_id}/zip")
+def kanban_zip(task_id: str, sub: str = "") -> Response:
+    """Download a task's whole artifact dir (or one subfolder, `?sub=`) as a .zip
+    with the folder structure preserved — one-click grab of a complete deliverable
+    such as a webapp folder."""
+    if sub and _safe_rel(sub) is None:
+        raise HTTPException(status_code=400, detail="bad sub")
+    qp = f"/kanban_artifact_zip?id={urllib.parse.quote(task_id)}"
+    if sub:
+        qp += f"&sub={urllib.parse.quote(sub)}"
+    data, _ctype, disp = _bridge_get_bytes(qp)
+    return Response(content=data, media_type="application/zip",
+                    headers={"Content-Disposition": disp or 'attachment; filename="artifacts.zip"'})
+
+
+# ── Reports + Apps libraries (Layer 3) — projection-backed pass-through ──────
+# The board gateway maintains reports.idx.json / apps.idx.json on the shared
+# volume and renders the fully merged payload server-side. Mission Control's
+# handlers are thin pass-throughs — no scan, no TTL cache, no per-task fan-out.
+# Mutation hooks (hide/unhide/purge/delete) update the projection inline at the
+# gateway, so freshness is structural rather than an invalidation dance here.
+
+
+def _task_updated(t: dict[str, Any]) -> int:
+    """Best-available 'last touched' epoch for a board task. Still used by the
+    create-dedup path; the Reports/Apps renderers now resolve `updated`
+    server-side via the projection."""
+    for k in ("completed_at", "started_at", "updated_at", "created_at"):
+        v = t.get(k)
+        if v:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                pass
+    return 0
+
+
+def _show_task(tid: str, cache: dict[str, dict]) -> dict:
+    """Memoised board `show` (task + parents + children). Used by archive-tree
+    BFS; the Reports/Apps renderers dropped this — group resolution moved into
+    the bridge, which reads the whole DAG in one SQLite query."""
+    if tid not in cache:
+        c, p = _kanban_bridge({"action": "show", "id": tid})
+        cache[tid] = (p.get("data") or {}) if c == 200 and p.get("ok") else {}
+    return cache[tid]
+
+
+@router.get("/api/reports")
+def reports() -> JSONResponse:
+    code, payload = _kanban_bridge({"action": "reports_index"})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.get("/api/apps")
+def apps_library() -> JSONResponse:
+    code, payload = _kanban_bridge({"action": "apps_index"})
+    if code == 200 and isinstance(payload, dict) and isinstance(payload.get("apps"), list):
+        # The bridge returns a relative `url_path` per app; the public origin
+        # (apps.ironnest.local) lives in MC config, so prefix it here.
+        for a in payload["apps"]:
+            a["url"] = APPS_BASE + (a.get("url_path") or "/")
+        payload["apps_base"] = APPS_BASE
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/kanban/{task_id}/hide")
+def kanban_report_hide(task_id: str, _: None = Depends(require_admin)) -> JSONResponse:
+    """Soft-delete one report: drop it from the Reports view by writing a `.hidden`
+    marker beside its artifacts. Reversible — the files are untouched; POST /unhide
+    restores it."""
+    code, payload = _kanban_bridge({"action": "artifacts_hide", "id": task_id})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/kanban/{task_id}/unhide")
+def kanban_report_unhide(task_id: str, _: None = Depends(require_admin)) -> JSONResponse:
+    """Restore a soft-deleted report by removing its `.hidden` marker."""
+    code, payload = _kanban_bridge({"action": "artifacts_unhide", "id": task_id})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.delete("/api/kanban/{task_id}/artifacts")
+def kanban_report_purge(task_id: str, _: None = Depends(require_admin)) -> JSONResponse:
+    """PERMANENTLY delete a report — wipes the task's entire artifact directory off
+    the shared volume. Irreversible; unlike /hide there is no restore."""
+    code, payload = _kanban_bridge({"action": "artifacts_purge", "id": task_id})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.delete("/api/kanban/{task_id}/artifact/{name}")
+def kanban_artifact_delete(task_id: str, name: str, _: None = Depends(require_admin)) -> JSONResponse:
+    """PERMANENTLY delete one file from a report. Irreversible. `name` is sanitised
+    to a basename here and re-validated by the bridge (defence in depth)."""
+    safe = os.path.basename(name)
+    if not safe or safe in (".", "..") or _SAFE.search(safe):
+        raise HTTPException(status_code=400, detail="bad file name")
+    code, payload = _kanban_bridge({"action": "artifact_delete", "id": task_id, "name": safe})
+    return JSONResponse(status_code=code, content=payload)
+
+
+_ZIP_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+@router.get("/api/reports/zip")
+def reports_zip(ids: str, name: str = "reports") -> Response:
+    """Bundle every artifact file of one or more reports into a single .zip.
+
+    `ids` is a comma-separated list of task ids (one for a single report card, all
+    of a group's tasks for a group download). Each task's authoritative file list
+    is read from the board gateway, then each file is streamed through it and added
+    to the archive. When more than one task is bundled, files are foldered per task
+    (`<title-or-id>/<file>`) so same-named files from different tasks don't clash."""
+    task_ids = [t.strip() for t in (ids or "").split(",") if t.strip()][:50]
+    if not task_ids:
+        raise HTTPException(status_code=400, detail="no task ids")
+    multi = len(task_ids) > 1
+    buf = io.BytesIO()
+    added = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for tid in task_ids:
+            code, payload = _kanban_bridge({"action": "artifacts", "id": tid})
+            if code != 200 or not payload.get("ok"):
+                continue
+            arts = payload.get("artifacts") or []
+            # Folder name for this task's files in a multi-task bundle: prefer the
+            # task title, fall back to the id; sanitised for cross-platform unzip.
+            folder = ""
+            if multi:
+                t_title = ""
+                c2, p2 = _kanban_bridge({"action": "show", "id": tid})
+                if c2 == 200 and p2.get("ok"):
+                    t_title = ((p2.get("data") or {}).get("task") or {}).get("title") or ""
+                folder = _ZIP_SAFE.sub("-", (t_title or tid).strip())[:80].strip("-") or tid
+            for a in arts:
+                fname = os.path.basename(str(a.get("name") or ""))
+                if not fname:
+                    continue
+                try:
+                    data, _ctype = _fetch_artifact_bytes(tid, fname)
+                except HTTPException:
+                    continue
+                arcname = f"{folder}/{fname}" if folder else fname
+                zf.writestr(arcname, data)
+                added += 1
+    if not added:
+        raise HTTPException(status_code=404, detail="no artifact files to download")
+    fname = (_ZIP_SAFE.sub("-", (name or "reports").strip()).strip("-") or "reports")[:80]
+    buf.seek(0)
+    return Response(content=buf.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}.zip"'})
+
+
+class WikiPublish(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    title: str = Field(default="", max_length=200)
+
+
+@router.post("/api/kanban/{task_id}/publish")
+def kanban_publish(task_id: str, req: WikiPublish, _: None = Depends(require_admin)) -> JSONResponse:
+    """Publish one task artifact into the LLM Wiki (full-text searchable +
+    chat-able at wiki.ironnest.local). Routed through the board gateway bridge,
+    which holds the wiki admin token — Mission Control stays secret-free. The
+    wiki runs its own secret-scan/quarantine pipeline, so a report containing
+    secret-like strings returns `status:"quarantined"` instead of publishing."""
+    code, payload = _bridge_json(_board_profile(), "POST", "/kanban",
+                                 {"action": "publish_wiki", "id": task_id,
+                                  "name": req.name, "title": req.title}, timeout=70)
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/kanban/{task_id}/decompose")
+def kanban_decompose(task_id: str, _: None = Depends(require_admin)) -> JSONResponse:
+    """Orchestrate: the configured orchestrator agent decomposes a triage goal
+    into assigned child tasks on the shared board. An LLM turn."""
+    code, payload = _bridge_json(_orchestrator(), "POST", "/kanban",
+                                 {"action": "decompose", "id": task_id}, timeout=250)
+    return JSONResponse(status_code=code, content=payload)
+
+
+class OrchestratorSet(BaseModel):
+    profile: str = Field(..., min_length=1, max_length=64)
+
+
+@router.get("/api/orchestrator")  # not /api/kanban/orchestrator — that collides with /api/kanban/{task_id}
+def orchestrator_get() -> JSONResponse:
+    return JSONResponse(content={"ok": True, "orchestrator": _orchestrator()})
+
+
+@router.post("/api/orchestrator")
+def orchestrator_set(req: OrchestratorSet, _: None = Depends(require_admin)) -> JSONResponse:
+    if req.profile not in {p["name"] for p in _profiles()}:
+        raise HTTPException(status_code=400, detail="unknown profile")
+    store = _read_store()
+    store.setdefault("settings", {})["orchestrator"] = req.profile
+    _write_store(store)
+    return JSONResponse(content={"ok": True, "orchestrator": req.profile})
+
+
+class AutoDispatch(BaseModel):
+    enabled: bool = False
+    max: int = Field(default=1, ge=1, le=4)
+
+
+@router.get("/api/kanban/agent/{profile}/autodispatch")
+def autodispatch_get(profile: str) -> JSONResponse:
+    code, payload = _bridge_json(profile, "POST", "/kanban", {"action": "autodispatch_get"})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/kanban/agent/{profile}/autodispatch")
+def autodispatch_set(profile: str, req: AutoDispatch, _: None = Depends(require_admin)) -> JSONResponse:
+    code, payload = _bridge_json(profile, "POST", "/kanban",
+                                 {"action": "autodispatch_set", "enabled": req.enabled, "max": req.max})
+    return JSONResponse(status_code=code, content=payload)
+
+
+app = FastAPI(title="Hermes Mission Control", version="0.1.0")
+app.include_router(router)

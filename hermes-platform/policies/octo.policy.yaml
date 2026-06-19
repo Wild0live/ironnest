@@ -1,0 +1,29 @@
+# Policy template used by scripts/create-profile.sh.
+#
+# Substitutions:
+#   octo     → lowercase profile name
+#
+# Output filename: policies/octo.policy.yaml
+# Validated by:    spec/policies.schema.json
+
+profile: octo
+description: |
+  Default-shape policy for octo. Standard rules:
+    READ  : shared/** + own private
+    WRITE : own private + own approved-shared
+    DENY  : every other profile's private and approved-shared
+  Override by editing the resulting policies/octo.policy.yaml.
+
+read:
+  # Default-deny is IMPLICIT. Only list what's allowed. Explicit `deny:`
+  # rules are reserved for narrower exclusions inside an allow (e.g.
+  # allow viking://shared/** but deny viking://shared/security/**).
+  # See docs/06-NAMESPACE-AND-POLICY-MODEL.md.
+  allow:
+    - "viking://shared/**"
+    - "viking://profiles/octo/**"
+
+write:
+  allow:
+    - "viking://profiles/octo/**"
+    - "viking://shared/approved/octo/**"

@@ -1,0 +1,33 @@
+# tools.yaml — <PROFILE-NAME-UPPER>
+#
+# Per-profile tool/MCP-server registration. The hermes-agent runtime
+# reads this file from /opt/data/tools.yaml inside the per-profile
+# container. Add/remove entries to scope a profile's capabilities.
+#
+# The Memory Gateway is always enabled and is NOT listed here — it is
+# wired in via the MEMORY_GATEWAY_URL + MEMORY_GATEWAY_TOKEN env vars.
+
+tools:
+  # Browser-intent MCP — disabled by default for new profiles; enable
+  # per-profile if the persona needs portal access.
+  # - name: browser-intent
+  #   transport: http
+  #   url: "http://browser-intent-mcp:8000"
+  #   auth:
+  #     bearer_env: BROWSER_INTENT_BEARER_TOKEN
+  #   timeout_seconds: 60
+
+  # Add other MCP servers here.
+
+skills:
+  # Skill toggles. Hermes ships ~30 skills; comment out anything the
+  # profile shouldn't use.
+  - code
+  - research
+  - media
+  - file_io
+
+defaults:
+  model: "openrouter/anthropic/claude-sonnet-4.5"
+  max_tokens: 8192
+  temperature: 0.7

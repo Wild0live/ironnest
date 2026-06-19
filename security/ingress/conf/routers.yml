@@ -19,48 +19,102 @@ http:
         average: 100        # sustained req/s per source IP
         burst: 50           # short spike allowance
 
-    # Tighter limit for sensitive admin UIs (Wazuh, Dozzle, AdGuard).
+    # Tighter limit for sensitive admin UIs (Dozzle, AdGuard).
     strict-rate-limit:
       rateLimit:
         average: 20
         burst: 10
 
+    # Very permissive limit for SPA-heavy dashboards (Wazuh, future
+    # OpenSearch Dashboards apps). The Wazuh dashboard fires ~290 plugin/
+    # bundle requests in a sub-second burst on initial load — well past
+    # the 50-request burst on `rate-limit`. We're already gated by
+    # trusted-networks (LAN-only) and OIDC at the app layer, so this
+    # middleware exists mainly to keep a runaway client from hammering
+    # the origin, not to gate normal use.
+    spa-rate-limit:
+      rateLimit:
+        average: 500
+        burst: 500
+
     # ── IP allowlist ─────────────────────────────────────────────────────────────
-    # Applied to sensitive services. Covers:
-    #   127.0.0.1/32      — loopback (host browser direct)
+    # Applied to sensitive services as a *coarse* network gate before Authelia.
+    # 127.0.0.1/32 deliberately OMITTED — the whole point of Authelia is to
+    # require a FIDO touch even for an attacker on the host. Letting loopback
+    # bypass the gate would defeat the threat model. The host can still reach
+    # services because Traefik publishes on 0.0.0.0:443 (LAN reachable too),
+    # and Authelia decides who gets through.
     #   ::1/128           — IPv6 loopback
     #   10.0.0.0/8        — RFC1918 + all Docker bridge ranges (10.x)
     #   172.16.0.0/12     — RFC1918 + Docker default bridges (172.17–172.31.x.x)
     #   192.168.0.0/16    — RFC1918 home/office LAN
-    #
-    # To also allow a remote IP (e.g. VPN or home static IP), add it here:
-    #   - "203.0.113.0/32"
     trusted-networks:
       ipAllowList:
         sourceRange:
-          - "127.0.0.1/32"
           - "::1/128"
           - "10.0.0.0/8"
           - "172.16.0.0/12"
           - "192.168.0.0/16"
 
+    # ── Authelia ForwardAuth ─────────────────────────────────────────────────────
+    # Every protected router runs this middleware first. Authelia returns 200 if
+    # the session cookie is valid, otherwise 302 → https://auth.ironnest.local/
+    # where the user logs in with a passkey (FIDO key tap). A valid session
+    # cookie unlocks ALL *.ironnest.local routes for the session lifetime
+    # (see authelia/configuration.yml session block: 1h inactivity / 4h max).
+    authelia:
+      forwardAuth:
+        address: "http://authelia:9091/api/authz/forward-auth"
+        trustForwardHeader: true
+        authResponseHeaders:
+          - "Remote-User"
+          - "Remote-Groups"
+          - "Remote-Name"
+          - "Remote-Email"
+
+    # ── Frame embedding (Mission Control) ────────────────────────────────────────
+    # Lets the Mission Control dashboard (mission.ironnest.local) embed the
+    # hermes-platform ttyd terminal in an <iframe>. Sets a CSP `frame-ancestors`
+    # allowlist (only Mission Control + self) and strips any X-Frame-Options so
+    # framing is governed solely by the CSP. The CSP contains ONLY frame-ancestors,
+    # so it does not restrict ttyd's scripts/WebSocket. Applied to the
+    # `hermes-platform` (ttyd) and `wiki` routers so Mission Control can embed
+    # both in <iframe>s — every other route keeps default same-origin framing
+    # (i.e. cannot be embedded).
+    frame-mission:
+      headers:
+        contentSecurityPolicy: "frame-ancestors 'self' https://mission.ironnest.local"
+        customResponseHeaders:
+          X-Frame-Options: ""
+
   routers:
+
+    # ── Authelia (the auth portal itself) ────────────────────────────────────────
+    # MUST NOT have the authelia middleware applied, or login becomes
+    # impossible (the auth page would forward-auth to itself). trusted-networks
+    # is fine since the login flow is initiated by an already-on-LAN client.
+    auth:
+      rule: "Host(`auth.ironnest.local`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, rate-limit]
+      service: authelia
+      tls: {}
 
     # ── AdGuard Home ─────────────────────────────────────────────────────────────
     # Sensitive: controls DNS for the whole platform.
     adguard:
       rule: "Host(`adguard.ironnest.local`)"
       entryPoints: [websecure]
-      middlewares: [trusted-networks, strict-rate-limit]
+      middlewares: [trusted-networks, strict-rate-limit, authelia]
       service: adguard
       tls: {}
 
     # ── Infisical secrets vault ───────────────────────────────────────────────────
-    # Has its own auth — rate-limit only to slow credential stuffing.
+    # Authelia front gate + Infisical's own auth as defense in depth.
     infisical:
       rule: "Host(`infisical.ironnest.local`)"
       entryPoints: [websecure]
-      middlewares: [rate-limit]
+      middlewares: [rate-limit, authelia]
       service: infisical
       tls: {}
 
@@ -69,40 +123,166 @@ http:
     dozzle:
       rule: "Host(`dozzle.ironnest.local`)"
       entryPoints: [websecure]
-      middlewares: [trusted-networks, strict-rate-limit]
+      middlewares: [trusted-networks, strict-rate-limit, authelia]
       service: dozzle
       tls: {}
 
     # ── Wazuh SIEM dashboard ──────────────────────────────────────────────────────
-    # Sensitive: full security event visibility.
+    # Sensitive: full security event visibility. Authentication is OIDC SSO
+    # against Authelia (configured 2026-05-28): the dashboard initiates its
+    # own OIDC flow with auth.ironnest.local as the OP, so we don't need
+    # Traefik's forward-auth middleware here (which would break the SPA the
+    # same way it did before OIDC was wired).
+    #
+    # Uses loose `rate-limit` (not strict) for the same reason as the Traefik
+    # dashboard: the OpenSearch Dashboards SPA fires 60+ bundle/asset requests
+    # in a burst on initial load, and `strict-rate-limit` (20 req/s, burst 10)
+    # returns 429 on most of them, manifesting in the UI as
+    # "Wazuh did not load properly. Check the server output for more information."
     wazuh:
-      rule: "Host(`wazuh.ironnest.local`) || Host(`127.0.0.1`) || Host(`localhost`)"
+      rule: "Host(`wazuh.ironnest.local`)"
       entryPoints: [websecure]
-      middlewares: [trusted-networks, strict-rate-limit]
+      middlewares: [trusted-networks, spa-rate-limit]
       service: wazuh
       tls: {}
 
     # ── OpenClaw AI gateway (on-demand) ───────────────────────────────────────────
-    # Has its own auth — rate-limit only to prevent API key abuse.
+    # Authelia front gate. OpenClaw's own bearer-token auth remains for API calls.
+    # NOTE: programmatic clients (CLI tools, scripts) hitting this URL will fail
+    # auth — they'd need to either go directly to the container on platform-net,
+    # or use Authelia's API key/OIDC flow (not configured here).
     openclaw:
       rule: "Host(`openclaw.ironnest.local`)"
       entryPoints: [websecure]
-      middlewares: [rate-limit]
+      middlewares: [rate-limit, authelia]
       service: openclaw
       tls: {}
 
     # ── Hermes browser terminal (on-demand) ───────────────────────────────────────
-    # ttyd wrapping the NousResearch hermes-agent TUI. Protected by ttyd HTTP
-    # Basic Auth (credentials injected from Infisical). trusted-networks +
-    # strict-rate-limit because this is a privileged interactive terminal.
+    # ttyd wrapping the NousResearch hermes-agent TUI. Authelia gate + ttyd's
+    # own Basic Auth (from Infisical) as defense in depth.
     hermes:
       rule: "Host(`hermes.ironnest.local`)"
       entryPoints: [websecure]
-      middlewares: [trusted-networks, strict-rate-limit]
+      middlewares: [trusted-networks, strict-rate-limit, authelia]
       service: hermes
       tls: {}
 
+    # ── Hermes web dashboard (on-demand) ──────────────────────────────────────────
+    # The `hermes dashboard` Python process inside hermes-ttyd listens on :9119
+    # (previously documented as "metrics" — that was incorrect). It's the actual
+    # web UI for managing config, API keys, and sessions. Authelia-gated.
+    hermes-dashboard:
+      rule: "Host(`hermes-dashboard.ironnest.local`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, strict-rate-limit, authelia]
+      service: hermes-dashboard
+      tls: {}
+
+    # ── Hermes Platform terminal (on-demand) ──────────────────────────────────────
+    # ttyd inside hermes-platform-ttyd, the NEW 3-tier memory-architecture stack
+    # (hermes-platform/) that supersedes the legacy hermes/ stack but runs in
+    # parallel during the transition. Wraps the same hermes-agent TUI but talks
+    # to the new memory-gateway + OpenViking backend. Authelia FIDO is the sole
+    # gate — ttyd's own Basic Auth is deliberately DISABLED in compose (Authelia
+    # consumes the Authorization header, which breaks Basic Auth; FIDO is stronger
+    # anyway). `frame-mission` lets Mission Control embed this terminal in an
+    # <iframe>; it's the ONLY route that permits framing.
+    hermes-platform:
+      rule: "Host(`hermes-platform.ironnest.local`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, strict-rate-limit, authelia, frame-mission]
+      service: hermes-platform
+      tls: {}
+
+    # ── Hermes Platform web dashboard (on-demand) ─────────────────────────────────
+    # The platform dashboard is a Vite SPA (NOT the legacy Python dashboard) and
+    # fires multiple asset requests on initial load, so we use loose `rate-limit`
+    # instead of `strict-rate-limit` to avoid 429s on boot (same reasoning as the
+    # Traefik / Wazuh routes). This dashboard exposes the per-profile hermes-pf-*
+    # containers (default, steve, mark, littlejohn, wifey, jaime, bigbert) that
+    # the legacy hermes-dashboard cannot see.
+    hermes-platform-dashboard:
+      rule: "Host(`hermes-platform-dashboard.ironnest.local`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, rate-limit, authelia]
+      service: hermes-platform-dashboard
+      tls: {}
+
+    # ── Hermes Mission Control (standalone container) ─────────────────────────────
+    # Ops dashboard served by its OWN container (hermes-platform-mission-control),
+    # decoupled from the memory-gateway policy kernel. Serves at root `/`. It's a
+    # light FastAPI page (index.html + 2 assets + a polled /api/state), NOT a
+    # heavy SPA, so Authelia ForwardAuth is safe here (same as the `wiki` route;
+    # unlike Wazuh, no uncredentialed asset burst to trip the 302-to-HTML quirk).
+    # Writes are optionally gated by MISSION_CONTROL_ADMIN_TOKEN; Authelia FIDO
+    # is the outer auth gate either way.
+    mission-control:
+      rule: "Host(`mission.ironnest.local`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, rate-limit, authelia]
+      service: mission-control
+      tls: {}
+
+    # ── Sandboxed static-app host (Mission Control "Apps") ────────────────────────
+    # Serves complete webapp deliverables (Kanban artifact folders with an
+    # index.html) LIVE on this DEDICATED origin so agent-authored HTML/JS is
+    # isolated from mission.ironnest.local (a separate origin can't script MC).
+    # Behind the same Authelia FIDO gate; the served app's own CSP (set by the
+    # artifact-apps nginx) blocks it from calling back into MC. Not a SPA, so
+    # ForwardAuth is safe. Framing into MC is allowed by that CSP's
+    # frame-ancestors, NOT by the frame-mission middleware.
+    apps:
+      rule: "Host(`apps.ironnest.local`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, rate-limit, authelia]
+      service: artifact-apps
+      tls: {}
+
+    # ── LLM Wiki service ──────────────────────────────────────────────────────────
+    # FastAPI app (not a SPA), so the Authelia 302-to-HTML quirk doesn't bite.
+    # Wiki has its own WIKI_ADMIN_TOKEN for write endpoints; Authelia is the
+    # outer FIDO gate.
+    wiki:
+      rule: "Host(`wiki.ironnest.local`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, rate-limit, authelia, frame-mission]
+      service: wiki
+      tls: {}
+
+    # ── Wiki Chat (Open WebUI) ────────────────────────────────────────────────────
+    # SvelteKit SPA fronted by an nginx chat-gateway. Authelia + Open WebUI's
+    # own login = defense in depth. If the SPA bootstrap breaks the way
+    # Wazuh's did (service-worker / uncredentialed asset fetches getting a
+    # 302-to-HTML), fall back to [trusted-networks, rate-limit] only, or wire
+    # Open WebUI's OIDC client to Authelia.
+    wiki-chat:
+      rule: "Host(`chat.ironnest.local`)"
+      entryPoints: [websecure]
+      middlewares: [rate-limit, authelia]
+      service: wiki-chat
+      tls: {}
+
+    # ── Traefik dashboard ─────────────────────────────────────────────────────────
+    # Routes itself through itself — the dashboard listens on traefik:8080
+    # (api.insecure=true, see traefik.yml). Authelia-gated since the dashboard
+    # exposes the full routing config + lets you trigger reloads.
+    # Uses loose `rate-limit` (not strict) because the dashboard SPA fires 40+
+    # asset requests in a burst on load — strict-rate-limit (20 req/s) returns
+    # HTTP 429 on half of them and the SPA can't render.
+    traefik:
+      rule: "Host(`traefik.ironnest.local`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, rate-limit, authelia]
+      service: traefik-api
+      tls: {}
+
   services:
+
+    authelia:
+      loadBalancer:
+        servers:
+          - url: "http://authelia:9091"
 
     adguard:
       loadBalancer:
@@ -132,10 +312,52 @@ http:
         servers:
           - url: "http://openclaw-gateway:18789"
 
+    # Legacy hermes/ stack is decommissioned; these two routes are kept only so
+    # existing bookmarks (hermes.ironnest.local / hermes-dashboard.ironnest.local)
+    # keep working. They now point at the same hermes-platform-ttyd backend as the
+    # hermes-platform* routes below. Remove once bookmarks are migrated.
     hermes:
       loadBalancer:
         servers:
-          - url: "http://hermes-ttyd:7682"
+          - url: "http://hermes-platform-ttyd:7682"
+
+    hermes-dashboard:
+      loadBalancer:
+        servers:
+          - url: "http://hermes-platform-ttyd:9119"
+
+    hermes-platform:
+      loadBalancer:
+        servers:
+          - url: "http://hermes-platform-ttyd:7682"
+
+    hermes-platform-dashboard:
+      loadBalancer:
+        servers:
+          - url: "http://hermes-platform-ttyd:9119"
+
+    traefik-api:
+      loadBalancer:
+        servers:
+          - url: "http://traefik:8080"
+
+    # Gateway is already attached to the `ingress` network, so Traefik reaches
+    # it by internal DNS at memory-gateway:8080 (the same :8080 the hermes-pf-*
+    # containers use on hermes-platform-app-net).
+    mission-control:
+      loadBalancer:
+        servers:
+          - url: "http://mission-control:8080"
+
+    wiki:
+      loadBalancer:
+        servers:
+          - url: "http://wiki-service:8787"
+
+    wiki-chat:
+      loadBalancer:
+        servers:
+          - url: "http://wiki-chat-gateway:8080"
 
   serversTransports:
     skip-tls-verify:

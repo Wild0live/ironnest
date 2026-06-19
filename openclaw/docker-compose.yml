@@ -96,8 +96,10 @@ services:
       http_proxy: "http://squid:3128"
       https_proxy: "http://squid:3128"
       no_proxy: "infisical,adguard,squid,socket-proxy,browser-intent-mcp,browser-intent-worker,localhost,127.0.0.1,.local"
-    ports:
-      - "127.0.0.1:18789:18789"   # UI — localhost only
+    # Loopback port closed 2026-05-27 — gateway UI now only via Traefik at
+    # https://openclaw.ironnest.local/ (gated by Authelia + FIDO).
+    # ports:
+    #   - "127.0.0.1:18789:18789"
     volumes:
       - openclaw-home:/home/node/.openclaw
       - codex-home:/home/node/.codex
@@ -162,8 +164,12 @@ services:
     volumes:
       - openclaw-home:/home/node/.openclaw
       - codex-home:/home/node/.codex
-    ports:
-      - "127.0.0.1:7681:7681"
+    # Loopback port closed 2026-05-27 — openclaw-ttyd is no longer published
+    # to the host. Per user decision: not actively used. To restore (e.g., for
+    # Codex OAuth flows), uncomment and consider adding a Traefik route at
+    # openclaw-terminal.ironnest.local for FIDO-gated browser access.
+    # ports:
+    #   - "127.0.0.1:7681:7681"
     networks:
       - platform-net              # in case CLI talks to gateway over the network
       - ingress                   # host port publishing

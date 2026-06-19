@@ -7,6 +7,11 @@
 **/secrets-runtime/.env
 **/secrets-runtime/agent-token
 
+# Authelia secrets (session/storage/JWT keys + bootstrap password) and per-user
+# database (contains password hash + WebAuthn credentials reference)
+security/ingress/authelia/secrets/
+security/ingress/authelia/users.yml
+
 # Infisical secrets template — contains your project UUID; copy from secrets.tmpl.example
 **/agent-config/secrets.tmpl
 
@@ -17,6 +22,15 @@
 # Backup files
 **/.env.bak*
 **/*.bak.*
+hermes/_upgrade-backup-*/
+
+# Local persona/prompt scratch material
+hermes-platform/.soul-work/
+hermes-platform/prompt-used.txt
+
+# Python runtime artifacts
+**/__pycache__/
+*.py[cod]
 
 # Local working dirs
 .vscode/

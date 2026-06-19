@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runtime snapshot of Rancher Desktop's WSL2 distros.
-# Target: G:\rancher-runtime-backups\<YYYY-MM-DD_HHMMSS>\
+# Target: E:\rancher-runtime-backups\<YYYY-MM-DD_HHMMSS>\
 # Retention: keep newest 2 archives (count-based, not age-based — each is ~75-100 GB).
 #
 # Covers (full runtime — pairs with the data-only ops/backup.sh):
@@ -19,7 +19,7 @@
 set -euo pipefail
 
 # wsl.exe lives in System32; force UTF-8 output so we can grep it cleanly.
-export PATH="/c/Windows/System32:$PATH"
+export PATH="$PATH:/c/Windows/System32"
 export WSL_UTF8=1
 
 to_win() { echo "$1" | sed -E 's|^/([a-zA-Z])/|\U\1:/|'; }
@@ -27,7 +27,7 @@ to_win() { echo "$1" | sed -E 's|^/([a-zA-Z])/|\U\1:/|'; }
 # Override either variable via environment to match your install paths:
 #   IRONNEST_RUNTIME_BACKUP_ROOT=/e/runtime-backups bash ops/backup-runtime.sh
 #   IRONNEST_RUNTIME_BACKUP_KEEP=1                  bash ops/backup-runtime.sh
-BACKUP_ROOT="${IRONNEST_RUNTIME_BACKUP_ROOT:-/g/rancher-runtime-backups}"
+BACKUP_ROOT="${IRONNEST_RUNTIME_BACKUP_ROOT:-/e/rancher-runtime-backups}"
 RETENTION_KEEP="${IRONNEST_RUNTIME_BACKUP_KEEP:-2}"
 DISTROS=(rancher-desktop rancher-desktop-data)
 STAMP="$(date +%Y-%m-%d_%H%M%S)"

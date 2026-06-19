@@ -8,8 +8,6 @@ networks:
   browser-internal:
     driver: bridge
     internal: true
-  ingress:
-    driver: bridge
 
 volumes:
   # Shared inbox written by Hermes (uid 10000) and read by the browser-intent
@@ -185,8 +183,7 @@ services:
     ports:
       - "127.0.0.1:18901:18901"
     networks:
-      ingress:
-      platform-net:
+      - platform-net
     depends_on:
       worker:
         condition: service_healthy

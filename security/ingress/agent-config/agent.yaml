@@ -1,0 +1,23 @@
+infisical:
+  address: "http://infisical:8090"
+
+auth:
+  type: "universal-auth"
+  config:
+    client-id: "/tmp/client-id"
+    client-secret: "/tmp/client-secret"
+
+sinks:
+  - type: "file"
+    config:
+      path: "/secrets/agent-token"
+
+# Single template — one `range` call over /wazuh-oidc/, output a complete
+# Authelia config fragment with hmac_secret + jwks + clients. Loaded by
+# authelia as a second --config file (see ../docker-compose.yml).
+# Single call sidesteps the Infisical CLI ≤ 0.43.76 shared-etag bug.
+templates:
+  - source-path: "/agent-config/oidc-snippet.tmpl"
+    destination-path: "/secrets/oidc-snippet.yml"
+    config:
+      polling-interval: "60s"

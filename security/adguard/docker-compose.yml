@@ -36,8 +36,12 @@ services:
       retries: 3
       start_period: 30s
     logging: *default-logging
-    ports:
-      - "127.0.0.1:3000:80"        # admin UI — localhost only
+    # Loopback port closed 2026-05-27 — admin UI now only via Traefik at
+    # https://adguard.ironnest.local/ (gated by Authelia + FIDO).
+    # AdGuard's DNS (UDP/TCP 53) is not published to the host anyway — containers
+    # reach it on the platform-net at 172.30.0.10.
+    # ports:
+    #   - "127.0.0.1:3000:80"
     volumes:
       - adguard-work:/opt/adguardhome/work
       - adguard-conf:/opt/adguardhome/conf

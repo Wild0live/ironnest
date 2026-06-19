@@ -1,0 +1,38 @@
+{{- /* Build a map of all secrets at /wazuh-oidc/ in a single range call.
+       Single-call avoids the Infisical CLI ≤ 0.43.76 shared-etag bug.
+       Output is a YAML fragment merged into Authelia via a second --config flag. */ -}}
+{{- $secrets := dict -}}
+{{- range secret "63d75eb0-ef3a-4ce3-908d-46360b922fa8" "dev" "/wazuh-oidc/" -}}
+{{- $_ := set $secrets .Key .Value -}}
+{{- end -}}
+identity_providers:
+  oidc:
+    hmac_secret: '{{ get $secrets "AUTHELIA_OIDC_HMAC" }}'
+    cors:
+      endpoints: ['authorization', 'token', 'revocation', 'introspection', 'userinfo']
+    # By default Authelia only puts `sub` in the ID token; other claims live
+    # in the userinfo endpoint. OpenSearch Security's OIDC plugin reads roles
+    # from the ID token only (no userinfo fetch), so we must promote
+    # `groups` + `preferred_username` into the ID token via a claims policy.
+    claims_policies:
+      wazuh_groups:
+        id_token: ['groups', 'preferred_username', 'email']
+    jwks:
+      - key_id: 'wazuh-rsa-2026'
+        algorithm: 'RS256'
+        use: 'sig'
+        key: |
+{{ get $secrets "AUTHELIA_OIDC_JWKS_PRIVATE_KEY" | indent 10 }}
+    clients:
+      - client_id: 'wazuh'
+        client_name: 'Wazuh SIEM Dashboard'
+        client_secret: '{{ get $secrets "WAZUH_OIDC_CLIENT_SECRET_HASH" }}'
+        public: false
+        authorization_policy: 'one_factor'
+        consent_mode: 'implicit'
+        claims_policy: 'wazuh_groups'
+        redirect_uris:
+          - 'https://wazuh.ironnest.local/auth/openid/login'
+        scopes: ['openid', 'profile', 'email', 'groups']
+        userinfo_signed_response_alg: 'none'
+        token_endpoint_auth_method: 'client_secret_post'   # OpenSearch Dashboards OIDC plugin sends creds in POST body, not Basic header

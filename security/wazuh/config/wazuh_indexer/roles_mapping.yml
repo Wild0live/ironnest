@@ -1,0 +1,95 @@
+---
+# OpenSearch Security role mappings — extends the stock Wazuh 4.14.4 mapping
+# with Authelia OIDC integration.
+#
+# IMPORTANT: this file is pushed verbatim by securityadmin.sh and REPLACES
+# the live mapping. It must contain EVERY mapping the dashboard +
+# wazuh.manager need to function — including the wazuh-specific ones like
+# `manage_wazuh_index` that grant kibanaserver access to wazuh-* indices.
+#
+# Diff vs stock:
+#   * all_access.backend_roles += "wazuh-admin"  (Authelia group → all_access)
+#   * kibana_user.backend_roles += "wazuh-admin" (so OIDC users get dashboard access)
+#   * everything else preserved exactly as stock wazuh-indexer:4.14.4
+
+_meta:
+  type: "rolesmapping"
+  config_version: 2
+
+all_access:
+  reserved: true
+  hidden: false
+  backend_roles:
+  - "admin"
+  - "wazuh-admin"      # Authelia group claim → all_access
+  hosts: []
+  users: []
+  and_backend_roles: []
+  description: "Maps admin + Authelia wazuh-admin to all_access"
+
+own_index:
+  reserved: false
+  hidden: false
+  backend_roles: []
+  hosts: []
+  users:
+  - "*"
+  and_backend_roles: []
+  description: "Allow full access to an index named like the username"
+
+logstash:
+  reserved: false
+  hidden: false
+  backend_roles:
+  - "logstash"
+  hosts: []
+  users: []
+  and_backend_roles: []
+
+readall:
+  reserved: true
+  hidden: false
+  backend_roles:
+  - "readall"
+  hosts: []
+  users: []
+  and_backend_roles: []
+
+manage_snapshots:
+  reserved: true
+  hidden: false
+  backend_roles:
+  - "snapshotrestore"
+  hosts: []
+  users: []
+  and_backend_roles: []
+
+kibana_server:
+  reserved: true
+  hidden: false
+  backend_roles: []
+  hosts: []
+  users:
+  - "kibanaserver"
+  and_backend_roles: []
+
+kibana_user:
+  reserved: false
+  hidden: false
+  backend_roles:
+  - "kibanauser"
+  - "wazuh-admin"      # Authelia OIDC users land in the dashboard via this role
+  hosts: []
+  users: []
+  and_backend_roles: []
+  description: "Maps kibanauser + Authelia wazuh-admin to kibana_user"
+
+# Wazuh monitoring and statistics index permissions
+manage_wazuh_index:
+  reserved: true
+  hidden: false
+  backend_roles: []
+  hosts: []
+  users:
+  - "kibanaserver"
+  and_backend_roles: []

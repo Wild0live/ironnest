@@ -21,7 +21,7 @@ fi
 cd "$PLATFORM_DIR"
 
 echo "Restoring from: $SRC"
-echo "This will DESTROY current data in postgres, openclaw-home, codex-home, hermes-data, adguard-conf, wazuh volumes."
+echo "This will DESTROY current data in postgres, openclaw-home, codex-home, hermes-data, adguard-conf, wazuh, authelia-data volumes."
 read -p "Type 'yes' to continue: " C
 [[ "$C" == "yes" ]] || { echo "aborted"; exit 1; }
 
@@ -60,6 +60,7 @@ restore_volume wazuh_wazuh_logs             wazuh-logs.tar.gz
 restore_volume wazuh_filebeat_etc           wazuh-filebeat-etc.tar.gz
 restore_volume wazuh_wazuh-indexer-data     wazuh-indexer-data.tar.gz
 restore_volume wazuh_wazuh-dashboard-config wazuh-dashboard-config.tar.gz
+restore_volume ingress_authelia-data        authelia-data.tar.gz
 
 # Re-assert volume ownership (defensive — tar normally preserves uid/gid):
 #   openclaw user runs as 1000; hermes user runs as 10000.

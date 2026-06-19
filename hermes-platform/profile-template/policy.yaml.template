@@ -1,0 +1,29 @@
+# Policy template used by scripts/create-profile.sh.
+#
+# Substitutions:
+#   <PROFILE-NAME>     → lowercase profile name
+#
+# Output filename: policies/<PROFILE-NAME>.policy.yaml
+# Validated by:    spec/policies.schema.json
+
+profile: <PROFILE-NAME>
+description: |
+  Default-shape policy for <PROFILE-NAME>. Standard rules:
+    READ  : shared/** + own private
+    WRITE : own private + own approved-shared
+    DENY  : every other profile's private and approved-shared
+  Override by editing the resulting policies/<PROFILE-NAME>.policy.yaml.
+
+read:
+  # Default-deny is IMPLICIT. Only list what's allowed. Explicit `deny:`
+  # rules are reserved for narrower exclusions inside an allow (e.g.
+  # allow viking://shared/** but deny viking://shared/security/**).
+  # See docs/06-NAMESPACE-AND-POLICY-MODEL.md.
+  allow:
+    - "viking://shared/**"
+    - "viking://profiles/<PROFILE-NAME>/**"
+
+write:
+  allow:
+    - "viking://profiles/<PROFILE-NAME>/**"
+    - "viking://shared/approved/<PROFILE-NAME>/**"

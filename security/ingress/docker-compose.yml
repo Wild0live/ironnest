@@ -13,11 +13,19 @@ networks:
     driver: bridge              # internet-capable, port publishing
   platform-net:
     external: true              # reach backend services + AdGuard DNS
+  platform-egress:
+    external: true              # infisical-agent path to infisical:8090
+                                # (platform-net internal:true drops outbound SYNs)
 
 volumes:
   traefik-certs:                # TLS cert + key (populated by generate-certs.sh)
     external: true
     name: ingress_traefik-certs # created by generate-certs.sh before compose up
+  authelia-data:                # SQLite DB + WebAuthn credentials (persistent)
+    name: ingress_authelia-data
+  oidc-secrets:                 # populated by ingress-infisical-agent; consumed
+                                # by authelia for OIDC HMAC / JWKS / clients.
+    name: ingress_oidc-secrets
 
 x-logging: &default-logging
   driver: json-file
@@ -43,8 +51,15 @@ services:
       - ./conf:/etc/traefik/conf:ro
       - traefik-certs:/certs:ro
     networks:
-      - traefik_ingress
-      - platform-net
+      traefik_ingress: {}
+      platform-net:
+        # Aliases let backend containers on platform-net resolve *.ironnest.local
+        # to traefik's container IP without depending on AdGuard records or
+        # leaving the internal network. Needed for Wazuh's OIDC plugin to fetch
+        # https://auth.ironnest.local/.well-known/openid-configuration from
+        # inside the docker network (the public route would require outbound).
+        aliases:
+          - auth.ironnest.local
     dns:
       - 172.30.0.10               # AdGuard
     healthcheck:
@@ -58,3 +73,94 @@ services:
         limits:
           cpus: "0.5"
           memory: 128M
+
+  # ── Infisical Agent sidecar ──────────────────────────────────────────────────
+  # Renders the three OIDC secret files into the oidc-secrets volume:
+  #   /secrets/oidc-hmac.txt        — Authelia OIDC HMAC signing secret
+  #   /secrets/oidc-jwks.pem        — RSA private key for ID token signing
+  #   /secrets/oidc-clients.yml     — partial Authelia config snippet listing
+  #                                   the wazuh OIDC client (with PBKDF2 hash)
+  # Authelia mounts the same volume read-only at /oidc-secrets and references
+  # the first two via *_FILE env vars. The oidc-clients.yml is not yet wired
+  # because Authelia 4.39's config-include behavior needs verification —
+  # we inline the client list in configuration.yml for now.
+  ingress-infisical-agent:
+    # Reuses the image already built by openclaw's `docker compose up --build`.
+    # If you ever rebuild from scratch, run `(cd ../../openclaw && docker compose build infisical-agent)`
+    # first to produce platform/infisical-cli:0.43.76-patched.
+    image: platform/infisical-cli:0.43.76-patched
+    container_name: ingress-infisical-agent
+    restart: unless-stopped
+    entrypoint: ["sh", "/agent-config/entrypoint.sh"]
+    env_file: ./.env
+    logging: *default-logging
+    volumes:
+      - ./agent-config:/agent-config:ro
+      - oidc-secrets:/secrets
+    tmpfs:
+      - /tmp:size=1m,mode=0700
+    networks:
+      - platform-egress           # Infisical reach (platform-net is internal)
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /secrets/oidc-snippet.yml"]
+      interval: 5s
+      timeout: 3s
+      retries: 24                 # up to 2 min for Infisical on first boot
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+
+  # ── Authelia SSO + passkey gate ──────────────────────────────────────────────
+  # Sits behind Traefik's ForwardAuth middleware (see conf/routers.yml).
+  # No host port: only reachable via Traefik at https://auth.ironnest.local/.
+  # Secrets come from files (./authelia/secrets/) referenced by *_FILE env vars
+  # so they never appear in env listings or process arguments.
+  authelia:
+    image: authelia/authelia:4.39.20
+    container_name: authelia
+    hostname: authelia
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - ./authelia/configuration.yml:/config/configuration.yml:ro
+      - ./authelia/users.yml:/config/users.yml:ro
+      - ./authelia/secrets:/secrets:ro
+      - oidc-secrets:/oidc-secrets:ro    # rendered by ingress-infisical-agent
+      - authelia-data:/data
+    environment:
+      AUTHELIA_SESSION_SECRET_FILE: /secrets/session.txt
+      AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE: /secrets/storage.txt
+      AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE: /secrets/jwt.txt
+    # All OIDC fields (hmac_secret, jwks, clients, cors) live in the snippet
+    # rendered by ingress-infisical-agent. Authelia merges it into the base
+    # configuration.yml at startup.
+    command:
+      - "authelia"
+      - "--config=/config/configuration.yml"
+      - "--config=/oidc-secrets/oidc-snippet.yml"
+    networks:
+      - platform-net              # only reached by Traefik on this network
+    dns:
+      - 172.30.0.10               # AdGuard
+    depends_on:
+      ingress-infisical-agent:
+        condition: service_healthy
+    healthcheck:
+      # `authelia healthcheck` was removed in 4.39; probe /api/health instead.
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9091/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M

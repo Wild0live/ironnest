@@ -2,11 +2,14 @@
 
 **The secure local platform for running AI workloads on Windows.**
 
-IronNest gives you a production-grade security envelope for running AI workloads — [OpenClaw](https://github.com/openclaw/openclaw) (self-hosted AI gateway) and [Hermes Agent](https://github.com/NousResearch/hermes-agent) (autonomous AI agent with Telegram gateway) — on your Windows 11 machine. It wraps every workload in nine independent security layers so that your API keys, outbound traffic, host OS, and container runtime are all protected, monitored, and auditable, without needing cloud infrastructure.
+IronNest gives you a production-grade security envelope for running AI workloads — [OpenClaw](https://github.com/openclaw/openclaw) (self-hosted AI gateway) and [Hermes Agent](https://github.com/NousResearch/hermes-agent) (autonomous AI agent with Telegram gateway, run here as the multi-profile **Hermes Platform** stack) — on your Windows 11 machine. It wraps every workload in ten independent security layers so that your API keys, outbound traffic, host OS, and container runtime are all protected, monitored, and auditable, without needing cloud infrastructure.
 
 ```
-Socket Isolation → DNS Filtering → Egress Control → Secrets → Ingress/TLS → SIEM → Image Scanning → Observability → AI Workloads
+FIDO Identity Gate (Authelia) → Socket Isolation → DNS Filtering → Egress Control
+  → Secrets → Ingress/TLS → SIEM → Image Scanning → Observability → AI Workloads
 ```
+
+Every admin UI (Infisical, Dozzle, AdGuard, OpenClaw, Hermes, Wazuh, Traefik dashboard) is reachable only via `https://*.ironnest.local/` and requires a **physical FIDO key tap** (WebAuthn passkey) to establish a session — most through Authelia's ForwardAuth middleware, and Wazuh through OIDC SSO against Authelia (since 2026-05-28). Backend services don't publish loopback ports, so an attacker who took remote control of the Windows host can't reach any UI without producing the security key.
 
 ---
 
@@ -59,13 +62,26 @@ IronNest solves all of this. It treats every AI workload as a zero-trust tenant:
 
 Each layer is an independent Docker Compose project. They defend the platform in sequence — if one fails or is misconfigured, the others continue to function independently.
 
+### 0. Identity Gate (FIDO / WebAuthn) — `security/ingress/authelia/`
+
+**Authelia** sits in front of every `*.ironnest.local` Traefik router as a ForwardAuth middleware. With `enable_passkey_login: true`, login is a single-factor passkey ceremony — a tap on a USB FIDO key (e.g. YubiKey) or a Windows Hello prompt. No password is needed for daily use; the bootstrap password is the fallback only if the security key is lost.
+
+Once you've passed the FIDO gate, a session cookie covers all `.ironnest.local` subdomains (Dozzle, Infisical, AdGuard, OpenClaw, Hermes, Hermes-Dashboard, Traefik dashboard). The cookie is short-lived (1h inactivity, 4h max, no remember-me) so a stolen session has a small useful window.
+
+The backend services no longer publish loopback ports — the only network path from the host to each UI runs through Traefik → Authelia. An attacker who has remote control of your Windows session cannot reach any IronNest UI without producing the physical key.
+
+One intentional escape hatch remains:
+- **Traefik dashboard** at `http://127.0.0.1:8880/dashboard/` — useful as a last-resort if Traefik's routing itself breaks.
+
+The **Wazuh dashboard** used to be a carve-out (its SPA breaks behind ForwardAuth, so it ran on its own password login with a `https://127.0.0.1:8443` loopback hatch). As of **2026-05-28 it is fully FIDO-gated via OIDC SSO** against Authelia (the dashboard runs its own OpenID Connect flow, so the SPA never sees a 302-to-HTML). The `8443` loopback hatch is closed — Wazuh is reachable only at `https://wazuh.ironnest.local/`.
+
 ### 1. Socket Proxy — `security/socket-proxy/`
 The Docker socket (`/var/run/docker.sock`) is the most dangerous file on a Linux host. Any container that mounts it can control every other container, read all environment variables, and escape to the host.
 
 IronNest never mounts the raw socket anywhere. Instead, a **Tecnativa socket proxy** exposes a read-only subset of the Docker API (container list, events, image list, network list) over TCP. Dozzle, Wazuh, and Trivy connect through this proxy. Write operations, exec, and build endpoints are blocked entirely.
 
 ### 2. Observability — `observability/dozzle/`
-**Dozzle** provides a real-time browser-based log viewer for all containers. It connects to the socket proxy (never the raw socket) and streams logs from every running container at `http://127.0.0.1:8888`. This is your primary window into what OpenClaw is doing at any given moment.
+**Dozzle** provides a real-time browser-based log viewer for all containers. It connects to the socket proxy (never the raw socket) and streams logs from every running container at `https://dozzle.ironnest.local/` (FIDO-gated via Authelia). This is your primary window into what OpenClaw is doing at any given moment.
 
 ### 3. DNS Filtering — `security/adguard/`
 Every container in IronNest has its DNS server hard-coded to `172.30.0.10` — the AdGuard Home container. This means no container can bypass DNS-layer blocking by using an alternative resolver.
@@ -77,7 +93,7 @@ All outbound HTTP and HTTPS traffic is routed through **Squid**, a forward proxy
 
 Squid uses an **allow-by-default / blocklist** model: all destinations are permitted unless they appear on a live threat feed. A companion `blocklist-updater` container fetches **Spamhaus DROP/EDROP**, **Emerging Threats C2**, and **Feodo Tracker** every 6 hours and reloads Squid without a restart. This means known-malicious IPs and domains are blocked at the TCP level, while legitimate new AI provider endpoints work without manual config changes.
 
-On top of this, `openclaw/start.sh` and `hermes/start.sh` each insert a `DOCKER-USER` firewall rule at the kernel level that drops any NEW outbound TCP connection that tries to bypass the proxy entirely (`curl --noproxy`-style). The proxy is not optional — it is enforced at two independent layers: Squid blocklist + kernel firewall.
+On top of this, the on-demand stacks' `start.sh` scripts insert a `DOCKER-USER` firewall rule at the kernel level that drops any NEW outbound TCP connection from their port-publishing ingress bridge that tries to bypass the proxy entirely (`curl --noproxy`-style). The proxy is not optional — it is enforced at two independent layers: Squid blocklist + kernel firewall.
 
 ### 5. SIEM — `security/wazuh/`
 **Wazuh** is an open-source Security Information and Event Management system. IronNest runs a full Wazuh stack: manager, OpenSearch indexer, and dashboard. A Windows host agent is installed on the PC itself (not just inside containers), so Wazuh monitors:
@@ -88,7 +104,7 @@ On top of this, `openclaw/start.sh` and `hermes/start.sh` each insert a `DOCKER-
 - Login attempts and privilege escalation
 - Network anomalies
 
-The Wazuh dashboard is accessible at `https://127.0.0.1:8443` and provides real-time alerts and historical event queries.
+The Wazuh dashboard is accessible only at `https://wazuh.ironnest.local/` (the `https://127.0.0.1:8443/` loopback hatch was closed 2026-05-27). Login is **FIDO-gated via OIDC SSO** against Authelia: the dashboard runs its own OpenID Connect flow, you tap your passkey at `auth.ironnest.local`, and the dashboard establishes its own session — so the SPA never breaks the way it did under ForwardAuth (see the Identity Gate notes above and ARCHITECTURE.md). It provides real-time alerts and historical event queries.
 
 ### 6. Image Scanner — `security/trivy/`
 **Trivy** runs as a persistent CVE database server at port 4954. When you want to audit your container images for known vulnerabilities, run:
@@ -104,26 +120,29 @@ Trivy checks every running image against its CVE database and produces a report.
 
 Both `openclaw/` and `hermes/` stacks include an **Infisical Agent sidecar** that authenticates using a Machine Identity, fetches secrets, and writes them to a runtime `.env` file every 60 seconds. API keys never appear in `docker-compose.yml`, never in a `.env` committed to git, never in a container image.
 
-**Per-workload scoping uses folders, not key prefixes.** When two workloads need the same logical secret (e.g. each `hermes-gateway-*` profile needs its own `TELEGRAM_BOT_TOKEN`), the right pattern is one Infisical folder per workload — `/steve`, `/wifey`, `/mark` — each holding the workload's specific values plus a Secret Link importing shared keys from `/`. The workload sets `INFISICAL_PATH=/<name>` and `infisical run --include-imports` merges its folder with the imports. This isolates blast radius (a compromised gateway only sees its own folder + shared), keeps ACLs aligned with workload boundaries, and avoids the brittle naming-convention path (`STEVE_TELEGRAM_BOT_TOKEN`, `MARK_TELEGRAM_BOT_TOKEN`, …) that doesn't scale and can't be enforced by access control. See [hermes/docker-compose.yml](hermes/docker-compose.yml) for the canonical example.
+**Per-workload scoping uses folders, not key prefixes.** When two workloads need the same logical secret (e.g. each `hermes-gateway-*` profile needs its own `TELEGRAM_BOT_TOKEN`), the right pattern is one Infisical folder per workload — `/steve`, `/qa`, `/mark` — each holding the workload's specific values plus a Secret Link importing shared keys from `/`. The workload sets `INFISICAL_PATH=/<name>` and `infisical run --include-imports` merges its folder with the imports. This isolates blast radius (a compromised gateway only sees its own folder + shared), keeps ACLs aligned with workload boundaries, and avoids the brittle naming-convention path (`STEVE_TELEGRAM_BOT_TOKEN`, `MARK_TELEGRAM_BOT_TOKEN`, …) that doesn't scale and can't be enforced by access control. See [hermes/docker-compose.yml](hermes/docker-compose.yml) for the canonical example.
 
-### AI Workloads — `openclaw/` and `hermes/`
+### AI Workloads — `openclaw/` and `hermes-platform/`
 
 Both workloads run with strict isolation — no Docker socket access, no capability to control other containers, all outbound traffic forced through Squid, secrets injected at runtime.
 
 **OpenClaw** (`openclaw/`) — self-hosted AI gateway:
 - Supports Anthropic Claude, OpenAI GPT, Google Gemini, Codex (ChatGPT subscription), and other providers
-- Browser terminal (`ttyd`) at `http://127.0.0.1:7681` for running `openclaw security audit` and similar CLI commands
+- Gateway UI at `https://openclaw.ironnest.local/` (FIDO-gated)
+- Browser terminal (`ttyd`) is built but not currently published or routed (loopback closed 2026-05-27). Re-enable in `openclaw/docker-compose.yml` and add a Traefik route if you want browser-based CLI access.
 
-**Hermes Agent** (`hermes/`) — autonomous AI agent running GPT-5.4 via OpenRouter:
-- Interactive TUI accessible at `http://127.0.0.1:7682` — over 30 skills across browser, code execution, media, research, social, and more
-- Persistent Telegram gateway (`hermes-gateway` container) that survives terminal closes
-- Analytics dashboard at `http://127.0.0.1:9119/analytics` — per-model token usage, session counts, skill rankings
+**Hermes Platform** (`hermes-platform/`) — autonomous Hermes agent, multi-profile, with a 3-tier long-term-memory plane:
+- **Eight isolated per-profile gateways** (`hermes-pf-default`, `-mark`, `-steve`, `-qa`, `-littlejohn`, `-jaime`, `-bigbert`, `-octo`), each mounting only its own Docker volume; profiles with a Telegram bot run their own long-poller (one per bot avoids `getUpdates` conflicts). The `qa` profile was renamed from `wifey` on 2026-06-14 (now QA/verification); `octo` (platform-ops) was added 2026-06-12.
+- Management TUI at `https://hermes-platform.ironnest.local/` (FIDO-gated) and a Vite web dashboard at `https://hermes-platform-dashboard.ironnest.local/` (FIDO-gated) — both served by `hermes-platform-ttyd`, the only container that can see every profile
+- **Memory plane:** profile agents reach a policy-enforcing `memory-gateway` (the sole path to the OpenViking long-term-memory backend, which embeds via a local Ollama model). Profile containers cannot reach OpenViking directly — every memory read/write is authenticated, policy-checked, and audited.
+- **Mission Control** (`hermes-platform-mission-control`, `https://mission.ironnest.local/`) — a standalone least-privilege ops dashboard (holds no secrets; reads the registry + audit log read-only). It also lets you chat with any profile from the browser via a tiny in-container agent-chat bridge (per-profile, token-gated, no Docker socket), with token streaming and downloads of files the agent produces.
+- This replaces the legacy single-stack `hermes/` project (TUI + flat Telegram gateways), which was **removed 2026-05-31**; `hermes/` now exists only as the build context for the shared `platform/hermes-agent` image. See [hermes-platform/README.md](hermes-platform/README.md) and `hermes-platform/docs/` for the full architecture.
 
 ---
 
 ## System Requirements
 
-IronNest runs 18 containers in always-on mode. Wazuh's OpenSearch indexer is the most memory-intensive component — plan your hardware accordingly before starting.
+IronNest runs 18 containers in always-on mode (9 bootstrap stacks). Wazuh's OpenSearch indexer is the most memory-intensive component — plan your hardware accordingly before starting.
 
 | Component | Minimum | Recommended |
 |---|---|---|
@@ -137,21 +156,27 @@ IronNest runs 18 containers in always-on mode. Wazuh's OpenSearch indexer is the
 
 **Why a separate drive for Docker storage?** Rancher Desktop stores all container images, volumes, and the WSL2 VHD on a single `.vhdx` file. This file grows significantly over time (Wazuh images alone are ~3 GB). Keeping it on a drive separate from your Windows system drive prevents Docker growth from impacting OS performance.
 
-**Container memory budget (enforced limits):**
+**Container memory budget (enforced limits, from the live running config).** "Always-on" = the 9 stacks `bootstrap.sh` starts; the on-demand stacks are brought up by the logon autostart task.
 
 | Stack | Containers | Memory limit |
 |---|---|---|
-| Wazuh (manager + indexer + dashboard) | 3 | 5.0 GB |
-| OpenClaw gateway + ttyd + Infisical agent | 3 | 5.1 GB |
+| Wazuh (manager + indexer + dashboard + infisical-agent) | 4 | 5.06 GB |
 | Infisical + Postgres + Redis | 3 | 1.8 GB |
-| Traefik | 1 | 0.13 GB |
-| Monitoring (Fluent Bit) | 1 | 0.13 GB |
-| Trivy, Squid + blocklist-updater, AdGuard, Dozzle, socket-proxy | 7 | 1.3 GB |
-| **Always-on total** | **15** | **~13.5 GB** |
-| Hermes Agent (ttyd + gateway + Infisical agent) | 3 | 2.5 GB |
-| Browser Intent MCP + worker + Infisical agent (optional) | 3 | 2.3 GB |
-| **All running total** | **24** | **~18.3 GB** |
+| Ingress (Traefik + Authelia + infisical-agent) | 3 | 0.44 GB |
+| Monitoring (Fluent Bit + container-sync) | 2 | 0.16 GB |
+| Trivy + Squid + blocklist-updater + AdGuard + Dozzle + socket-proxy | 6 | 1.25 GB |
+| **Always-on total** | **18** | **~8.7 GB** |
+| OpenClaw (gateway + ttyd + Infisical agent) | 3 | 5.06 GB |
+| Hermes Platform (7 `hermes-pf-*` gateways + ttyd + memory-gateway + OpenViking + Ollama + Infisical agent + Mission Control dashboard) | 13 | 10.4 GB |
+| Browser Intent (MCP + worker + Infisical agent) | 3 | 2.31 GB |
+| **All-running total (every on-demand stack up)** | **37** | **~26.5 GB** |
 
+> The Wazuh and Ingress stacks each gained an `infisical-agent` sidecar for the OIDC rollout (the dashboard's OIDC client secret and Authelia's OIDC HMAC/JWKS), which is why Wazuh is now 4 containers and Ingress 3.
+>
+> Hermes Platform grew from 12 to 13 containers (~8.56 → ~10.4 GB) on 2026-06-07 when the **Mission Control** ops dashboard was added: a new ~128 MB container, plus the seven `hermes-pf-*` raised from 0.5 CPU/512 MB to 2.0 CPU/768 MB and Ollama from 2.0 to 5.0 CPU (CPU starvation was throttling warm dashboard-chat turns).
+>
+> The optional **LLM Wiki** companion (separate project at `D:\LLM Wiki`, routes `wiki.ironnest.local` / `chat.ironnest.local`) adds 5 more containers (~1.75 GB) when running. It is not part of the cloneable platform tree.
+>
 > Windows itself plus WSL2 overhead adds ~2–4 GB on top. On a 16 GB machine, if you experience memory pressure, reduce Wazuh's indexer heap: add `OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx1g` to `security/wazuh/.env`.
 
 **Storage breakdown:**
@@ -164,20 +189,24 @@ IronNest runs 18 containers in always-on mode. Wazuh's OpenSearch indexer is the
 
 ## What's included
 
-| Stack | Path | Startup | Purpose | Local UI |
+All operator UIs are reached via `https://*.ironnest.local/` URLs through Traefik, gated by Authelia/FIDO (Wazuh via OIDC SSO, the rest via ForwardAuth). Backend services do not publish loopback ports by default; only the Traefik dashboard keeps a loopback escape hatch (`http://127.0.0.1:8880/dashboard/`).
+
+| Stack | Path | Startup | Purpose | URL |
 |---|---|---|---|---|
 | Socket proxy | `security/socket-proxy/` | bootstrap | Read-only Docker API for Dozzle / Wazuh / Trivy | — |
-| DNS filter | `security/adguard/` | bootstrap | AdGuard Home — DNS-layer blocking for all containers | `127.0.0.1:3000` |
+| DNS filter | `security/adguard/` | bootstrap | AdGuard Home — DNS-layer blocking for all containers | `https://adguard.ironnest.local/` (FIDO) |
 | Egress proxy | `security/egress-proxy/` | bootstrap | Squid + blocklist-updater — allow-by-default with threat blocklists | — |
-| SIEM | `security/wazuh/` | bootstrap | Wazuh manager + indexer + dashboard | `127.0.0.1:8443` |
+| SIEM | `security/wazuh/` | bootstrap | Wazuh manager + indexer + dashboard + infisical-agent | `https://wazuh.ironnest.local/` (FIDO-gated via OIDC SSO against Authelia; loopback `8443` closed) |
 | Image scanner | `security/trivy/` | bootstrap | CVE database server + on-demand scanner | — |
-| Ingress | `security/ingress/` | bootstrap | Traefik reverse proxy — TLS termination, single internet entry point | `127.0.0.1:8880` (dashboard) |
-| Secrets manager | `secrets/` | bootstrap | Infisical + Postgres + Redis | `127.0.0.1:18090` |
-| Log viewer | `observability/dozzle/` | bootstrap | Real-time container log viewer | `127.0.0.1:8888` |
+| Ingress | `security/ingress/` | bootstrap | Traefik reverse proxy (TLS termination, single internet entry point) + Authelia identity gate | `https://auth.ironnest.local/` (login portal), `https://traefik.ironnest.local/dashboard/` (FIDO) + escape hatch `http://127.0.0.1:8880/dashboard/` |
+| Secrets manager | `secrets/` | bootstrap | Infisical + Postgres + Redis | `https://infisical.ironnest.local/` (FIDO + Infisical login) |
+| Log viewer | `observability/dozzle/` | bootstrap | Real-time container log viewer | `https://dozzle.ironnest.local/` (FIDO) |
 | Log shipping | `monitoring/` | bootstrap | Fluent Bit — ships all container logs → Wazuh OpenSearch | — |
-| AI workload | `openclaw/` | on-demand | OpenClaw gateway + ttyd browser terminal | `127.0.0.1:18789`, `127.0.0.1:7681` |
-| Hermes Agent | `hermes/` | on-demand | Hermes Agent TUI + Telegram gateway | `127.0.0.1:7682` |
-| Browser Intent | `browser-intent/` | on-demand | Local MCP facade for allowlisted browser login intents | `127.0.0.1:18901` |
+| AI workload | `openclaw/` | on-demand | OpenClaw gateway + ttyd browser terminal | `https://openclaw.ironnest.local/` (FIDO); ttyd not currently published |
+| Hermes Platform | `hermes-platform/` | on-demand | Hermes agent — 7 isolated per-profile gateways + management ttyd + Vite dashboard + 3-tier memory plane (memory-gateway + OpenViking + Ollama) + Mission Control ops dashboard | `https://hermes-platform.ironnest.local/` (ttyd TUI, FIDO), `https://hermes-platform-dashboard.ironnest.local/` (web dashboard, FIDO), `https://mission.ironnest.local/` (Mission Control, FIDO) |
+| Browser Intent | `browser-intent/` | on-demand | Local MCP facade for allowlisted browser login intents | `127.0.0.1:18901` (MCP endpoint, not browser-facing) |
+
+> The legacy single-stack `hermes/` Compose project (TUI + Telegram gateways at `hermes.ironnest.local` / `hermes-dashboard.ironnest.local`) was **removed 2026-05-31**. `hermes-platform/` is now the sole agent stack; `hermes/` survives only as the build context for the shared `platform/hermes-agent` image. The optional **LLM Wiki** companion (`D:\LLM Wiki`, on-demand) adds `wiki.ironnest.local` and `chat.ironnest.local`, both FIDO-gated.
 
 ---
 
@@ -344,13 +373,66 @@ When all containers show healthy, move to the next step.
 
 ---
 
+### Step 5b — Set up the Authelia identity gate
+
+Every `*.ironnest.local` UI is gated by Authelia ForwardAuth — a passkey (FIDO key or Windows Hello) is required to obtain a session cookie. Before you can reach any backend through Traefik, three things need to happen on the Windows host: the hostnames must resolve to `127.0.0.1`, Chrome must trust the self-signed Traefik cert (WebAuthn refuses to register a credential on any site with TLS errors), and you must register a passkey against your Authelia user.
+
+**1. Add hosts file entries** (run in an **elevated PowerShell** prompt):
+
+```powershell
+$entries = @(
+  'auth', 'dozzle', 'adguard', 'infisical', 'wazuh',
+  'openclaw', 'hermes', 'hermes-dashboard',
+  'hermes-platform', 'hermes-platform-dashboard', 'mission',
+  'wiki', 'chat', 'traefik'
+) | ForEach-Object { "127.0.0.1`t$_.ironnest.local" }
+Add-Content -Path 'C:\Windows\System32\drivers\etc\hosts' -Value $entries
+```
+
+Verify with `Resolve-DnsName auth.ironnest.local` — it should return `127.0.0.1`.
+
+**2. Trust the Traefik self-signed cert in the Windows certificate store.** Traefik mints its own cert into the `ingress_traefik-certs` volume. Extract it to a host file (using `[System.IO.File]::WriteAllText` to keep the LF newlines PEM expects), then import it into `LocalMachine\Root`:
+
+```powershell
+# Extract the cert from the Docker volume
+$pem = docker run --rm -v ingress_traefik-certs:/certs alpine cat /certs/server.crt
+[System.IO.File]::WriteAllText("$env:TEMP\ironnest-traefik.crt", ($pem -join "`n"))
+
+# Import (requires elevated PowerShell)
+Import-Certificate -FilePath "$env:TEMP\ironnest-traefik.crt" -CertStoreLocation Cert:\LocalMachine\Root
+```
+
+> This is **required** for WebAuthn. Chrome refuses `navigator.credentials.create()` on any origin with TLS errors, so passkey registration will silently fail until the cert is trusted. Restart Chrome after the import to pick up the new root.
+
+**3. Register your passkey.**
+
+1. Visit `https://auth.ironnest.local/` in a regular (non-incognito) Chrome window.
+2. Log in with username `phoenix` (or whichever username you added in `security/ingress/authelia/users.yml`) and the bootstrap password from `security/ingress/authelia/secrets/bootstrap-password.txt`.
+3. Navigate to **Settings → Two-Factor Authentication → WebAuthn Credentials → Add**.
+4. Authelia emails an OTP through the filesystem notifier (no SMTP wired up). Retrieve it from the container:
+
+   ```bash
+   docker exec authelia tail /data/notifications.txt
+   ```
+
+   Paste the OTP into the dialog.
+5. Tap your FIDO key (or trigger Windows Hello). The credential is stored in the SQLite DB at `/data/db.sqlite3` inside the `ingress_authelia-data` volume.
+
+> **Incognito blocks WebAuthn *registration*.** Use a regular Chrome window for the enrollment ceremony; subsequent logins work fine in incognito. The bootstrap password remains valid as a fallback — keep it in a password manager in case you lose the security key.
+
+> **ttyd and `Authorization: Basic`.** A backend that issues its own HTTP Basic challenge (as ttyd does) collides with Authelia consuming the same header for its session. So **both** OpenClaw's and Hermes Platform's ttyd run with Basic Auth **unset** — Authelia would try to validate the Basic creds against its passkey-only user store and 401 the request, so stacking Basic Auth actively breaks access. Authelia FIDO is the sole gate, and it's strictly stronger than Basic Auth.
+
+Once registration succeeds, the session cookie covers every `.ironnest.local` subdomain for 1 h of inactivity (4 h max).
+
+---
+
 ### Step 6 — Set up Infisical and configure OpenClaw secrets
 
 Infisical is your self-hosted secrets vault. You need to complete its first-run setup before OpenClaw can start.
 
 **Open Infisical:**
 
-Navigate to `http://127.0.0.1:18090` in your browser. Complete the sign-up form to create your admin account.
+Navigate to `https://infisical.ironnest.local/` in your browser (you must finish Step 5b first — the loopback port `127.0.0.1:18090` is no longer published). Authelia will prompt for a passkey tap; once accepted, complete Infisical's sign-up form to create your admin account.
 
 **Create a project:**
 
@@ -386,7 +468,7 @@ INFISICAL_CLIENT_SECRET=<same Client Secret>
 
 **Update the secrets template with your project ID:**
 
-Your Infisical project has a UUID visible in the browser URL when you're inside the project (e.g. `http://127.0.0.1:18090/project/63d75eb0-ef3a-4ce3-908d-46360b922fa8/...`). Copy that UUID, then:
+Your Infisical project has a UUID visible in the browser URL when you're inside the project (e.g. `https://infisical.ironnest.local/project/63d75eb0-ef3a-4ce3-908d-46360b922fa8/...`). Copy that UUID, then:
 
 ```bash
 cp openclaw/agent-config/secrets.tmpl.example openclaw/agent-config/secrets.tmpl
@@ -413,79 +495,82 @@ bash openclaw/start.sh
 
 **Access OpenClaw:**
 
+All UIs go through Traefik on `https://*.ironnest.local/` and require a passkey tap at Authelia (the one-time tap covers every subdomain for the session).
+
 | Interface | URL | Notes |
 |---|---|---|
-| OpenClaw UI | `http://127.0.0.1:18789` | Main AI gateway interface |
-| Browser terminal | `http://127.0.0.1:7681` | Login with `TTYD_USERNAME` / `TTYD_PASSWORD` |
-| Dozzle logs | `http://127.0.0.1:8888` | All container logs in real time |
-| Infisical | `http://127.0.0.1:18090` | Secrets management |
-| AdGuard | `http://127.0.0.1:3000` | DNS filter dashboard |
-| Wazuh | `https://127.0.0.1:8443` | SIEM dashboard |
+| OpenClaw UI | `https://openclaw.ironnest.local/` | Main AI gateway interface |
+| Browser terminal | — | ttyd is built but **not currently published** (loopback port 7681 closed 2026-05-27, no Traefik route). Re-enable in `openclaw/docker-compose.yml` and add a route if you want it. |
+| Dozzle logs | `https://dozzle.ironnest.local/` | All container logs in real time |
+| Infisical | `https://infisical.ironnest.local/` | Secrets management |
+| AdGuard | `https://adguard.ironnest.local/` | DNS filter dashboard |
+| Wazuh | `https://wazuh.ironnest.local/` | SIEM dashboard — **FIDO-gated via OIDC SSO** against Authelia (tap your passkey at `auth.ironnest.local`). Loopback `8443` hatch is closed. |
 
-**Run a security audit from the browser terminal:**
+**Run a security audit:**
 
-Open `http://127.0.0.1:7681`, log in, then:
+ttyd is unpublished by default, so run audits via `docker exec`:
 
 ```bash
-openclaw security audit
-openclaw security audit --deep
-openclaw security audit --fix
+docker exec openclaw-gateway openclaw security audit
+docker exec openclaw-gateway openclaw security audit --deep
+docker exec openclaw-gateway openclaw security audit --fix
 ```
 
 ---
 
-### Step 7b — (Optional) Start Hermes Agent
+### Step 7b — (Optional) Start Hermes Platform
 
-Hermes Agent is a second AI workload that adds a Telegram messaging gateway and an interactive TUI alongside OpenClaw. It is fully isolated in its own stack and does not affect OpenClaw in any way.
+Hermes Platform is the second AI workload — a multi-profile Hermes agent with a 3-tier long-term-memory plane (memory-gateway → OpenViking → Ollama). It runs **seven isolated per-profile gateways**, a management ttyd + web dashboard, and a policy-enforcing memory gateway, all fully isolated from OpenClaw. (This replaces the legacy single-stack `hermes/` project, removed 2026-05-31.)
 
-**Set up Infisical secrets for Hermes** (same pattern as Step 6):
+> **Full runbook:** `hermes-platform/docs/09-DEPLOYMENT-RUNBOOK.md` and `hermes-platform/docs/04-CONFIGURATION.md` carry the authoritative step-by-step (the secret list runs to 12+ keys). The summary below is the shape of it.
 
-1. In Infisical, create a new project called `hermes`
-2. Add these **shared** secrets in the `dev` environment at path `/`:
-
-| Secret name | Value |
-|---|---|
-| `OPENROUTER_API_KEY` | Your API key from [openrouter.ai](https://openrouter.ai) |
-| `HERMES_TTYD_USERNAME` | A username for the Hermes browser terminal |
-| `HERMES_TTYD_PASSWORD` | A strong password for the Hermes browser terminal |
-| `TELEGRAM_BOT_TOKEN` | *(optional)* Token from [@BotFather](https://t.me/BotFather) for the default profile's bot |
-
-3. **(Optional — multi-profile setup.)** Each non-default gateway (`steve`, `wifey`, `mark`) runs its own Telegram bot. For each profile:
-   - Create a folder at `/` named after the profile (e.g. `/steve`)
-   - Inside the folder, add `TELEGRAM_BOT_TOKEN` with that profile's BotFather token
-   - Inside the folder, add a **Secret Link** (Environment=Development, Secret Path=`/`) so shared keys flow through
-   - The matching `hermes-gateway-<profile>` service in [hermes/docker-compose.yml](hermes/docker-compose.yml) already sets `INFISICAL_PATH=/<profile>` — no compose edit needed when you add the folder. Per-folder `TELEGRAM_BOT_TOKEN` overrides the one at `/`.
-
-3. Create a Machine Identity named `hermes-gateway` (Access Control → Machine Identities), assign it Viewer role on the hermes project, and copy the Client ID + Client Secret into `hermes/.env`
-
-4. Copy and configure the secrets template:
+**1. Build the shared agent image first.** Hermes Platform reuses the `platform/hermes-agent` image built from the `hermes/` build context:
 
 ```bash
-cp hermes/agent-config/secrets.tmpl.example hermes/agent-config/secrets.tmpl
+bash hermes/build.sh
 ```
 
-Replace `<YOUR_INFISICAL_PROJECT_UUID>` with your hermes project UUID (visible in the Infisical URL).
+**2. Set up Infisical** (project + machine identity):
 
-**Start Hermes:**
+1. Create a project called `hermes-platform`.
+2. Under the `dev` environment, **create the secret folders first** (`secrets set` does *not* auto-create them): `/hermes-platform`, `/hermes-platform/openviking`, `/hermes-platform/gateway`, and one per profile — `/hermes-platform/default`, `/mark`, `/steve`, `/qa`, `/littlejohn` (add `/jaime`, `/bigbert`, `/octo` if you provision those). Populate each with its tokens and per-profile `TELEGRAM_BOT_TOKEN` (one bot per profile — one long-poller per token avoids `getUpdates` conflicts). Shared keys (OpenRouter, embedding provider, ttyd creds) live under `/hermes-platform`.
+3. Create a **machine identity** `hermes-platform-machine` at the **org level**, grant it access to the project (start as **Admin** so the first secret push works, then downgrade to **Viewer** once running — runtime only needs read).
+
+**3. Configure `.env`:**
 
 ```bash
-bash hermes/start.sh
+cp hermes-platform/.env.example hermes-platform/.env
+# Fill in INFISICAL_UNIVERSAL_AUTH_CLIENT_ID, _CLIENT_SECRET,
+# INFISICAL_PROJECT_ID, and HERMES_PLATFORM_INFISICAL_PROJECT_ID (= INFISICAL_PROJECT_ID)
 ```
 
-The first build downloads ~1 GB of dependencies — allow 20 minutes. Subsequent starts are fast.
+**4. Build the platform images and start:**
 
-**Access Hermes:**
+```bash
+bash hermes-platform/build.sh   # builds openviking + memory-gateway images
+bash hermes-platform/start.sh   # waits for openviking, memory-gateway, and all hermes-pf-* healthy
+```
+
+`start.sh` also auto-pulls the Ollama embedding model (`mxbai-embed-large`, ~670 MB) on first run and asserts the network-segmentation invariant (a profile container must NOT be able to reach OpenViking directly).
+
+**5. Validate:**
+
+```bash
+bash hermes-platform/scripts/healthcheck.sh
+bash hermes-platform/scripts/validate-conversational-memory.sh
+bash hermes-platform/scripts/validate-isolation.sh
+bash hermes-platform/scripts/validate-sharing.sh
+```
+
+**Access Hermes Platform:**
 
 | Interface | URL |
 |---|---|
-| Browser terminal | `http://127.0.0.1:7682` |
-| Via Traefik | `https://hermes.ironnest.local` |
+| Hermes Platform TUI (ttyd) | `https://hermes-platform.ironnest.local/` |
+| Hermes Platform dashboard (per-profile management) | `https://hermes-platform-dashboard.ironnest.local/` |
+| Mission Control (ops dashboard — tasks, per-agent chat, file downloads) | `https://mission.ironnest.local/` |
 
-**First-run setup** (from the browser terminal):
-
-```bash
-hermes setup
-```
+All require a passkey tap at Authelia. ttyd's own Basic Auth is **disabled** — Authelia consumes the `Authorization` header, so Basic Auth would break access; FIDO is the sole, stronger gate. The loopback ports `127.0.0.1:8123` (ttyd) / `8124` (dashboard) remain for direct access. Mission Control also embeds this terminal at `https://mission.ironnest.local/` → **Terminal** (iframe, allowed via the `frame-mission` Traefik middleware).
 
 ---
 
@@ -493,7 +578,7 @@ hermes setup
 
 Rancher Desktop injects DNAT rules on every boot that break intra-container TCP communication. Without the autostart task, you need to run `bootstrap.sh` manually after every login.
 
-The autostart task runs `bootstrap.sh` and then `openclaw/start.sh` automatically after Rancher Desktop finishes initializing. It polls `docker info` for up to 3 minutes so it handles slow boots gracefully.
+The autostart task runs `bootstrap.sh` and then the on-demand stacks (`openclaw/start.sh`, `hermes-platform/start.sh`, `browser-intent/start.sh`) automatically after Rancher Desktop finishes initializing. It polls `docker info` for up to 3 minutes so it handles slow boots gracefully. (The legacy `hermes/start.sh` is intentionally excluded — its `hermes-gateway*` containers would fight `hermes-pf-*` for Telegram polling.)
 
 Run this in an **elevated PowerShell terminal** (right-click PowerShell → Run as Administrator):
 
@@ -537,7 +622,7 @@ Wazuh can monitor the Windows host OS (not just containers) for file integrity c
 Restart-Service WazuhSvc
 ```
 
-The agent appears in the Wazuh dashboard at `https://127.0.0.1:8443` within a minute.
+The agent appears in the Wazuh dashboard at `https://wazuh.ironnest.local/` within a minute.
 
 > If you restart the Wazuh manager container, `client.keys` on the host goes stale. Remove the old agent from the manager (`manage_agents -r <id>`) then re-run the enrollment command.
 
@@ -553,7 +638,7 @@ bash ops/check-prereqs.sh
 bash ops/status.sh
 
 # View live logs for all containers
-# → open http://127.0.0.1:8888 in your browser
+# → open https://dozzle.ironnest.local/ in your browser (passkey-gated)
 
 # Run a CVE scan across all running images
 bash security/trivy/scan.sh all
@@ -567,15 +652,18 @@ cd openclaw && docker compose stop
 # Start OpenClaw again
 bash openclaw/start.sh
 
-# Run an OpenClaw security audit (from browser terminal at http://127.0.0.1:7681)
-openclaw security audit
-openclaw security audit --fix
+# Run an OpenClaw security audit (ttyd unpublished — exec into the gateway)
+docker exec openclaw-gateway openclaw security audit
+docker exec openclaw-gateway openclaw security audit --fix
 
-# Start Hermes Agent (on-demand)
-bash hermes/start.sh
+# Start Hermes Platform (on-demand)
+bash hermes-platform/start.sh
 
-# Stop Hermes when not in use
-cd hermes && docker compose stop
+# Stop Hermes Platform when not in use
+cd hermes-platform && docker compose stop
+
+# Start Browser Intent (on-demand)
+bash browser-intent/start.sh
 ```
 
 ---
@@ -585,11 +673,13 @@ cd hermes && docker compose stop
 If autostart (Step 8) is configured, this is handled automatically. If not:
 
 ```bash
-bash bootstrap.sh       # fixes DNAT rules, starts always-on stacks
-bash openclaw/start.sh  # starts OpenClaw
+bash bootstrap.sh              # fixes DNAT rules, starts the 9 always-on stacks
+bash openclaw/start.sh         # starts OpenClaw
+bash hermes-platform/start.sh  # starts Hermes Platform
+bash browser-intent/start.sh   # starts Browser Intent
 ```
 
-Never use bare `docker compose up -d` to start stacks after a restart — the DNAT fix must run first or intra-container TCP will silently fail.
+Never use bare `docker compose up -d` to start stacks after a restart — the DNAT fix must run first or intra-container TCP will silently fail. (The logon autostart task runs exactly this chain — `bootstrap.sh` then the three on-demand `start.sh` scripts — so configuring it in Step 8 means you never do this by hand.)
 
 ---
 
@@ -696,26 +786,6 @@ Same root cause as above. Run the fix above, then:
 cd openclaw && docker compose restart infisical-agent
 ```
 
-**OpenClaw browser terminal (`http://127.0.0.1:7681`) asks for credentials but rejects them**
-
-The `TTYD_USERNAME` and `TTYD_PASSWORD` secrets may not have synced yet from Infisical. Check:
-
-```bash
-docker exec openclaw-infisical-agent cat /secrets/.env | grep TTYD
-```
-
-If empty, restart the agent:
-
-```bash
-docker restart openclaw-infisical-agent
-```
-
-Wait 15 seconds, then restart ttyd:
-
-```bash
-cd openclaw && docker compose restart openclaw-ttyd
-```
-
 **Wazuh dashboard shows no agents**
 
 The host agent's `client.keys` is stale after a Wazuh manager restart. Re-enroll:
@@ -733,7 +803,7 @@ Check its logs:
 docker compose -p <stack-name> logs <service-name>
 ```
 
-Or view it in Dozzle at `http://127.0.0.1:8888`. Most issues after a fresh bootstrap are Wazuh indexer startup time — give it 2–3 minutes.
+Or view it in Dozzle at `https://dozzle.ironnest.local/`. Most issues after a fresh bootstrap are Wazuh indexer startup time — give it 2–3 minutes.
 
 **bootstrap.sh appears to hang after starting the secrets stack**
 
@@ -745,28 +815,14 @@ docker compose -p secrets logs infisical-postgres
 
 A permission error on the data volume means the volume was created with the wrong ownership — run `docker volume rm rancher-stack_postgres-data` and re-run bootstrap.
 
-**Infisical is unreachable at `http://127.0.0.1:18090`**
+**Infisical is unreachable at `https://infisical.ironnest.local/`**
 
-Rancher Desktop's `sshPortForwarder` may have injected DNAT rules that intercept port traffic. Run:
+If the hostname doesn't resolve, hosts file entries are missing — re-run the `Add-Content` from Step 5b. If the page loads but redirects to Authelia and the FIDO key isn't recognised, restart Chrome to clear stale credential caches.
+
+If TCP itself looks broken (e.g. Traefik can't reach the Infisical backend), Rancher Desktop's `sshPortForwarder` may have injected stray DNAT rules. Run:
 
 ```bash
 bash ops/fix-nat-prerouting.sh
-```
-
-**Hermes browser terminal (`http://127.0.0.1:7682`) asks for credentials but rejects them**
-
-Same cause as the OpenClaw ttyd issue above — Infisical agent may not have rendered yet. Check:
-
-```bash
-docker exec hermes-infisical-agent cat /secrets/.env | grep HERMES_TTYD
-```
-
-If empty, restart the agent and wait 15 seconds, then restart ttyd:
-
-```bash
-docker restart hermes-infisical-agent
-sleep 15
-cd hermes && docker compose restart hermes-ttyd
 ```
 
 **`ops/check-prereqs.sh` reports a FAIL for secrets.tmpl**

@@ -1,0 +1,70 @@
+---
+# OpenSearch Security dynamic config — Wazuh indexer (4.14.4)
+#
+# Wires two parallel auth domains:
+#   1. internal (basicauth → internal_users.yml)  — preserves admin/kibanaserver
+#      so that Filebeat, the manager↔indexer pipeline, and the OpenSearch Security
+#      admin API keep working with their existing creds.
+#   2. openid   (jwt from Authelia)               — drives the dashboard SSO flow
+#      with passkey login via the IronNest FIDO gate.
+#
+# Apply with securityadmin.sh after every edit (see OIDC-ROLLOUT.md):
+#   docker exec -it wazuh.indexer bash -lc \
+#     "/usr/share/wazuh-indexer/plugins/opensearch-security/tools/securityadmin.sh \
+#        -cd /usr/share/wazuh-indexer/config/opensearch-security/ \
+#        -nhnv -cacert /usr/share/wazuh-indexer/config/certs/root-ca.pem \
+#        -cert /usr/share/wazuh-indexer/config/certs/admin.pem \
+#        -key /usr/share/wazuh-indexer/config/certs/admin-key.pem \
+#        -h localhost"
+#
+# The OP issuer + JWKS are fetched from Authelia at index startup AND on every
+# auth attempt. wazuh.indexer must therefore be able to resolve
+# auth.ironnest.local (AdGuard DNS) and trust the Traefik self-signed CA
+# (mounted into the JVM truststore via PKCS#12 — see docker-compose.yml).
+
+_meta:
+  type: "config"
+  config_version: 2
+
+config:
+  dynamic:
+    http:
+      anonymous_auth_enabled: false
+      xff:
+        enabled: false
+    authc:
+      # ── Authelia OIDC (passkey-driven) ─────────────────────────────────────
+      # Order 0 so the dashboard's /auth/openid/login flow is the primary path.
+      # Internal users.yml still works as fallback (order 1) for service accounts.
+      openid_auth_domain:
+        http_enabled: true
+        transport_enabled: true
+        order: 0
+        http_authenticator:
+          type: openid
+          challenge: false
+          config:
+            subject_key: preferred_username
+            roles_key: groups
+            openid_connect_url: "https://auth.ironnest.local/.well-known/openid-configuration"
+            # Trust the Traefik self-signed cert (CN=ironnest.local, SAN
+            # *.ironnest.local) when fetching OP metadata + JWKS. The cert is
+            # self-signed so it acts as its own CA. Mounted from the
+            # ingress_traefik-certs external volume at compose level.
+            openid_connect_idp:
+              enable_ssl: true
+              pemtrustedcas_filepath: /usr/share/wazuh-indexer/config/certs/traefik-ca.pem
+        authentication_backend:
+          type: noop
+
+      # ── Internal users (existing service accounts) ─────────────────────────
+      basic_internal_auth_domain:
+        description: "Authenticate via HTTP Basic against the internal user database"
+        http_enabled: true
+        transport_enabled: true
+        order: 1
+        http_authenticator:
+          type: basic
+          challenge: false
+        authentication_backend:
+          type: intern

@@ -18,7 +18,7 @@ x-logging: &default-logging
 
 services:
   dozzle:
-    image: amir20/dozzle:v10.4.1
+    image: amir20/dozzle:v10.6.5
     container_name: dozzle
     restart: unless-stopped
     logging: *default-logging
@@ -28,8 +28,11 @@ services:
       DOCKER_HOST: "tcp://socket-proxy:2375"
       # Read-only mode — UI hides any action that would require write access.
       DOZZLE_MODE: "server"
-    ports:
-      - "8888:8080"
+    # Host port closed 2026-05-27 — was previously 0.0.0.0:8888 (LAN-reachable).
+    # Dozzle is now only reachable via Traefik at https://dozzle.ironnest.local/
+    # (gated by Authelia + FIDO). Uncomment to restore for debugging.
+    # ports:
+    #   - "8888:8080"
     networks:
       - platform-net
       - ingress

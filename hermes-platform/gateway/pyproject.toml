@@ -1,0 +1,30 @@
+[project]
+name = "hermes-platform-memory-gateway"
+version = "0.1.0"
+description = "Policy-enforcing memory gateway in front of OpenViking for the IronNest Hermes platform."
+requires-python = ">=3.13"
+readme = { text = "See ../README.md and ../docs/01-ARCHITECTURE.md", content-type = "text/plain" }
+license = { text = "Internal" }
+
+[project.scripts]
+memory-gateway = "app.main:run"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "ARG", "RUF"]
+ignore = ["E501"]  # handled by formatter
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts  = "-ra -q"

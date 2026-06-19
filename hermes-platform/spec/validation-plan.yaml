@@ -1,0 +1,69 @@
+# validation-plan.yaml — every case scripts/validate-{isolation,sharing}.sh runs.
+#
+# An AI agent re-running this plan after a config change should see all
+# cases pass. Any new failure indicates regression.
+
+plan_version: 1
+generated_by: spec/validation-plan.yaml
+runs:
+  - script: scripts/healthcheck.sh
+    purpose: cross-stack smoke test
+    must_pass: true
+
+  - script: scripts/validate-isolation.sh
+    purpose: prove cross-profile DENIES
+    cases:
+      - id: ISO-01
+        description: openviking unreachable from each hermes-pf-* container
+        expected_http: "000"   # connection refused (no route)
+        invariant: I1
+
+      - id: ISO-02
+        description: each profile may READ its own viking://profiles/<self>/**
+        expected_http: "200"
+        invariant: I2
+
+      - id: ISO-03
+        description: each profile may READ viking://shared/**
+        expected_http: "200"
+        invariant: I2
+
+      - id: ISO-04
+        description: each profile may WRITE its own viking://shared/approved/<self>/**
+        expected_http: "200"
+        invariant: I2
+
+      - id: ISO-05
+        description: cross-profile READ of viking://profiles/<other>/** is DENIED
+        expected_http: "403"
+        invariant: I2
+
+      - id: ISO-06
+        description: cross-profile WRITE of viking://profiles/<other>/** is DENIED
+        expected_http: "403"
+        invariant: I2
+
+      - id: ISO-07
+        description: cross-profile WRITE of viking://shared/approved/<other>/** is DENIED
+        expected_http: "403"
+        invariant: I2
+
+      - id: ISO-08
+        description: path-traversal URIs (.. segments) are DENIED
+        expected_http: "403"
+        invariant: I2
+
+  - script: scripts/validate-sharing.sh
+    purpose: prove the curated cross-profile sharing PATH works
+    cases:
+      - id: SHA-01
+        description: profile A may write to viking://shared/approved/<A>/**
+        expected_http: "200"
+
+      - id: SHA-02
+        description: every OTHER profile may read viking://shared/approved/<A>/**
+        expected_http: "200"
+
+      - id: SHA-03
+        description: /memory/publish-approved promotes private → approved
+        expected_http: "200"

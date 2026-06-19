@@ -1,0 +1,106 @@
+# hermes-platform — Profile registry
+#
+# Schema:        spec/registry.schema.json
+# Validated by:  gateway/app/registry.py at startup and on
+#                POST /admin/reload-policies
+# Edited by:     scripts/create-profile.sh (append) and
+#                scripts/delete-profile.sh (remove)
+#
+# DO NOT put bearer tokens in this file. Tokens live in Infisical at
+# /hermes-platform/gateway → MEMORY_GATEWAY_PROFILE_TOKENS_JSON.
+# This registry references profiles only by name.
+#
+# `description` is the declarative source of truth for kanban-decompose
+# routing. scripts/sync-orchestrator-roster.sh materializes these into the
+# orchestrator container's local profile roster (profile.yaml per profile)
+# so `hermes kanban decompose` can route subtasks to the right specialist by
+# role. Without a description a profile is "undescribed" and the decomposer
+# can only fall back to the default_assignee (the orchestrator itself).
+
+profiles:
+  - name: default
+    namespace: "viking://profiles/default/"
+    approved_shared_namespace: "viking://shared/approved/default/"
+    container_name: hermes-pf-default
+    status: enabled
+    policy_file: default.policy.yaml
+    created_at: "2026-05-23T00:00:00Z"
+    tags: ["seeded", "root-profile"]
+    notes: "Successor to the existing hermes-gateway (default profile)."
+    description: "Orchestrator and coordinating agent (Dr. Smith). Plans, decomposes, and routes multi-step and cross-domain work, then synthesizes results. Handles research, architecture, planning, automation, and analysis end-to-end, and delegates coding to Steve, trading to Mark, and security to Little John. Use for task breakdown, coordination, and strategy; default fallback when no single specialist fits."
+  - name: mark
+    namespace: "viking://profiles/mark/"
+    approved_shared_namespace: "viking://shared/approved/mark/"
+    container_name: hermes-pf-mark
+    status: enabled
+    policy_file: mark.policy.yaml
+    created_at: "2026-05-23T00:00:00Z"
+    tags: ["seeded", "trading"]
+    notes: "PSE swing-trading operator persona."
+    description: "Stock-trading specialist. Handles market research and the review and evaluation of trading strategies and trading plans. Research and review only."
+  - name: steve
+    namespace: "viking://profiles/steve/"
+    approved_shared_namespace: "viking://shared/approved/steve/"
+    container_name: hermes-pf-steve
+    status: enabled
+    policy_file: steve.policy.yaml
+    created_at: "2026-05-23T00:00:00Z"
+    tags: ["seeded"]
+    notes: ""
+    description: "Software engineer. Handles implementation, coding, refactoring, bug fixing and debugging, writing and fixing tests, and release-readiness preparation. The builder who writes and changes code."
+  - name: qa
+    namespace: "viking://profiles/qa/"
+    approved_shared_namespace: "viking://shared/approved/qa/"
+    container_name: hermes-pf-qa
+    status: enabled
+    policy_file: qa.policy.yaml
+    created_at: "2026-05-23T00:00:00Z"
+    tags: ["qa", "verification"]
+    notes: "QA / verification agent. Renamed 2026-06-14 from the former 'wifey' (home/household) profile; volume migrated, Infisical path /hermes-platform/qa."
+    description: "Quality assurance and verification specialist. Independently exercises the running system: designs and runs integration, acceptance, and regression tests, performs exploratory testing, and reproduces and characterizes bugs with minimal repro steps — validates behavior against requirements and acceptance criteria rather than reviewing code. Independent of whoever built the change."
+  - name: littlejohn
+    namespace: "viking://profiles/littlejohn/"
+    approved_shared_namespace: "viking://shared/approved/littlejohn/"
+    container_name: hermes-pf-littlejohn
+    status: enabled
+    policy_file: littlejohn.policy.yaml
+    created_at: "2026-05-23T00:00:00Z"
+    tags: ["seeded"]
+    notes: ""
+    description: "Cybersecurity specialist. Handles threat modeling, secure code review, vulnerability assessment, penetration-testing analysis, and infrastructure, CI/CD, and operational security review."
+  - name: jaime
+    namespace: viking://profiles/jaime/
+    approved_shared_namespace: viking://shared/approved/jaime/
+    container_name: hermes-pf-jaime
+    status: enabled
+    policy_file: jaime.policy.yaml
+    created_at: "2026-05-24T08:19:39Z"
+    tags:
+      - dynamic
+      - provisioned
+    notes: provisioned by scripts/provision-profile.sh
+    description: "Independent reviewer and researcher. Reviews code, design, and architecture but never implements; evaluates tools, libraries, and architectural options before decisions; performs release-readiness GO/NO-GO gating and fact-checked technical research."
+  - name: bigbert
+    namespace: viking://profiles/bigbert/
+    approved_shared_namespace: viking://shared/approved/bigbert/
+    container_name: hermes-pf-bigbert
+    status: enabled
+    policy_file: bigbert.policy.yaml
+    created_at: "2026-05-24T08:19:45Z"
+    tags:
+      - dynamic
+      - provisioned
+    notes: provisioned by scripts/provision-profile.sh
+    description: "Knowledge and documentation specialist. Handles LLM Wiki lookups, citations, page proposals, and retrieval of curated knowledge and prior decisions from the wiki."
+  - name: octo
+    namespace: viking://profiles/octo/
+    approved_shared_namespace: viking://shared/approved/octo/
+    container_name: hermes-pf-octo
+    status: enabled
+    policy_file: octo.policy.yaml
+    created_at: "2026-06-12T15:31:11Z"
+    tags:
+      - dynamic
+      - provisioned
+    notes: provisioned by scripts/provision-profile.sh
+    description: "Platform operations specialist. Handles container, stack, and route health investigation and incident response; Docker Compose, Traefik/Authelia ingress, Infisical secret delivery, and networking changes; deployment verification and post-incident root-cause analysis."

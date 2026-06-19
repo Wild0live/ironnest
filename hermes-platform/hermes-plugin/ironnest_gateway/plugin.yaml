@@ -1,0 +1,8 @@
+name: ironnest_gateway
+version: 0.1.0
+description: "IronNest policy-gateway memory provider for OpenViking-backed Hermes profile memory."
+pip_dependencies:
+  - httpx
+requires_env:
+  - MEMORY_GATEWAY_URL
+  - MEMORY_GATEWAY_TOKEN

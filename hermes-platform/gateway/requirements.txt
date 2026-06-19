@@ -1,0 +1,25 @@
+# Memory Gateway runtime dependencies — pinned for reproducibility.
+#
+# `openviking` is the source of truth for fastapi / uvicorn / httpx /
+# pydantic versions; pinning conflicting versions here breaks the
+# dependency resolver. The pins below match what openviking 0.3.19 pulls
+# (verified 2026-05-23). When you bump openviking, re-resolve and update.
+#
+# Bump deliberately; re-run gateway/tests/ after any change.
+
+# OpenViking SDK — installs the openviking-server CLI too, but we only
+# need the Python client surface in the gateway. The openviking container
+# is a separate service.
+openviking==0.3.19
+
+# Framework pins matched to openviking 0.3.19's transitive set
+fastapi==0.136.1
+uvicorn[standard]==0.47.0
+pydantic==2.13.4
+pydantic-settings==2.14.1
+httpx==0.28.1
+
+# Direct deps the gateway adds on top
+PyYAML==6.0.3
+jsonschema==4.26.0
+python-json-logger==2.0.7

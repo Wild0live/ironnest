@@ -1,0 +1,119 @@
+# IronNest unified read-only data browser.
+#
+# Purpose: one VS Code "Attach to Running Container" target that exposes every
+# browse-worthy volume across the platform as a single read-only tree at /view.
+# Lets you fuzzy-find / grep across all stacks' state in one window without
+# poking each container individually.
+#
+# Lifecycle (independent of all other stacks):
+#   docker compose -f ops/ironnest-browse.compose.yml up -d
+#   docker compose -f ops/ironnest-browse.compose.yml down
+#
+# In VS Code:
+#   F1 -> "Dev Containers: Attach to Running Container" -> /ironnest-browser
+#   File -> Open Folder -> /view
+#
+# Security posture:
+#   - All mounts read-only (kernel-enforced; saves fail with EROFS)
+#   - network_mode: none (no inbound, no outbound; pure file viewer)
+#   - read_only: true on container root (only /tmp is writable, tmpfs)
+#   - All capabilities dropped, no-new-privileges
+#   - DELIBERATELY EXCLUDES secret-bearing volumes:
+#       rancher-stack_postgres-data  (Infisical secret store)
+#       hermes-platform_openviking-secrets-runtime  (rendered .env w/ API keys)
+#       ingress_traefik-certs  (TLS private keys)
+#       wazuh_*  (security audit events — keep siloed)
+#     Mounting any of those defeats the platform's secret-hygiene model even
+#     read-only, because VS Code (and screenshots) would expose contents.
+
+name: ironnest-browse
+
+services:
+  browser:
+    build:
+      context: ./ironnest-browser
+      dockerfile: Dockerfile
+    image: platform/ironnest-browser:0.1.0
+    container_name: ironnest-browser
+    restart: unless-stopped
+    command: ["tail", "-f", "/dev/null"]
+    network_mode: none
+    read_only: true
+    tmpfs:
+      # Container itself stays read-only; VS Code Server installs into
+      # /root/.vscode-server (in-memory, lost on restart — re-installs on next
+      # attach in ~10s from the host's serverCache). /tmp covers ad-hoc shell
+      # scratch. Sizes chosen so the extracted VS Code Server fits:
+      #   - Alpine VS Code Server extracted: ~350 MB
+      #   - Node.js runtime working set:     ~100 MB
+      #   - Headroom:                        ~50 MB
+      - /tmp:size=64m
+      - /root/.vscode-server:exec,size=600m
+      - /root/.vscode-server-insiders:exec,size=600m
+    cap_drop:
+      - ALL
+    cap_add:
+      # Root in the container needs DAC_READ_SEARCH to read files owned by
+      # other UIDs (per-profile data is uid 10000, etc). This is the
+      # READ-ONLY counterpart to DAC_OVERRIDE — cannot enable writes.
+      - DAC_READ_SEARCH
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          # VS Code Server (Node.js process inside the container) needs real
+          # resources when an editor is attached. When NO editor is attached
+          # the container idles around 5 MB / 0 CPU.
+          cpus: "1.0"
+          memory: 1500M
+    volumes:
+      # ── hermes-platform (memory & policy plane) ─────────────────────────
+      - hermes-platform_data-default:/view/hermes-platform/profiles/default:ro
+      - hermes-platform_data-qa:/view/hermes-platform/profiles/qa:ro
+      - hermes-platform_data-mark:/view/hermes-platform/profiles/mark:ro
+      - hermes-platform_data-steve:/view/hermes-platform/profiles/steve:ro
+      - hermes-platform_data-littlejohn:/view/hermes-platform/profiles/littlejohn:ro
+      - hermes-platform_data-jaime:/view/hermes-platform/profiles/jaime:ro
+      - hermes-platform_data-bigbert:/view/hermes-platform/profiles/bigbert:ro
+      - hermes-platform_openviking-workspace:/view/hermes-platform/openviking:ro
+      - hermes-platform_memory-gateway-log:/view/hermes-platform/audit:ro
+
+      # ── hermes (legacy stack — kept during transition) ──────────────────
+      - hermes_hermes-data:/view/hermes-legacy:ro
+
+      # ── browser-intent <-> hermes file handoffs ─────────────────────────
+      - hermes-to-browser-intent:/view/browser-intent/from-hermes:ro
+      - browser-intent-to-hermes:/view/browser-intent/to-hermes:ro
+
+      # ── openclaw ────────────────────────────────────────────────────────
+      - openclaw_codex-home:/view/openclaw/codex-home:ro
+      - rancher-stack_openclaw-home:/view/openclaw/home:ro
+
+      # ── monitoring (container metadata + log shipper state) ─────────────
+      - monitoring_container-lookups:/view/monitoring/container-lookups:ro
+      - monitoring_fluent-bit-db:/view/monitoring/fluent-bit:ro
+
+      # ── access logs (proxies) ───────────────────────────────────────────
+      - ingress_traefik-logs:/view/logs/traefik:ro
+      - egress-proxy_squid-logs:/view/logs/squid:ro
+
+volumes:
+  hermes-platform_data-default:           { external: true }
+  hermes-platform_data-qa:                { external: true }
+  hermes-platform_data-mark:              { external: true }
+  hermes-platform_data-steve:             { external: true }
+  hermes-platform_data-littlejohn:        { external: true }
+  hermes-platform_data-jaime:             { external: true }
+  hermes-platform_data-bigbert:           { external: true }
+  hermes-platform_openviking-workspace:   { external: true }
+  hermes-platform_memory-gateway-log:     { external: true }
+  hermes_hermes-data:                     { external: true }
+  hermes-to-browser-intent:               { external: true }
+  browser-intent-to-hermes:               { external: true }
+  openclaw_codex-home:                    { external: true }
+  rancher-stack_openclaw-home:            { external: true }
+  monitoring_container-lookups:           { external: true }
+  monitoring_fluent-bit-db:               { external: true }
+  ingress_traefik-logs:                   { external: true }
+  egress-proxy_squid-logs:                { external: true }

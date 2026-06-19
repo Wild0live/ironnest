@@ -1,0 +1,19 @@
+# Policy for the `qa` profile.
+# See docs/06-NAMESPACE-AND-POLICY-MODEL.md.
+#
+# Renamed 2026-06-14 from wifey.policy.yaml (the former home/household profile).
+
+profile: qa
+description: |
+  QA — quality-assurance / verification profile. Standard profile-private +
+  shared-read + own-shared-approved-write rules.
+
+read:
+  allow:
+    - "viking://shared/**"
+    - "viking://profiles/qa/**"
+
+write:
+  allow:
+    - "viking://profiles/qa/**"
+    - "viking://shared/approved/qa/**"

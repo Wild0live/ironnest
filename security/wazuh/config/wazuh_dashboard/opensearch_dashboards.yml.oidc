@@ -1,0 +1,53 @@
+# Alternate opensearch_dashboards.yml — Authelia OIDC variant.
+#
+# To enable: rename this file over opensearch_dashboards.yml, restart the
+# wazuh.dashboard container. To roll back: keep the .stock backup created by
+# the rollout script and rename it back.
+#
+# Differences from stock:
+#   * opensearch_security.auth.type: openid              (was: basicauth)
+#   * opensearch_security.openid.*                        (new block)
+#   * opensearch_security.cookie.secure: true             (HTTPS-only)
+#   * server.basePath / rewriteBasePath unchanged         (still served at /)
+#
+# Prereqs (see OIDC-ROLLOUT.md):
+#   * wazuh.dashboard has network reach to https://auth.ironnest.local
+#     (already on platform-net; AdGuard DNS resolves *.ironnest.local → traefik)
+#   * NODE_EXTRA_CA_CERTS includes the Traefik root CA (already in place for
+#     the Wazuh CA; needs to be a bundle file containing BOTH)
+#   * Authelia has the wazuh OIDC client registered with redirect_uri
+#     https://wazuh.ironnest.local/auth/openid/login
+
+server.host: 0.0.0.0
+server.port: 5601
+opensearch.hosts: https://wazuh.indexer:9200
+opensearch.ssl.verificationMode: certificate
+opensearch.requestHeadersWhitelist: ["securitytenant","Authorization","security_authentication"]
+opensearch_security.multitenancy.enabled: false
+opensearch_security.readonly_mode.roles: ["kibana_read_only"]
+server.ssl.enabled: true
+server.ssl.key: "/usr/share/wazuh-dashboard/certs/wazuh-dashboard-key.pem"
+server.ssl.certificate: "/usr/share/wazuh-dashboard/certs/wazuh-dashboard.pem"
+opensearch.ssl.certificateAuthorities: ["/usr/share/wazuh-dashboard/certs/root-ca.pem"]
+uiSettings.overrides.defaultRoute: /app/wz-home
+
+# ── OIDC SSO ────────────────────────────────────────────────────────────────
+opensearch_security.auth.type: openid
+opensearch_security.openid.connect_url: "https://auth.ironnest.local/.well-known/openid-configuration"
+opensearch_security.openid.client_id: "wazuh"
+# Client secret loaded from the OpenSearch Dashboards keystore at startup.
+# Populate it with:
+#   docker exec -it wazuh.dashboard bash -lc \
+#     "echo -n \"$OIDC_CLIENT_SECRET\" | /usr/share/wazuh-dashboard/bin/opensearch-dashboards-keystore add \
+#        --stdin --force opensearch_security.openid.client_secret"
+opensearch_security.openid.base_redirect_url: "https://wazuh.ironnest.local"
+opensearch_security.openid.scope: "openid profile email groups"
+opensearch_security.openid.logout_url: "https://auth.ironnest.local/logout"
+opensearch_security.openid.root_ca: "/usr/share/wazuh-dashboard/certs/traefik/server.crt"
+opensearch_security.openid.verify_hostnames: true
+
+# ── Session cookies ─────────────────────────────────────────────────────────
+opensearch_security.cookie.secure: true
+opensearch_security.cookie.ttl: 900000
+opensearch_security.session.ttl: 900000
+opensearch_security.session.keepalive: true

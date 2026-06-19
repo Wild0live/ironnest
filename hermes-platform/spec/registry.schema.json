@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ironnest.local/hermes-platform/spec/registry.schema.json",
+  "title": "Hermes Platform — Profile Registry",
+  "description": "Schema for registry/profiles-registry.yaml.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profiles"],
+  "properties": {
+    "profiles": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/profileEntry" },
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "profileEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name", "namespace", "approved_shared_namespace",
+        "container_name", "status", "policy_file", "created_at"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+        },
+        "namespace": {
+          "type": "string",
+          "pattern": "^viking://profiles/[a-z][a-z0-9_-]{0,31}/$"
+        },
+        "approved_shared_namespace": {
+          "type": "string",
+          "pattern": "^viking://shared/approved/[a-z][a-z0-9_-]{0,31}/$"
+        },
+        "container_name": {
+          "type": "string",
+          "pattern": "^hermes-pf-[a-z][a-z0-9_-]{0,31}$"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["enabled", "disabled", "draft"]
+        },
+        "policy_file": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,31}\\.policy\\.yaml$"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "notes": { "type": "string" },
+        "description": {
+          "type": "string",
+          "description": "One- or two-sentence role description. Materialized into the orchestrator container's profile roster by scripts/sync-orchestrator-roster.sh so the kanban decomposer can route tasks to this profile by role."
+        }
+      }
+    }
+  }
+}

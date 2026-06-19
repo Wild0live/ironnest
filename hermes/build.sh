@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Build the hermes-agent image.
+# Build the platform/hermes-agent image used by hermes-platform stack.
 #
-# Run this manually when:
-#   - The Dockerfile changes
-#   - The bundled Hermes Python package needs a refresh
-#   - hermes/start.sh detects a missing image on first run (it calls this script)
+# This image is shared between all hermes-pf-* containers and hermes-platform-ttyd.
+# The legacy hermes/ docker-compose.yml has been removed (2026-05-31) — hermes-platform
+# is the sole agent stack. This script only builds the image.
 #
-# Subsequent starts use the cached image — hermes/start.sh does NOT build.
+# Run this when:
+#   - The Dockerfile changes (e.g. version bump: update HERMES_TAG + image tag)
+#   - hermes-platform/start.sh detects a missing image on first run
 #
 # Usage:
 #   bash hermes/build.sh           # cache-friendly build
@@ -23,9 +24,10 @@ if [ "${1:-}" = "--pull" ]; then
   PULL="--pull"
 fi
 
-echo "--- building hermes-agent image $PULL ---"
+IMAGE=$(grep '^ARG HERMES_TAG=' Dockerfile | head -1 | cut -d= -f2)
+echo "--- building platform/hermes-agent:${IMAGE}-patched $PULL ---"
 echo "    (first build: ~20 min — subsequent builds use Docker layer cache)"
-docker compose build $PULL
+docker build $PULL -t "platform/hermes-agent:${IMAGE}-patched" .
 
 echo "--- build complete ---"
-docker compose images
+docker image inspect "platform/hermes-agent:${IMAGE}-patched" --format '{{.RepoTags}} {{.Size}} bytes'

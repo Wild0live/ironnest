@@ -1,0 +1,36 @@
+# namespaces.yaml — logical → native URI mapping rules
+#
+# Loaded by gateway/app/openviking_client.py at startup. If the official
+# OpenViking namespace surface ever supports native multi-tenancy, only
+# this file (and openviking_client._to_native / _from_native) changes.
+
+version: 1
+
+# The gateway accepts URIs in two top-level forms:
+#   viking://shared/<rest>
+#   viking://profiles/<profile>/<rest>
+# Both are mapped onto OpenViking's documented viking://resources/ tree.
+
+mappings:
+  - logical_prefix:  "viking://shared/"
+    native_prefix:   "viking://resources/shared/"
+    description: |
+      Collaboration/curated knowledge tree. The sub-prefix viking://shared/approved/
+      is the cross-profile collaboration sink — only that profile may write under
+      its own approved/<self>/ subtree.
+
+  - logical_prefix:  "viking://profiles/"
+    native_prefix:   "viking://resources/profiles/"
+    description: |
+      Per-profile private namespace. The gateway's policy engine ensures
+      only the profile itself may read or write under its own subtree.
+
+# Reverse map: when OpenViking returns a viking://resources/* URI in
+# search results, the gateway converts back to the logical form before
+# returning to the caller.
+
+reserved_top_level:
+  # These OpenViking native tops are NOT exposed by the gateway:
+  - "viking://resources/"   # raw; reserved for internal adapter use
+  - "viking://user/"        # native user-prefs tree; not used by hermes-platform
+  - "viking://agent/"       # native per-agent tree; not used by hermes-platform

@@ -9,6 +9,7 @@
 #   - Hermes data volume (config, sessions, memories, skills)
 #   - AdGuard conf volume
 #   - Wazuh etc + logs + indexer data + dashboard config
+#   - Authelia data volume (registered WebAuthn credentials in db.sqlite3)
 #   - All .env files across stacks (contain ENCRYPTION_KEY etc.)
 #   - Wazuh TLS certs
 #
@@ -66,6 +67,7 @@ backup_volume wazuh_wazuh_logs            wazuh-logs.tar.gz
 backup_volume wazuh_filebeat_etc          wazuh-filebeat-etc.tar.gz
 backup_volume wazuh_wazuh-indexer-data    wazuh-indexer-data.tar.gz
 backup_volume wazuh_wazuh-dashboard-config wazuh-dashboard-config.tar.gz
+backup_volume ingress_authelia-data       authelia-data.tar.gz
 
 # 3. Platform config (all .env files + wazuh TLS certs + compose files)
 log "archiving platform config (.env files, certs, compose)"

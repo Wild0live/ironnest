@@ -61,7 +61,7 @@ public LLM client ──[bearer token, rate-limit, schema validator]──► MC
 
 ```
 browser-intent/
-├── docker-compose.yml         # 3 services, 4 networks, 2 bind + 1 external volume
+├── docker-compose.yml         # 3 services, 3 networks, 2 bind + 1 external volume
 ├── Dockerfile.mcp             # Node 24 (Bookworm), runs as uid 1000 (node)
 ├── Dockerfile.worker          # Playwright 1.56.1 (Noble), runs as uid 1001 (pwuser)
 ├── start.sh                   # boot: validate env → repair egress → compose up → wait healthy
@@ -121,7 +121,8 @@ browser-intent/
 | `platform-net` | external | IronNest service LAN; mcp + worker attach here |
 | `platform-egress` | external | Sidecar/proxy network (infisical-agent, squid, adguard) |
 | `browser-internal` | internal bridge | Private mcp ↔ worker channel |
-| `ingress` | bridge | MCP's public-facing side (published on `127.0.0.1:18901` only) |
+
+> **Routing note (2026-05-31).** An earlier revision of this stack attached the `mcp` service to a fourth bridge network (`ingress`) in addition to `platform-net`. Because Docker sets the default gateway through whichever interface was attached first, and `ingress` was attached first, SYN-ACKs to inbound connections arriving on `platform-net` were routed back out through the `ingress` interface — asymmetric routing that caused all Hermes MCP connections to time out silently. The `ingress` network had no other members and served no purpose, so it was removed. `platform-net` is now the sole interface on the `mcp` container and the default gateway, resolving the issue.
 
 ### 3.2 Volumes
 
@@ -176,7 +177,7 @@ Note: there is no Dockerfile.infisical-cli. The earlier `platform/infisical-cli:
 | Required env | `BROWSER_INTENT_MCP_TOKEN`, `BROWSER_INTENT_WORKER_SECRET` (must match worker) |
 | Optional env | `BROWSER_INTENT_MCP_TOKEN_DR_SMITH`, `BROWSER_INTENT_ENABLE_DIAGNOSTICS`, rate-limit/session tunables (§10) |
 | Volumes | `./policies:ro` |
-| Networks | `ingress`, `platform-net` |
+| Networks | `platform-net` only (see §3.1 routing note) |
 | depends_on | `worker: service_healthy` |
 | Resources | CPU 0.5, mem 256M |
 | Healthcheck | `GET http://localhost:18901/healthz` |
@@ -785,6 +786,8 @@ Key incidents and design decisions captured in `~/.claude/projects/D--claude-wor
 - `project_infisical_agent_multipath_etag_bug.md` — Single-recursive-listSecrets workaround.
 - `project_hermes_to_browser_intent_inbox.md` — Shared-volume file exchange (Hermes uid 10000 ↔ pwuser uid 1001).
 - `feedback_hermes_mcp_tools_cache.md` — Hermes caches tools/list per connection; restart after tool-surface changes.
+- `feedback_hermes_mcp_initial_connection_giveup.md` — Hermes gateway gives up MCP connection after 3 failed initial attempts and never retries; fix the network before restarting the gateway.
+- **2026-05-31 network fix** — `mcp` service was on two networks (`ingress` + `platform-net`). Docker defaulted the gateway to `ingress`, causing asymmetric routing (SYN-ACKs returned via the wrong interface) and all Hermes MCP connections timing out. Fixed by removing the unused `ingress` network entirely; `mcp` is now on `platform-net` only. See §3.1 routing note.
 
 ---
 

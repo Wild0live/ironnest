@@ -1,0 +1,50 @@
+###############################################################################
+# OpenViking server config — rendered at container start by entrypoint.sh
+#
+# Source schema: https://github.com/volcengine/OpenViking (README §Config)
+#
+# Placeholders use the ${VAR} form and are substituted via `envsubst`.
+# Values come from the sidecar-rendered /secrets/.env (Infisical → folder
+# /hermes-platform/openviking) plus a few static defaults below.
+###############################################################################
+
+[storage]
+workspace = /var/lib/openviking/workspace
+
+[log]
+level  = info
+output = stdout
+
+###############################################################################
+# Embedding provider — used by `ov find` semantic search.
+#
+# Default: volcengine/Doubao (matches OpenViking's primary upstream). Override
+# by setting EMBEDDING_PROVIDER in Infisical /hermes-platform/openviking.
+###############################################################################
+[embedding.dense]
+provider  = ${EMBEDDING_PROVIDER:-volcengine}
+model     = ${EMBEDDING_MODEL:-doubao-embedding-text-240715}
+dimension = ${EMBEDDING_DIMENSION:-2560}
+api_base  = ${EMBEDDING_API_BASE:-https://ark.cn-beijing.volces.com/api/v3}
+api_key   = ${EMBEDDING_API_KEY}
+
+###############################################################################
+# Vision-language model — used for image/PDF ingestion via `ov add-resource`.
+#
+# Optional. If VLM_API_KEY is unset, leave the [vlm] section out at runtime
+# (entrypoint.sh detects this).
+###############################################################################
+[vlm]
+provider = ${VLM_PROVIDER:-volcengine}
+model    = ${VLM_MODEL:-doubao-vision-pro-32k-241028}
+api_base = ${VLM_API_BASE:-https://ark.cn-beijing.volces.com/api/v3}
+api_key  = ${VLM_API_KEY}
+
+###############################################################################
+# Server bind — must stay 0.0.0.0 inside the container; network isolation
+# comes from the internal Docker network (hermes-platform-mem-net), not
+# from the listener.
+###############################################################################
+[server]
+host = 0.0.0.0
+port = 1933

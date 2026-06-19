@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ironnest.local/hermes-platform/spec/policies.schema.json",
+  "title": "Hermes Platform — Profile Policy",
+  "description": "Schema for policies/<profile>.policy.yaml files. Validated at gateway startup and on POST /admin/reload-policies.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profile", "read", "write"],
+  "properties": {
+    "profile": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+      "description": "Lowercase profile name; must match the registry entry and the policy filename (<profile>.policy.yaml)."
+    },
+    "description": {
+      "type": "string",
+      "description": "Free-form documentation. Not used by the policy engine."
+    },
+    "read":  { "$ref": "#/$defs/ruleSet" },
+    "write": { "$ref": "#/$defs/ruleSet" }
+  },
+  "$defs": {
+    "ruleSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allow": { "$ref": "#/$defs/uriPatternList" },
+        "deny":  { "$ref": "#/$defs/uriPatternList" }
+      }
+    },
+    "uriPatternList": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^viking://(shared|profiles)(/.*)?$",
+        "description": "Glob pattern. * matches one segment; ** matches zero or more segments; ? matches one char."
+      },
+      "uniqueItems": true
+    }
+  }
+}

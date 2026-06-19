@@ -1,0 +1,298 @@
+# system.manifest.yaml — canonical machine-readable manifest for hermes-platform
+#
+# This file + docs/00-AI-REBUILD-MANIFEST.md are the two entry points
+# another AI/LLM agent uses to reconstruct the system from scratch.
+# Keep them in sync.
+
+manifest_version: 2
+stack_name: hermes-platform
+stack_kind: on-demand
+current_service_count: 14
+upstream_references:
+  hermes:      "https://github.com/NousResearch/hermes-agent"
+  openviking:  "https://github.com/volcengine/OpenViking"
+  ollama:      "https://ollama.com/"
+  infisical:   "https://infisical.com/"
+
+contains:
+  - services:       spec/services.yaml
+  - networks:       spec/services.yaml  # networks block
+  - volumes:        spec/services.yaml  # volumes  block
+  - namespaces:     spec/namespaces.yaml
+  - policy_schema:  spec/policies.schema.json
+  - registry_schema: spec/registry.schema.json
+  - profile_schema: spec/profile.schema.json
+  - rebuild_checklist: spec/rebuild-checklist.yaml
+  - validation_plan:   spec/validation-plan.yaml
+
+invariants:
+  - id: I1
+    description: |
+      OpenViking publishes NO host ports. It is reachable ONLY from the
+      memory-gateway container via the internal hermes-platform-mem-net
+      network. A successful curl from any hermes-pf-* container to
+      http://openviking:1933/ is a SECURITY REGRESSION.
+    verified_by: scripts/healthcheck.sh, scripts/validate-isolation.sh
+
+  - id: I2
+    description: |
+      Every memory access goes through memory-gateway. The gateway
+      enforces deny-first policy from policies/<profile>.policy.yaml.
+      No hermes-pf-* container has direct network or volume access to
+      OpenViking's data.
+    verified_by: docs/08-SECURITY-MODEL.md §"Defense in depth"
+
+  - id: I3
+    description: |
+      Per-profile DATA volumes (/opt/data) are NOT shared. hermes-pf-mark
+      mounts ONLY hermes-platform_data-mark at /opt/data; a kernel escape
+      cannot read another profile's SOUL.md because the volume is not
+      mounted. SCOPED EXCEPTION: the shared artifact tree at /opt/shared
+      (host bind ./shared) IS cross-agent readable BY DESIGN — own slice
+      read-write at /opt/shared/mine, whole tree read-only at
+      /opt/shared/all. This exception applies to /opt/shared ONLY; /opt/data
+      isolation is unchanged. The shared tree is NOT audited (see
+      docs/08-SECURITY-MODEL.md §"Shared artifact exchange").
+    verified_by: docker-compose.yml volume bindings
+
+  - id: I4
+    description: |
+      Bearer tokens never appear in this repo. Tokens live in Infisical
+      at /hermes-platform/gateway (MEMORY_GATEWAY_PROFILE_TOKENS_JSON)
+      and per-profile at /hermes-platform/<profile> (MEMORY_GATEWAY_TOKEN),
+      injected at process start by /usr/local/bin/with-infisical.
+    verified_by: .gitignore, grep audit
+
+  - id: I5
+    description: |
+      Existing SOUL.md content is preserved. scripts/patch-souls.sh
+      backs up to SOUL.md.bak.<epoch> before mutating, and replaces
+      ONLY the `## OpenViking Memory Policy` section.
+    verified_by: scripts/patch-souls.sh (dry-run diff)
+
+  - id: I6
+    description: |
+      Normal Hermes conversations use the in-process ironnest_gateway
+      MemoryProvider to call memory-gateway for pre-answer recall and
+      post-answer persistence. Reachable gateway HTTP alone does not
+      prove the Hermes lifecycle integration is active.
+    verified_by: scripts/validate-conversational-memory.sh
+
+  - id: I7
+    description: |
+      Mission Control is an operator UI/control plane, not the memory policy
+      kernel. It stays on platform-net only, holds no OpenViking key, profile
+      bearer token, or Infisical machine identity credential, and reaches
+      profile agents only through their token-gated in-container chat bridges
+      on port 8011. It must not be added to hermes-platform-app-net or
+      hermes-platform-mem-net.
+    verified_by: docker-compose.yml mission-control service; docs/02-SERVICES.md
+
+  - id: I8
+    description: |
+      The shared Hermes Kanban board is intentionally cross-profile, but only
+      through the dedicated hermes-platform_kanban-shared volume mounted at
+      /opt/kanban. It holds board state, workspaces, and worker logs, and must
+      remain secret-free. This does not weaken /opt/data isolation: profile
+      SOUL, auth, sessions, and private state stay in one volume per profile.
+      Manual runs execute in the assignee profile's own container; auto-dispatch
+      is per-profile opt-in.
+    verified_by: docker-compose.yml kanban-shared mounts; agent-bridge/agent-chat-bridge.py /kanban actions
+
+dependencies:
+  external_networks:    [platform-net, platform-egress]
+  external_services:    [infisical, squid, adguard]
+  external_images:      [platform/hermes-agent:v2026.6.5-patched, ollama/ollama:0.4.6, infisical/cli@sha256:dba406b35e5819632412c561bfa46e6185e04c6d76175dc82bf97c4ff53745d7]
+  external_volumes_ro:  [hermes_hermes-data]  # ONLY read during migration
+
+seeded_profiles:
+  - default
+  - mark
+  - steve
+  - qa            # renamed from wifey 2026-06-14
+  - littlejohn
+
+enabled_dynamic_profiles:
+  - jaime
+  - bigbert
+  - octo          # platform-ops, added 2026-06-12
+
+extension_points:
+  - id: EP-MCP
+    description: Add MCP servers per profile via tools.yaml; gateway exposes nothing here yet.
+    docs: docs/14-MCP-INTEGRATION-NOTES.md
+  - id: EP-K8S
+    description: Migration target = K8s. Services are stateless except for named volumes.
+    docs: docs/13-KUBERNETES-MIGRATION-NOTES.md
+  - id: EP-VAULT
+    description: Replace Infisical with Vault by swapping with-infisical.sh.
+    docs: docs/08-SECURITY-MODEL.md
+  - id: EP-OBSERVABILITY
+    description: Prometheus/Grafana/OTel hooks — gateway already emits structured JSON.
+    docs: docs/12-OPERATIONS-RUNBOOK.md
+  - id: EP-MISSION-CONTROL
+    description: Extend the browser ops dashboard through mission-control while keeping it separate from memory-gateway.
+    docs: docs/02-SERVICES.md
+  - id: EP-KANBAN
+    description: Extend shared work coordination through /opt/kanban and bridge-mediated structured Kanban actions.
+    docs: docs/02-SERVICES.md, mission-control/KANBAN-PHASE1-PLAN.md
+
+# ──────────────────────────────────────────────────────────────────────────
+# Known quirks — non-obvious behaviors AI agents should know about BEFORE
+# changing anything. Every entry was discovered during the 2026-05-23
+# deployment after burning real time on it.
+#
+# Full prose explanations in docs/17-LLM-HANDOFF.md §"Quirks discovered
+# during the live 2026-05-23 deployment" and docs/11-TROUBLESHOOTING.md.
+# ──────────────────────────────────────────────────────────────────────────
+known_quirks:
+
+  - id: Q1
+    area: openviking-api
+    description: |
+      Real REST endpoints are /api/v1/content/* and /api/v1/fs/* and
+      /api/v1/search/*. Health is /health, not /status or /. Re-verify
+      from /openapi.json after any version bump.
+    impacts: [gateway/app/openviking_client.py]
+
+  - id: Q2
+    area: openviking-auth
+    description: |
+      ROOT api_key requests to tenant-scoped APIs require X-OpenViking-Account,
+      X-OpenViking-User, X-OpenViking-Agent headers (we pin all to "default").
+    impacts: [gateway/app/openviking_client.py]
+
+  - id: Q3
+    area: openviking-write
+    description: |
+      POST /api/v1/content/write defaults to mode=replace which 404s on new
+      files. Adapter does create-or-replace fallback after auto-mkdir of parent.
+    impacts: [gateway/app/openviking_client.py write()]
+
+  - id: Q4
+    area: openviking-mkdir
+    description: |
+      POST /api/v1/fs/mkdir is recursive (creates all ancestors) and idempotent
+      (returns 200 on existing dirs, no "already exists" error).
+    impacts: [gateway/app/openviking_client.py _ensure_parent_dir()]
+
+  - id: Q5
+    area: openviking-config
+    description: |
+      ov.conf is JSON not INI. Built by Python in entrypoint.sh from env vars.
+    impacts: [openviking/entrypoint.sh]
+
+  - id: Q6
+    area: openviking-listen
+    description: |
+      Must set server.host=0.0.0.0 in ov.conf. Default is localhost-only,
+      making openviking unreachable from other containers on the same network.
+    impacts: [openviking/entrypoint.sh]
+
+  - id: Q7
+    area: openviking-pypi
+    description: |
+      Need `pip install openviking[gemini]` extra for google-genai. Even if
+      using Ollama via openai-compat, leaving the extra is harmless.
+    impacts: [openviking/Dockerfile]
+
+  - id: Q8
+    area: with-infisical-env-scope
+    description: |
+      Env vars injected by `with-infisical` are visible ONLY in the wrapped
+      process tree. Fresh `docker exec` shells do NOT inherit them.
+      /proc/1/environ is tini (no injected env).
+    impacts: [scripts/validate-isolation.sh, scripts/validate-sharing.sh]
+    fix: Wrap docker exec in with-infisical (already done in validate scripts).
+
+  - id: Q9
+    area: msys-path-mangling
+    description: |
+      Git Bash on Windows rewrites /opt/path → C:/Program Files/Git/opt/path
+      when passed as a docker exec argument. Use //opt/path (double slash) to
+      defeat conversion. -v mounts: use cygpath -w for host, // for container.
+    impacts: [scripts/*.sh, any docker exec from Git Bash]
+
+  - id: Q10
+    area: rancher-desktop-port-forwarder
+    description: |
+      RD's host-switch port forwarder caches stale port mappings after
+      container restarts. Manifests as host curl timeout even when container
+      listens internally. Fixes (in order): wait 30-60s; rdctl shutdown/start;
+      use in-container path (always works).
+    impacts: [healthcheck.sh marks this as WARN not FAIL]
+
+  - id: Q11
+    area: rancher-desktop-host-network
+    description: |
+      Docker containers in RD's WSL2 distro CANNOT reach the Windows host on
+      any IP (host.docker.internal, 192.168.x.x, 172.17.80.1). The distro
+      itself can, but containers inside it cannot. Hyper-V firewall drops the
+      SYN after NAT. Blocks native-GPU host services.
+    impacts: ["task #16", "decision D-010"]
+
+  - id: Q12
+    area: compose-yaml-merge
+    description: |
+      YAML <<: *anchor does NOT deep-merge environment: block. Re-declaring
+      environment: REPLACES the anchor's environment entirely. Use a separate
+      env anchor (x-hermes-env-common) and merge it AT THE MAPPING LEVEL.
+    impacts: ["docker-compose.yml hermes-pf-* services"]
+
+  - id: Q13
+    area: infisical-cli
+    description: |
+      CLI 0.43.76 gotchas: no --recursive on export (use --include-imports);
+      `infisical secrets folders create` (not `folders create`); folders MUST
+      exist before secrets set (no auto-create); `secrets list` returns empty
+      table on non-existent path (false positive); 0.0.0.0 must be in
+      NO_PROXY when CLI tools target their own 0.0.0.0:port server.
+    impacts: [secrets-runtime/*.sh scripts, with-infisical.sh]
+
+  - id: Q14
+    area: ollama-windows-env
+    description: |
+      OLLAMA_HOST=0.0.0.0:11434 must be MACHINE scope (or set in current shell
+      before Start-Process). USER scope works for the foreground process but
+      Start-Process inherits current-process env, not persisted env, so a fresh
+      ollama launch from a stale shell still binds to 127.0.0.1.
+    impacts: ["task #16 (closed wontfix)"]
+
+  - id: Q15
+    area: policy-engine
+    description: |
+      Default-deny is implicit. Blanket deny rules in policies break own-
+      namespace access (deny wins over allow). Only list `allow:` rules;
+      use explicit `deny:` only for narrow carve-outs inside an allow.
+    impacts: ["policies/*.policy.yaml", "docs/16-DECISION-LOG.md D-009"]
+
+  - id: Q16
+    area: list-profiles-helper
+    description: |
+      scripts/_common.sh provides list_profiles() that falls back to listing
+      policies/*.policy.yaml basenames when yq is absent. Read-only scripts
+      don't require yq on the host. Profile-mutating scripts (create/delete)
+      still need yq.
+    impacts: [scripts/_common.sh, scripts/validate-*.sh]
+
+  - id: Q17
+    area: management-plane-trust
+    description: |
+      hermes-platform-ttyd is a management sidecar that mounts ALL profile
+      volumes (default at /opt/data; others at /opt/data/profiles/<p>/). This
+      is BY DESIGN — operators need cross-profile UI access. The agent
+      containers (hermes-pf-*) stay volume-isolated. Trust boundary: anyone
+      with the ttyd password gets full multi-profile filesystem access, but
+      NOT gateway-namespace bypass (gateway still enforces per-bearer-token).
+    impacts: ["docker-compose.yml hermes-platform-ttyd", "docs/16-DECISION-LOG.md D-011"]
+
+  - id: Q18
+    area: mission-control-boundary
+    description: |
+      Mission Control talks to profiles through the in-container
+      agent-chat-bridge on port 8011. The bridge runs as the profile's hermes
+      user and owns that profile's ACP chat process, file upload/download
+      directory, SOUL.md edits, model edits, and role-summary generation.
+      Mission Control itself should not get Docker socket access, OpenViking
+      credentials, profile memory tokens, or membership in app-net/mem-net.
+    impacts: ["mission-control/app/main.py", "agent-bridge/agent-chat-bridge.py", "docker-compose.yml mission-control"]

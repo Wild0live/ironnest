@@ -1,0 +1,25 @@
+infisical:
+  address: "http://infisical:8090"
+
+auth:
+  type: "universal-auth"
+  config:
+    client-id: "/tmp/client-id"
+    client-secret: "/tmp/client-secret"
+
+sinks:
+  - type: "file"
+    config:
+      path: "/secrets/agent-token"
+
+# Renders the OIDC client secret (raw, NOT the PBKDF2 hash) into an env file
+# that wazuh.dashboard loads via env_file. The dashboard's keystore is
+# populated from $WAZUH_OIDC_CLIENT_SECRET by the dashboard entrypoint hook.
+#
+# Single direct-secret lookup — no `range`-list calls. Sidesteps the Infisical
+# CLI ≤ 0.43.76 shared-etag bug (see memory/project_infisical_agent_multipath_etag_bug.md).
+templates:
+  - source-path: "/agent-config/secrets.tmpl"
+    destination-path: "/secrets/.env"
+    config:
+      polling-interval: "60s"

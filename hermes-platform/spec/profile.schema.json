@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ironnest.local/hermes-platform/spec/profile.schema.json",
+  "title": "Hermes Platform — Profile Template Substitution Variables",
+  "description": "Variables that scripts/create-profile.sh substitutes into profile-template/* files.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profile_name", "container_name", "namespace", "approved_shared_namespace", "created_at"],
+  "properties": {
+    "profile_name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+      "description": "Substitutes <PROFILE-NAME>"
+    },
+    "profile_name_upper": {
+      "type": "string",
+      "description": "Substitutes <PROFILE-NAME-UPPER>. Derived: profile_name.upper()."
+    },
+    "container_name": {
+      "type": "string",
+      "pattern": "^hermes-pf-[a-z][a-z0-9_-]{0,31}$",
+      "description": "Substitutes <CONTAINER-NAME>"
+    },
+    "namespace": {
+      "type": "string",
+      "pattern": "^viking://profiles/[a-z][a-z0-9_-]{0,31}/$"
+    },
+    "approved_shared_namespace": {
+      "type": "string",
+      "pattern": "^viking://shared/approved/[a-z][a-z0-9_-]{0,31}/$"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "profile_token": {
+      "type": "string",
+      "minLength": 32,
+      "description": "Bearer token. MUST be set in Infisical, NEVER in templates."
+    }
+  }
+}

@@ -1,0 +1,30 @@
+# USER.md — <PROFILE-NAME-UPPER>
+
+<!--
+  Declarative facts about the human(s) this profile interacts with.
+  Imperative rules live in SOUL.md; volatile state lives in MEMORY.md.
+
+  Sections are §-separated per the existing hermes convention. Bots
+  parse `§ key: value` entries; humans read free-form prose between
+  separators.
+-->
+
+§ profile_name: <PROFILE-NAME>
+§ created_at:   <CREATED-AT>
+§ canonical_namespace: viking://profiles/<PROFILE-NAME>/
+§ approved_shared_namespace: viking://shared/approved/<PROFILE-NAME>/
+
+## Human(s) this profile serves
+
+(Replace with descriptive prose. Do not put PII secrets here; reference
+Infisical paths only.)
+
+## Communication channels
+
+- Telegram bot:  (set by Infisical at /hermes-platform/<PROFILE-NAME>)
+- Preferred language: en
+- Tone:                neutral
+
+## Preferences
+
+(Append `§ key: value` lines as the relationship develops.)

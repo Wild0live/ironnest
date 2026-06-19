@@ -1,0 +1,17 @@
+# Policy for the `steve` profile.
+# See docs/06-NAMESPACE-AND-POLICY-MODEL.md.
+
+profile: steve
+description: |
+  Steve — see /opt/data/profiles/steve/SOUL.md. Standard profile-private
+  + shared-read + own-shared-approved-write rules.
+
+read:
+  allow:
+    - "viking://shared/**"
+    - "viking://profiles/steve/**"
+
+write:
+  allow:
+    - "viking://profiles/steve/**"
+    - "viking://shared/approved/steve/**"

@@ -1,0 +1,17 @@
+# Policy for the `littlejohn` profile.
+# See docs/06-NAMESPACE-AND-POLICY-MODEL.md.
+
+profile: littlejohn
+description: |
+  LittleJohn — see /opt/data/profiles/littlejohn/SOUL.md. Standard
+  profile-private + shared-read + own-shared-approved-write rules.
+
+read:
+  allow:
+    - "viking://shared/**"
+    - "viking://profiles/littlejohn/**"
+
+write:
+  allow:
+    - "viking://profiles/littlejohn/**"
+    - "viking://shared/approved/littlejohn/**"

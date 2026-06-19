@@ -1,0 +1,103 @@
+---
+# Authelia main config — passkey-first single-factor login for IronNest.
+#
+# Auth flow: user hits any *.ironnest.local URL → Traefik forward-auths to
+# Authelia → if no valid session, redirected to https://auth.ironnest.local/
+# → user logs in with passkey (FIDO key) → cookie set for .ironnest.local
+# → request forwarded to backend.
+#
+# Bootstrap admin password is in secrets/bootstrap-password.txt — use it for
+# the first login only, then register a passkey. The argon2id hash of that
+# password is in users.yml. Keep the password in your password manager as a
+# fallback if you lose the FIDO key.
+#
+# Reference: https://www.authelia.com/configuration/
+
+theme: dark
+
+server:
+  address: 'tcp://0.0.0.0:9091/'
+
+log:
+  level: info
+  format: json
+
+# We rely on passkey (WebAuthn) as the sole factor. TOTP disabled to keep
+# the login UI focused on the passkey button.
+totp:
+  disable: true
+
+webauthn:
+  disable: false
+  display_name: 'IronNest'
+  attestation_conveyance_preference: indirect
+  # Allow login by tapping a passkey instead of typing a username+password.
+  # Counts as one_factor (matches access_control.default_policy below).
+  enable_passkey_login: true
+  selection_criteria:
+    attachment: ''            # accept both USB security keys and Windows Hello
+    discoverability: preferred
+    user_verification: preferred
+
+authentication_backend:
+  password_reset:
+    disable: true   # no SMTP wired up; resets handled by editing users.yml
+  file:
+    path: /config/users.yml
+    password:
+      algorithm: argon2
+
+access_control:
+  default_policy: one_factor
+  rules:
+    # Dummy two_factor rule. Authelia's user-portal hides the WebAuthn
+    # registration UI unless *some* rule requires two_factor. This rule
+    # targets a host that doesn't exist, so it never matches real traffic.
+    - domain: 'unused-two-factor.ironnest.local'
+      policy: two_factor
+
+session:
+  cookies:
+    - domain: 'ironnest.local'
+      authelia_url: 'https://auth.ironnest.local/'
+      default_redirection_url: 'https://dozzle.ironnest.local/'
+      name: authelia_session
+      same_site: lax
+      inactivity: '1h'
+      expiration: '4h'
+      remember_me: '0'   # disable — every new session needs a fresh passkey tap
+
+storage:
+  local:
+    path: /data/db.sqlite3
+
+# We have no SMTP wired up. Authelia requires *some* notifier configured;
+# filesystem notifier writes notifications to a file (we won't use them since
+# password_reset is disabled and webauthn registration goes through the UI).
+notifier:
+  disable_startup_check: true
+  filesystem:
+    filename: /data/notifications.txt
+
+identity_validation:
+  reset_password:
+    jwt_lifespan: '5m'
+
+# ── OIDC OpenID Provider ─────────────────────────────────────────────────────
+# Authelia plays the OP role for Wazuh's OpenSearch Security OIDC backend.
+# The user's browser is redirected here from the dashboard, taps a passkey,
+# and gets a redirect back with an authorization code. The dashboard exchanges
+# the code for an ID token over the back channel.
+#
+# Secrets:
+#   - hmac_secret: loaded from /oidc-secrets/oidc-hmac.txt via _FILE env var
+#                  (AUTHELIA_IDENTITY_PROVIDERS_OIDC_HMAC_SECRET_FILE)
+#   - jwks[0].key: loaded from /oidc-secrets/oidc-jwks.pem via _FILE env var
+#                  (AUTHELIA_IDENTITY_PROVIDERS_OIDC_JWKS_0_KEY_FILE)
+#   - client_secret (below): PBKDF2-SHA512 hash of the raw secret stored in
+#                  Infisical at /wazuh-oidc/WAZUH_OIDC_CLIENT_SECRET. Rotate
+#                  both together via security/wazuh/bootstrap-oidc-secrets.sh.
+# The entire identity_providers.oidc block (hmac_secret, jwks, cors, clients)
+# is rendered by ingress-infisical-agent into /oidc-secrets/oidc-snippet.yml
+# and loaded via a second --config flag on the authelia command line. Keeps
+# secrets out of this file and makes rotation a re-render rather than an edit.

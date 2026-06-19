@@ -1,0 +1,28 @@
+# MEMORY.md — <PROFILE-NAME-UPPER>
+
+<!--
+  Declarative *facts* the profile has learned — not chain-of-thought,
+  not scratch reasoning. Long-term durable working memory lives in
+  OpenViking under viking://profiles/<PROFILE-NAME>/memories/. This
+  on-disk MEMORY.md is for facts the agent must read at every session
+  start (the "L0 always-load" set).
+
+  Sections are §-separated per the existing hermes convention.
+-->
+
+§ schema_version: 1
+§ last_compacted: <CREATED-AT>
+
+## Permanent facts
+
+(One bullet per fact. Append-only; compactions go through
+`POST /memory/publish-approved` to move durable facts up to OpenViking.)
+
+## Active tasks
+
+(Profile's current in-flight items. Migrate completed items to
+OpenViking under viking://profiles/<PROFILE-NAME>/tasks/done/.)
+
+## Open questions
+
+(Things this profile has asked and not yet answered.)
