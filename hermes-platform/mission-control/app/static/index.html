@@ -33,6 +33,10 @@
             <svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
             <span>Tasks</span>
           </button>
+          <button class="nav-item" data-view="approvals">
+            <svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+            <span>Approvals</span><span id="approvalBadge" class="nav-badge" hidden>0</span>
+          </button>
           <button class="nav-item" data-view="reports">
             <svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="13" y2="16"/></svg>
             <span>Reports</span>
@@ -110,6 +114,24 @@
               <div id="agentList" class="agent-list"></div>
             </section>
           </div>
+        </section>
+
+        <section class="view" id="view-approvals">
+          <section class="panel approvals-panel">
+            <div class="panel-head approvals-head">
+              <div><h2>Mission Control Approvals</h2><p>Octo’s Docker requests stay pending until an operator approves and executes them.</p></div>
+              <button id="requestApprovalBtn" class="approval-request">Request review</button>
+            </div>
+            <p id="approvalRunnerHint" class="approval-runner"></p>
+            <div class="approval-toolbar" role="toolbar" aria-label="Approval views">
+              <div class="approval-tabs" id="approvalTabs"><button type="button" class="active" data-approval-view="pending">Needs approval</button><button type="button" data-approval-view="progress">In progress</button><button type="button" data-approval-view="history">History</button></div>
+              <input id="approvalSearch" type="search" class="conv-search" placeholder="Search approvals…" aria-label="Search approvals" />
+              <select id="approvalRequesterFilter" aria-label="Filter by requester"><option value="">All agents</option></select>
+              <select id="approvalRiskFilter" aria-label="Filter by risk"><option value="">All risk levels</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="critical">Critical</option></select>
+              <label class="approval-archive-toggle"><input type="checkbox" id="approvalArchivedToggle" /> Include archived</label>
+            </div>
+            <div id="approvalList" class="approval-list"><p class="empty">Loading approvals…</p></div>
+          </section>
         </section>
 
         <section class="view" id="view-agent">
@@ -319,6 +341,29 @@
           <button value="cancel">Cancel</button>
           <button value="submit">Create</button>
         </menu>
+      </form>
+    </dialog>
+
+    <dialog id="approvalRequestDialog" class="approval-dialog">
+      <button type="button" class="dialog-close" aria-label="Close">✕</button>
+      <form method="dialog" id="approvalRequestForm">
+        <h2>Request Docker action review</h2>
+        <p class="dialog-hint">This only creates a request. It cannot run until an operator explicitly approves it.</p>
+        <label>Action<select name="action"><option value="restart">Restart container</option><option value="start">Start container</option><option value="stop">Stop container</option></select></label>
+        <label>Target<select name="target" id="operationTarget" required></select></label>
+        <label>Reason<textarea name="reason" required minlength="3" maxlength="1000" placeholder="Operational context for the approver"></textarea></label>
+        <menu><button value="cancel">Cancel</button><button value="submit" class="primary">Request review</button></menu>
+      </form>
+    </dialog>
+
+    <dialog id="approvalExecuteDialog" class="approval-dialog">
+      <button type="button" class="dialog-close" aria-label="Close">✕</button>
+      <form method="dialog" id="approvalExecuteForm">
+        <h2>Approve and execute</h2>
+        <p id="approvalExecuteSummary" class="dialog-hint"></p>
+        <label>Operator name<input name="approved_by" required maxlength="80" autocomplete="name" placeholder="Your name" /></label>
+        <label>Approval note <span>(optional)</span><textarea name="note" maxlength="500" placeholder="What you reviewed"></textarea></label>
+        <menu><button value="cancel">Cancel</button><button value="submit" class="primary">Approve &amp; execute</button></menu>
       </form>
     </dialog>
 

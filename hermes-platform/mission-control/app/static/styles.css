@@ -138,6 +138,8 @@ nav {
   border-color: var(--line);
 }
 
+.nav-badge { margin-left: auto; min-width: 20px; height: 20px; padding: 0 6px; display: inline-grid; place-items: center; border-radius: 999px; background: var(--amber); color: var(--ink); font-size: 11px; font-weight: 800; }
+
 .token-box {
   margin-top: auto;
   display: grid;
@@ -1391,6 +1393,51 @@ menu {
 }
 .settings-status { color: var(--muted); font-size: 12px; min-height: 16px; margin: 8px 0 0; }
 .settings-dialog menu button.primary { color: var(--green); border-color: #244e3a; }
+
+/* ── Approval-gated Docker operations ────────────────────────────────────── */
+.approvals-panel { max-width: 980px; }
+.approvals-head { align-items: flex-start; gap: 18px; }
+.approvals-head > div p { color: var(--muted); font-size: 13px; margin: 7px 0 0; }
+.approval-request { margin-left: auto; background: var(--blue); color: #0d1728; border-color: var(--blue); font-weight: 750; }
+.approval-runner { color: var(--muted); font-size: 12px; margin: 15px 0; padding: 9px 11px; background: var(--panel-soft); border-left: 3px solid var(--amber); }
+.approval-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 14px 0; }
+.approval-tabs { display: flex; gap: 4px; }
+.approval-tabs button { font-size: 12px; padding: 7px 9px; color: var(--muted); }
+.approval-tabs button.active { color: var(--text); border-color: var(--blue); background: #1b3554; }
+.approval-toolbar .conv-search { width: min(230px, 100%); }
+.approval-toolbar select { min-height: 32px; max-width: 150px; }
+.approval-archive-toggle { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.approval-group { border: 1px solid var(--line); border-radius: 9px; padding: 0 12px 12px; background: var(--panel-soft); }
+.approval-group summary { cursor: pointer; padding: 12px 0; color: var(--text); font-size: 13px; }
+.approval-group summary span { color: var(--muted); margin-left: 8px; }
+.approval-group .approval-card { margin-top: 8px; }
+.approval-list { display: grid; gap: 10px; }
+.approval-card { display: flex; gap: 18px; justify-content: space-between; padding: 15px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-soft); }
+.approval-card-main { min-width: 0; }
+.approval-card-title { display: flex; align-items: center; gap: 10px; }
+.approval-requester-avatar { display: inline-flex; flex: none; }
+.approval-requester-avatar .ava { flex: none; }
+.approval-card-title p, .approval-reason, .approval-detail { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+.approval-reason { max-width: 620px; line-height: 1.45; }
+.approval-plan { max-width: 760px; margin-top: 10px; color: var(--muted); font-size: 12px; }
+.approval-plan summary { cursor: pointer; color: var(--blue); }
+.approval-plan pre { max-height: 280px; overflow: auto; margin: 8px 0 0; padding: 10px; white-space: pre-wrap; word-break: break-word; color: var(--text); background: #10141b; border: 1px solid var(--line); border-radius: 6px; }
+.approval-card-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; align-content: center; }
+.approval-card-actions button { min-height: 32px; white-space: nowrap; }
+.approval-execute { background: var(--green); color: #092116; border-color: var(--green); font-weight: 750; }
+.approval-status { text-transform: capitalize; font-size: 11px; font-weight: 750; padding: 4px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.approval-status.pending_approval { color: var(--amber); border-color: #6f5424; }
+.approval-status.executing { color: var(--blue); border-color: #31588d; }
+.approval-status.executed { color: var(--green); border-color: #245438; }
+.approval-status.failed, .approval-status.expired, .approval-status.unknown { color: var(--red); border-color: #74333b; }
+.approval-card-actions small { color: var(--muted); font-size: 11px; }
+.approval-dialog { width: min(480px, calc(100vw - 32px)); }
+.approval-dialog form { display: grid; gap: 11px; }
+.approval-dialog label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
+.approval-dialog label span { color: var(--muted); font-weight: 400; }
+.approval-dialog textarea { min-height: 85px; }
+
+@media (max-width: 620px) { .approval-card { flex-direction: column; } .approval-card-actions { justify-content: flex-start; } .approval-request { margin-left: 0; } .approvals-head { flex-direction: column; } }
 
 .agent-panel {
   display: flex;

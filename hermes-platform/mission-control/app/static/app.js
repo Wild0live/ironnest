@@ -15,6 +15,7 @@ const KANBAN_COLUMNS = [
 // columns (todo/triage/running/review) are lifecycle-managed, not free moves.
 const KANBAN_DROP_TARGETS = new Set(["ready", "blocked", "done", "archived"]);
 const kanban = { tasks: [], loaded: false, showArchived: false, drawerId: null, activeColumn: null };
+const operations = { requests: [], targets: [], enabled: false, selected: null, view: "pending", search: "", requester: "", risk: "", includeArchived: false };
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -63,6 +64,106 @@ function render() {
   populateAgentProfiles();
   renderKpis();
 }
+
+function operationLabel(action) {
+  return ({ start: "Start", stop: "Stop", restart: "Restart", docker_api: "Docker API request", host_powershell: "Windows host remediation" })[action] || action;
+}
+
+function operationTime(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function renderOperations() {
+  const pending = operations.requests.filter((item) => item.status === "pending_approval").length;
+  const badge = $("#approvalBadge");
+  if (badge) { badge.hidden = pending === 0; badge.textContent = pending; }
+  const hint = $("#approvalRunnerHint");
+  if (hint) hint.textContent = operations.enabled
+    ? "Each approval is single-use and expires after ten minutes. Little John's Windows plans run only after you review and approve the exact script."
+    : "The operations runner is not configured, so new requests and execution are unavailable.";
+  const list = $("#approvalList");
+  if (!list) return;
+  const requesterFilter = $("#approvalRequesterFilter");
+  if (requesterFilter) {
+    const names = [...new Set(operations.requests.map((item) => item.requested_by).filter(Boolean))].sort();
+    requesterFilter.innerHTML = `<option value="">All agents</option>${names.map((name) => `<option value="${escapeHtml(name)}"${operations.requester === name ? " selected" : ""}>${escapeHtml(displayName(name))}</option>`).join("")}`;
+  }
+  const terminal = new Set(["executed", "failed", "expired", "unknown"]);
+  let shown = operations.requests.filter((item) => {
+    const status = item.status || "";
+    if (operations.view === "pending" && status !== "pending_approval") return false;
+    if (operations.view === "progress" && status !== "executing") return false;
+    if (operations.view === "history" && !terminal.has(status)) return false;
+    if (!operations.includeArchived && item.archived_at) return false;
+    if (operations.requester && item.requested_by !== operations.requester) return false;
+    if (operations.risk && (item.risk || "medium") !== operations.risk) return false;
+    const haystack = [item.requested_by, item.action, item.target, item.reason, item.status, item.risk].join(" ").toLowerCase();
+    return !operations.search || haystack.includes(operations.search.toLowerCase());
+  });
+  const card = (item) => {
+    const pendingAction = item.status === "pending_approval"
+      ? `<button type="button" class="approval-execute" data-operation-approve="${escapeHtml(item.id)}">Approve &amp; execute</button>` : "";
+    const details = item.docker_request
+      ? `<p class="approval-detail"><code>${escapeHtml(item.docker_request.method)} ${escapeHtml(item.docker_request.path)}</code></p>` : "";
+    const script = item.action === "host_powershell"
+      ? `<p class="approval-detail"><strong>Risk: ${escapeHtml(item.risk || "medium")}</strong></p><details class="approval-plan"><summary>Review exact PowerShell plan</summary><pre>${escapeHtml(item.script || "")}</pre></details>` : "";
+    return `<article class="approval-card">
+      <div class="approval-card-main"><div class="approval-card-title"><span class="approval-requester-avatar">${avatarHtml(item.requested_by || "__you", 34)}</span><div><strong>${escapeHtml(displayName(item.requested_by || "Operator"))} requests ${escapeHtml(operationLabel(item.action))}</strong><p><code>${escapeHtml(item.target)}</code> · ${escapeHtml(operationTime(item.created_at))}</p></div></div>
+      <p class="approval-reason">${escapeHtml(item.reason)}</p>${details}${script}</div>
+      <div class="approval-card-actions"><span class="approval-status ${escapeHtml(item.status)}">${escapeHtml(item.status.replaceAll("_", " "))}</span>${pendingAction}${item.approved_by ? `<small>Approved by ${escapeHtml(item.approved_by)}</small>` : ""}</div>
+    </article>`;
+  };
+  // Collapse repeated historical requests for the same agent/action/target;
+  // active work stays expanded so it is never obscured.
+  if (operations.view === "history") {
+    const groups = new Map();
+    shown.forEach((item) => { const key = `${item.requested_by}|${item.action}|${item.target}`; (groups.get(key) || groups.set(key, []).get(key)).push(item); });
+    list.innerHTML = [...groups.values()].map((items) => items.length === 1 ? card(items[0]) : `<details class="approval-group"><summary>${escapeHtml(displayName(items[0].requested_by || "Operator"))} · ${escapeHtml(operationLabel(items[0].action))} · ${escapeHtml(items[0].target)} <span>${items.length} requests</span></summary>${items.map(card).join("")}</details>`).join("");
+  } else list.innerHTML = shown.map(card).join("");
+  if (!list.innerHTML) list.innerHTML = `<p class="empty">${operations.view === "pending" ? "No approvals are waiting." : "No approvals match this view."}</p>`;
+  list.querySelectorAll("[data-operation-approve]").forEach((button) => button.addEventListener("click", () => openOperationApproval(button.dataset.operationApprove)));
+}
+
+async function loadOperations() {
+  try {
+    const data = await api("/api/operations", { headers: headers() });
+    operations.requests = data.requests || [];
+    operations.targets = data.targets || [];
+    operations.enabled = !!data.enabled;
+  } catch (err) {
+    operations.requests = [];
+    operations.targets = [];
+    operations.enabled = false;
+  }
+  renderOperations();
+}
+
+function openOperationApproval(id) {
+  const item = operations.requests.find((request) => request.id === id);
+  if (!item) return;
+  operations.selected = item;
+  $("#approvalExecuteSummary").textContent = `${operationLabel(item.action)} ${item.target}: ${item.reason}`;
+  $("#approvalExecuteDialog").showModal();
+}
+
+const approvalTabs = $("#approvalTabs");
+if (approvalTabs) approvalTabs.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-approval-view]");
+  if (!button) return;
+  operations.view = button.dataset.approvalView;
+  approvalTabs.querySelectorAll("button").forEach((item) => item.classList.toggle("active", item === button));
+  renderOperations();
+});
+const approvalSearch = $("#approvalSearch");
+if (approvalSearch) approvalSearch.addEventListener("input", () => { operations.search = approvalSearch.value.trim(); renderOperations(); });
+const approvalRequesterFilter = $("#approvalRequesterFilter");
+if (approvalRequesterFilter) approvalRequesterFilter.addEventListener("change", () => { operations.requester = approvalRequesterFilter.value; renderOperations(); });
+const approvalRiskFilter = $("#approvalRiskFilter");
+if (approvalRiskFilter) approvalRiskFilter.addEventListener("change", () => { operations.risk = approvalRiskFilter.value; renderOperations(); });
+const approvalArchivedToggle = $("#approvalArchivedToggle");
+if (approvalArchivedToggle) approvalArchivedToggle.addEventListener("change", () => { operations.includeArchived = approvalArchivedToggle.checked; renderOperations(); });
 
 
 function renderAgents() {
@@ -1769,6 +1870,7 @@ function activateView(view) {
   if (view === "terminal") ensureTerminal();
   if (view === "wiki") ensureWiki();
   if (view === "tasks") loadKanban();
+  if (view === "approvals") loadOperations();
   if (view === "reports") loadReports();
   if (view === "apps") loadApps();
   if (view === "calendar") loadCron();
@@ -1812,13 +1914,44 @@ if (_wikiReload) _wikiReload.addEventListener("click", () => {
   if (f && f.dataset.src) f.src = f.dataset.src;  // reload the frame
 });
 
-$("#refreshBtn").addEventListener("click", () => { loadState(); loadKanban(); });
+$("#refreshBtn").addEventListener("click", () => { loadState(); loadKanban(); loadOperations(); });
 $("#addScheduleBtn").addEventListener("click", () => $("#scheduleDialog").showModal());
 
 // Generic top-right ✕ for any dialog carrying a .dialog-close button — just
 // closes its parent <dialog> without submitting the form.
 document.querySelectorAll(".dialog-close").forEach((btn) => {
   btn.addEventListener("click", () => btn.closest("dialog")?.close());
+});
+
+$("#requestApprovalBtn").addEventListener("click", () => {
+  $("#operationTarget").innerHTML = operations.targets.map((target) =>
+    `<option value="${escapeHtml(target)}">${escapeHtml(target)}</option>`).join("") || `<option value="">No eligible targets</option>`;
+  $("#approvalRequestDialog").showModal();
+});
+
+$("#approvalRequestForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (event.submitter?.value === "cancel") { $("#approvalRequestDialog").close(); return; }
+  try {
+    const body = Object.fromEntries(new FormData(event.currentTarget).entries());
+    body.requested_by = "operator";
+    await api("/api/operations/requests", { method: "POST", headers: headers(), body: JSON.stringify(body) });
+    $("#approvalRequestDialog").close(); event.currentTarget.reset();
+    setSync("Docker action sent for review"); await loadOperations();
+  } catch (err) { setSync("Request failed — check the admin token and runner"); }
+});
+
+$("#approvalExecuteForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (event.submitter?.value === "cancel") { $("#approvalExecuteDialog").close(); return; }
+  const operation = operations.selected;
+  if (!operation) return;
+  try {
+    const body = Object.fromEntries(new FormData(event.currentTarget).entries());
+    await api(`/api/operations/${encodeURIComponent(operation.id)}/approve`, { method: "POST", headers: headers(), body: JSON.stringify(body) });
+    $("#approvalExecuteDialog").close(); event.currentTarget.reset(); operations.selected = null;
+    setSync("Approved Docker action executed"); await loadOperations();
+  } catch (err) { setSync("Execution failed — check approval expiry and runner status"); }
 });
 
 // Kanban: create dialog + archived toggle wiring
@@ -3231,11 +3364,13 @@ loadAgentsHealth();
 loadUsage();
 loadCron();
 loadKanban();
+loadOperations();
 setInterval(loadState, 15000);
 setInterval(loadAgentsHealth, 15000);
 setInterval(loadUsage, 30000);
 setInterval(() => { if ($("#view-tasks").classList.contains("active")) loadKanban(); }, 15000);
 setInterval(() => { if ($("#view-calendar").classList.contains("active")) loadCron(); }, 30000);
+setInterval(loadOperations, 15000);
 
 // Return to the view the operator was last on (Overview is the HTML default).
 try {
