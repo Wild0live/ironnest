@@ -36,7 +36,7 @@ if ! docker image inspect "$HERMES_IMG" >/dev/null 2>&1; then
 fi
 
 echo "--- building hermes-platform images $PULL ---"
-docker compose build $PULL openviking memory-gateway mission-control
+docker compose build $PULL openviking memory-gateway mission-control operations-runner
 
 echo "--- build complete ---"
-docker compose images openviking memory-gateway mission-control
+docker compose images openviking memory-gateway mission-control operations-runner

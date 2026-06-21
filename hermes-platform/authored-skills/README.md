@@ -11,11 +11,12 @@ be re-applied after a profile rebuild.
 ```
 authored-skills/
   littlejohn/security/nvd-epss-kev-lookup/   → installed (live)
-  littlejohn/security/wazuh-query/           → staged (install after broker is up)
+  littlejohn/security/wazuh-query/           → installed (live)
   mark/research/pse-edge-disclosures/        → installed (live)
   wifey/household/electrical-load-230v/      → installed (live)
   wifey/household/recipe-scaling-substitution/ → installed (live)
   octo/devops/wazuh-query/                   → staged (install after broker is up)
+  octo/devops/approval-gated-operations/     → staged (install after operations token setup)
   _ops/set-disabled-skills.py               → prune helper (ruamel, format-preserving)
 ```
 
@@ -64,17 +65,14 @@ Disabled: `minecraft-modpack-server`, `pokemon-player`, `yuanbao`, `spotify`,
 `openhue` (+ `airtable`, already off). Unambiguously off-mandate for the work
 agents. Reversible: re-run the script with a shorter list.
 
-## Built, not yet deployed — Wazuh Query Broker
+## Wazuh Query Broker — deployed for Littlejohn
 
-`platform/security/wazuh-query-broker/` — read-only SIEM broker for Octo + Little
-John (alerts, agent status, rule lookups). Built and syntax/compose-validated.
-**Deploy is intentionally left to the operator**: the step that authenticates to
-the live Wazuh indexer was blocked by the autonomy guard (unrotated `admin`
-credential against production security infra) — the correct gate. See that dir's
-README for the deploy runbook and the `broker_ro` read-only-user setup.
-
-The `wazuh-query` skills for Octo and Little John are **staged** (not installed)
-and should be `docker cp`'d in only after the broker answers `/health`.
+`platform/security/wazuh-query-broker/` is deployed for **Littlejohn**. It runs
+as `wazuh-query` on `platform-net`, uses a dedicated `broker_ro` OpenSearch
+identity restricted to alert/monitoring reads, and accepts Littlejohn's separate
+Infisical-delivered bearer token. The Littlejohn skill is installed and verified
+end-to-end: health and authenticated alert reads succeed; mutation is rejected.
+Octo remains a separate opt-in rollout.
 
 ## Considered and dropped
 

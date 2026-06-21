@@ -78,6 +78,7 @@ MAX_SOUL = 200 * 1024  # 200 KB cap on SOUL.md writes
 # "not configured" so the token surface stays minimal.
 KANBAN_HOME = os.environ.get("HERMES_KANBAN_HOME", "/opt/kanban")
 ARTIFACTS_DIR = os.path.join(KANBAN_HOME, "artifacts")
+REPORTS_ROOT = os.environ.get("MISSION_CONTROL_REPORTS_ROOT", "").strip()
 WIKI_SERVICE_URL = os.environ.get("WIKI_SERVICE_URL", "http://wiki-service:8787").rstrip("/")
 WIKI_SECRETS_FILE = os.environ.get("WIKI_SECRETS_FILE", "/run/llm-wiki-secrets/wiki-service.env")
 WIKI_PUBLIC_URL = os.environ.get("WIKI_PUBLIC_URL", "https://wiki.ironnest.local").rstrip("/")
@@ -1293,6 +1294,59 @@ def _task_updated_ts(t: dict) -> int:
     return 0
 
 
+def _report_slug(value: str, fallback: str) -> str:
+    value = re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
+    return value[:72].strip("-") or fallback
+
+
+def _publish_report_packages(reports: list[dict]) -> None:
+    """Publish the Reports sidebar projection to its canonical host-backed root.
+
+    This runs only on the board gateway, which is the single component that has
+    both the resolved report metadata and the authoritative artifact files.
+    """
+    if not REPORTS_ROOT:
+        return
+    try:
+        for report in reports:
+            if report.get("hidden"):
+                continue
+            tid = str(report.get("task_id") or "")
+            if not _TID_RE.match(tid):
+                continue
+            group = _report_slug(str(report.get("group_title") or "general"), "general")
+            title = _report_slug(str(report.get("title") or tid), tid)
+            package = os.path.join(REPORTS_ROOT, group, f"{title}--{tid}")
+            os.makedirs(package, exist_ok=True)
+            published: list[dict] = []
+            for entry in report.get("files") or []:
+                name = str(entry.get("name") or "")
+                if not name or os.path.basename(name) != name:
+                    continue
+                source = os.path.join(_artifacts_dir(tid), name)
+                target = os.path.join(package, name)
+                if not os.path.isfile(source):
+                    continue
+                if (not os.path.exists(target) or os.path.getsize(source) != os.path.getsize(target)
+                        or int(os.path.getmtime(source)) != int(os.path.getmtime(target))):
+                    shutil.copy2(source, target)
+                published.append({"name": name, "size": os.path.getsize(source),
+                                  "mime": entry.get("mime", "")})
+            manifest = {"task_id": tid, "title": report.get("title", tid),
+                        "group_id": report.get("group_id", tid),
+                        "group_title": report.get("group_title", "general"),
+                        "assignee": report.get("assignee", ""), "status": report.get("status", ""),
+                        "updated": report.get("updated"), "completed": report.get("completed"),
+                        "files": published}
+            tmp = os.path.join(package, ".report-manifest.tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(manifest, fh, indent=2)
+                fh.write("\n")
+            os.replace(tmp, os.path.join(package, "report-manifest.json"))
+    except OSError as exc:
+        print(f"report package publish failed: {exc}", flush=True)
+
+
 def _list_all_tasks() -> dict[str, dict]:
     """Single dict of every task (active + archived) by id, via two CLI calls.
     Returns {} if either call fails so the index degrades gracefully."""
@@ -1375,6 +1429,7 @@ def _build_reports_index() -> dict:
             "hidden": bool(entry.get("hidden")),
         })
     out.sort(key=lambda r: r["updated"], reverse=True)
+    _publish_report_packages(out)
     return {"ok": True, "generated_at": int(time.time()), "reports": out}
 
 

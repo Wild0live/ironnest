@@ -27,8 +27,15 @@ if compgen -G "services.d/*.yml" >/dev/null; then
     done
 fi
 
+# The privileged operations runner is opt-in. It is excluded from routine
+# startup unless an operator explicitly enables it after configuring its token.
+COMPOSE_PROFILES=()
+if [ "${ENABLE_OPERATIONS_RUNNER:-0}" = "1" ]; then
+    COMPOSE_PROFILES+=(--profile operations)
+fi
+
 compose() {
-    docker compose "${COMPOSE_FILES[@]}" "$@"
+    docker compose "${COMPOSE_FILES[@]}" "${COMPOSE_PROFILES[@]}" "$@"
 }
 
 # ── Required external volumes used by the stack ─────────────────────────────
@@ -37,9 +44,15 @@ compose() {
 # hermes_hermes-data volume during migration (one-shot, manually triggered).
 
 # ── First-run image detection ──────────────────────────────────────────────
-for IMG in platform/hermes-platform-openviking:0.1.0 \
-           platform/hermes-platform-memory-gateway:0.1.0 \
-           platform/hermes-platform-mission-control:0.1.0 ; do
+IMAGES=(
+    platform/hermes-platform-openviking:0.1.0
+    platform/hermes-platform-memory-gateway:0.1.0
+    platform/hermes-platform-mission-control:0.1.0
+)
+if [ "${ENABLE_OPERATIONS_RUNNER:-0}" = "1" ]; then
+    IMAGES+=(platform/hermes-platform-operations-runner:0.1.0)
+fi
+for IMG in "${IMAGES[@]}"; do
     if ! docker image inspect "$IMG" >/dev/null 2>&1; then
         echo "--- image $IMG not present, running build.sh ---"
         "$STACK/build.sh"
@@ -77,6 +90,9 @@ CONTAINERS=(
     hermes-platform-ttyd
     "${PROFILE_CONTAINERS[@]}"
 )
+if [ "${ENABLE_OPERATIONS_RUNNER:-0}" = "1" ]; then
+    CONTAINERS+=(hermes-platform-operations-runner)
+fi
 deadline=$(( $(date +%s) + 300 ))
 while :; do
     all_ok=1

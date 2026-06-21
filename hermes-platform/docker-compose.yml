@@ -49,6 +49,11 @@ networks:
     driver: bridge
     internal: true
     name: hermes-platform-app-net
+  # Private command channel: only Mission Control and the deliberately narrow
+  # operations runner join.  Profile agents never receive this network.
+  mission-control-ops-net:
+    driver: bridge
+    internal: true
 
   # Stack-local bridge for publishing the memory-gateway port to 127.0.0.1
   # (admin/diagnostic access only).
@@ -100,6 +105,8 @@ volumes:
   # Mission Control's own tasks/schedules store (isolated from the gateway).
   mission-control-state:
     name: hermes-platform_mission-control-state
+  operations-runner-state:
+    name: hermes-platform_operations-runner-state
 
   # Infisical sidecar render dir for openviking
   openviking-secrets-runtime:
@@ -417,7 +424,8 @@ services:
     # Healthcheck baked into Dockerfile
 
   # ── Mission Control (standalone ops dashboard) ────────────────────────────
-  # Decoupled from the memory-gateway policy kernel: holds NO secrets, is on
+  # Decoupled from the memory-gateway policy kernel: holds no gateway/profile
+  # secrets, is on
   # platform-net ONLY (so Traefik can route to it — NOT on the agent/OpenViking
   # nets), and reads exactly two gateway-owned files read-only: the profile
   # registry and the audit log. Owns its own tasks/schedules JSON on a private
@@ -442,19 +450,32 @@ services:
       MISSION_CONTROL_ADMIN_TOKEN:   "${MISSION_CONTROL_ADMIN_TOKEN:-}"
       # Shared secret for calling the per-profile agent chat bridges.
       MISSION_CONTROL_BRIDGE_TOKEN:  "${MISSION_CONTROL_BRIDGE_TOKEN:-}"
+      # Optional approval-gated lifecycle control. Both values must be present
+      # or the Operations endpoints remain disabled.
+      OPERATIONS_RUNNER_URL:          "http://operations-runner:8091"
+      OPERATIONS_RUNNER_TOKEN:        "${OPERATIONS_RUNNER_TOKEN:-}"
+      OPERATIONS_APPROVAL_TTL_SECONDS: "${OPERATIONS_APPROVAL_TTL_SECONDS:-600}"
+      OCTO_OPERATIONS_SUBMIT_TOKEN:   "${OCTO_OPERATIONS_SUBMIT_TOKEN:-}"
+      LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN: "${LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN:-}"
+      HOST_OPERATIONS_RUNNER_URL:      "${HOST_OPERATIONS_RUNNER_URL:-http://172.17.80.1:8765}"
+      HOST_OPERATIONS_RUNNER_TOKEN:    "${HOST_OPERATIONS_RUNNER_TOKEN:-}"
+      HOST_OPERATIONS_QUEUE_DIR:       "/var/lib/mission-control/host-operations"
     volumes:
       - ./registry:/etc/hermes-platform/registry:ro
       - ./policies:/etc/hermes-platform/policies:ro
       - memory-gateway-log:/var/log/gateway:ro
       - mission-control-state:/var/lib/mission-control
+      - ./host-operations-queue:/var/lib/mission-control/host-operations
     networks:
       - platform-net
+      - mission-control-ops-net
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz', timeout=4).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 5
       start_period: 10s
+
     logging: *default-logging
     cap_drop: [ALL]
     security_opt:
@@ -467,6 +488,43 @@ services:
         limits:
           cpus: "0.5"
           memory: 128M
+
+  # The only service in this project with Docker socket access.  It is not a
+  # Docker API proxy: its code permits only start/stop/restart for its explicit
+  # profile gateway allowlist, requires a bearer token, and persists single-use
+  # request IDs.  Never add exec/create/build/pull endpoints here.
+  operations-runner:
+    profiles: ["operations"]
+    build:
+      context: ./operations-runner
+      dockerfile: Dockerfile
+    image: platform/hermes-platform-operations-runner:0.1.0
+    container_name: hermes-platform-operations-runner
+    restart: unless-stopped
+    environment:
+      OPERATIONS_RUNNER_TOKEN: "${OPERATIONS_RUNNER_TOKEN:-}"
+      OPERATIONS_ALLOWED_CONTAINERS: "hermes-pf-default,hermes-pf-mark,hermes-pf-steve,hermes-pf-qa,hermes-pf-littlejohn,hermes-pf-jaime,hermes-pf-bigbert,hermes-pf-octo"
+      # Comma-separated Docker-host paths Octo may request as bind sources.
+      # Empty = factory bind mounts are rejected (named volumes remain allowed).
+      FACTORY_HOST_PATH_ROOTS: "${FACTORY_HOST_PATH_ROOTS:-}"
+      OPERATIONS_RUNNER_STATE_FILE: "/var/lib/operations-runner/executed.json"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - operations-runner-state:/var/lib/operations-runner
+    networks:
+      - mission-control-ops-net
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8091/healthz', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   # ── Sandboxed static-app server ───────────────────────────────────────────
   # Serves COMPLETE webapp deliverables (folders with an index.html) from the
@@ -600,6 +658,7 @@ services:
       <<: *hermes-env-common
       INFISICAL_PATH: "/hermes-platform/default"
       HERMES_PROFILE: "default"
+      MISSION_CONTROL_REPORTS_ROOT: "/opt/mission-control-reports"
     command:
       - with-infisical
       - sh
@@ -622,6 +681,7 @@ services:
       - ./shared/default:/opt/shared/mine
       - ./shared:/opt/shared/all:ro
       - kanban-shared:/opt/kanban   # shared Kanban board (HERMES_KANBAN_HOME)
+      - D:/LLM Wiki/sources/mission-control-reports:/opt/mission-control-reports
       - ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
       - ./hermes-profile-entrypoint.sh:/opt/ironnest/hermes-profile-entrypoint.sh:ro
       - ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
@@ -763,6 +823,13 @@ services:
       <<: *hermes-env-common
       INFISICAL_PATH: "/hermes-platform/littlejohn"
       HERMES_PROFILE: "littlejohn"
+      MC_HOST_OPERATIONS_URL: "http://mission-control:8080"
+      MC_HOST_OPERATIONS_SUBMIT_TOKEN_FILE: "/run/secrets/littlejohn-host-operations-submit-token"
+      # The read-only Wazuh broker is an internal platform service. Bypass
+      # Squid for this hostname so Littlejohn can query it with the scoped
+      # token injected from Infisical; no other profile receives this route.
+      NO_PROXY:    "memory-gateway,browser-intent-mcp,infisical,adguard,squid,socket-proxy,wazuh-query,localhost,127.0.0.1,.local"
+      no_proxy:    "memory-gateway,browser-intent-mcp,infisical,adguard,squid,socket-proxy,wazuh-query,localhost,127.0.0.1,.local"
     command:
       - with-infisical
       - sh
@@ -783,6 +850,8 @@ services:
       - ./shared/littlejohn:/opt/shared/mine
       - ./shared:/opt/shared/all:ro
       - ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
+      - ./agent-bridge/request-host-operation.py:/opt/ironnest/request-host-operation.py:ro
+      - ./secrets/littlejohn-host-operations-submit-token:/run/secrets/littlejohn-host-operations-submit-token:ro
       - kanban-shared:/opt/kanban   # shared Kanban board (HERMES_KANBAN_HOME)
       - ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
       - ./hermes-profile-entrypoint.sh:/opt/ironnest/hermes-profile-entrypoint.sh:ro

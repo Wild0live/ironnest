@@ -40,11 +40,12 @@ services:
       HERMES_GATEWAY_NO_SUPERVISE: "1"
       HTTPS_PROXY: "http://squid:3128"
       HTTP_PROXY:  "http://squid:3128"
-      NO_PROXY:    "memory-gateway,browser-intent-mcp,infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+      NO_PROXY:    "memory-gateway,mission-control,browser-intent-mcp,infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
       https_proxy: "http://squid:3128"
       http_proxy:  "http://squid:3128"
-      no_proxy:    "memory-gateway,browser-intent-mcp,infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+      no_proxy:    "memory-gateway,mission-control,browser-intent-mcp,infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
       MEMORY_GATEWAY_URL: "http://memory-gateway:8080"
+      MISSION_CONTROL_URL: "http://mission-control:8080"
       TELEGRAM_REQUIRE_MENTION: "true"
       HERMES_KANBAN_HOME: "/opt/kanban"   # join the shared Kanban board
     command:

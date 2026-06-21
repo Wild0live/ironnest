@@ -9,12 +9,15 @@ OpenViking networks. It reads two of the gateway's files read-only:
 
 …and owns a small JSON store for tasks/schedules on its own volume. Writes are
 optionally gated by MISSION_CONTROL_ADMIN_TOKEN; when unset, the Authelia FIDO
-gate in front of this host is the auth boundary.
+gate in front of this host is the auth boundary.  Its optional operations
+integration carries only a runner-specific capability token, never Docker,
+gateway, or profile credentials.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+import hmac
 import io
 import json
 import os
@@ -49,6 +52,24 @@ ADMIN_TOKEN = os.environ.get("MISSION_CONTROL_ADMIN_TOKEN", "").strip()
 BRIDGE_TOKEN = os.environ.get("MISSION_CONTROL_BRIDGE_TOKEN", "").strip()
 BRIDGE_PORT = int(os.environ.get("AGENT_BRIDGE_PORT", "8011"))
 BRIDGE_TIMEOUT = int(os.environ.get("AGENT_BRIDGE_PROXY_TIMEOUT", "270"))
+
+# Optional, deliberately narrow lifecycle authority.  When either value is
+# absent, the Operations API remains disabled.  The token is shared only with
+# the internal operations-runner; it is never exposed to profile agents.
+OPERATIONS_RUNNER_URL = os.environ.get("OPERATIONS_RUNNER_URL", "").rstrip("/")
+OPERATIONS_RUNNER_TOKEN = os.environ.get("OPERATIONS_RUNNER_TOKEN", "").strip()
+OPERATIONS_APPROVAL_TTL = int(os.environ.get("OPERATIONS_APPROVAL_TTL_SECONDS", "600"))
+OPERATIONS_ARCHIVE_AFTER_DAYS = int(os.environ.get("OPERATIONS_ARCHIVE_AFTER_DAYS", "30"))
+OPERATIONS_RETENTION_DAYS = int(os.environ.get("OPERATIONS_RETENTION_DAYS", "180"))
+# Scoped credential held by Octo and Mission Control only. It authorizes a
+# *proposal*, never Docker execution or approval.
+OCTO_OPERATIONS_SUBMIT_TOKEN = os.environ.get("OCTO_OPERATIONS_SUBMIT_TOKEN", "").strip()
+# Little John may submit a reviewed Windows-host remediation proposal only.
+# This credential never authorizes approval or execution.
+LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN = os.environ.get("LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN", "").strip()
+HOST_OPERATIONS_RUNNER_URL = os.environ.get("HOST_OPERATIONS_RUNNER_URL", "").rstrip("/")
+HOST_OPERATIONS_RUNNER_TOKEN = os.environ.get("HOST_OPERATIONS_RUNNER_TOKEN", "").strip()
+HOST_OPERATIONS_QUEUE_DIR = Path(os.environ.get("HOST_OPERATIONS_QUEUE_DIR", "").strip())
 
 # Sandboxed origin that serves complete static webapp artifacts LIVE (a separate
 # host = a separate browser origin, so agent-authored HTML/JS can't script the
@@ -105,6 +126,31 @@ class AgentChat(BaseModel):
     attachments: list[Attachment] = Field(default_factory=list)
 
 
+OperationAction = Literal["start", "stop", "restart", "docker_api", "host_powershell"]
+
+
+class OperationRequestCreate(BaseModel):
+    """A proposal only.  Calling this endpoint never reaches Docker."""
+    action: OperationAction
+    target: str = Field(..., min_length=1, max_length=128)
+    reason: str = Field(..., min_length=3, max_length=1000)
+    requested_by: str = Field(default="operator", min_length=1, max_length=80)
+    # Only used for docker_api. The exact request is retained with the approval
+    # record, so an approver sees what will reach the Docker daemon.
+    method: Literal["POST", "DELETE"] | None = None
+    path: str | None = Field(default=None, max_length=300)
+    body: dict[str, Any] | None = None
+    # Only used for host_powershell. The operator reviews this exact text in
+    # the Approvals sidebar before it can reach the Windows-host runner.
+    script: str | None = Field(default=None, max_length=60_000)
+    risk: Literal["low", "medium", "high", "critical"] = "medium"
+
+
+class OperationApproval(BaseModel):
+    approved_by: str = Field(..., min_length=1, max_length=80)
+    note: str = Field(default="", max_length=500)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -118,6 +164,28 @@ def require_admin(authorization: str | None = Header(default=None)) -> None:
     if authorization != expected:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail="admin token required")
+
+
+def require_octo_operations_submit(
+    x_operations_submit_token: str | None = Header(default=None),
+) -> None:
+    if not OCTO_OPERATIONS_SUBMIT_TOKEN:
+        raise HTTPException(status_code=503, detail="Octo operations submission is not configured")
+    if not x_operations_submit_token or not hmac.compare_digest(
+            x_operations_submit_token, OCTO_OPERATIONS_SUBMIT_TOKEN):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="operations submission token required")
+
+
+def require_littlejohn_operations_submit(
+    x_operations_submit_token: str | None = Header(default=None),
+) -> None:
+    if not LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN:
+        raise HTTPException(status_code=503, detail="Little John operations submission is not configured")
+    if not x_operations_submit_token or not hmac.compare_digest(
+            x_operations_submit_token, LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="operations submission token required")
 
 
 # ── Persistent store (tasks + schedules) ────────────────────────────────────
@@ -138,6 +206,7 @@ def _default_store() -> dict[str, Any]:
             },
         ],
         "schedules": [],
+        "operations": [],
     }
 
 
@@ -153,6 +222,7 @@ def _read_store() -> dict[str, Any]:
         return _default_store()
     data.setdefault("tasks", [])
     data.setdefault("schedules", [])
+    data.setdefault("operations", [])
     return data
 
 
@@ -1833,6 +1903,239 @@ def autodispatch_set(profile: str, req: AutoDispatch, _: None = Depends(require_
     code, payload = _bridge_json(profile, "POST", "/kanban",
                                  {"action": "autodispatch_set", "enabled": req.enabled, "max": req.max})
     return JSONResponse(status_code=code, content=payload)
+
+
+# ── Approval-gated Docker lifecycle operations ──────────────────────────────
+# This is intentionally a request/approval system, not a shell or Docker proxy.
+# The separate runner independently enforces the same target/action allowlist.
+
+
+def _operations_enabled() -> bool:
+    return bool((OPERATIONS_RUNNER_URL and OPERATIONS_RUNNER_TOKEN) or
+                HOST_OPERATIONS_QUEUE_DIR)
+
+
+def _operation_targets() -> set[str]:
+    """Only profile gateway containers may be requested from Mission Control.
+
+    The runner is authoritative and has its own static allowlist; this check
+    keeps a malformed or stale dashboard request from becoming a proposal.
+    """
+    return {str(p.get("container_name") or f"hermes-pf-{p['name']}") for p in _profiles()}
+
+
+def _operation_view(item: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy safe for API consumers (there are no credentials in state)."""
+    return dict(item)
+
+
+def _notify_operation_thread(item: dict[str, Any], event: str) -> None:
+    """Mirror approval lifecycle events into the requester's agent chat."""
+    profile = str(item.get("requested_by") or "")
+    if not profile or profile not in {p.get("name") for p in _profiles()}:
+        return
+    conv = item.get("conversation_id")
+    if not conv:
+        convs = [c for c in list_conversations(profile) if not c.get("archived")]
+        conv = convs[0]["id"] if convs else create_conversation(profile, "Approvals")["id"]
+        item["conversation_id"] = conv
+    action = str(item.get("action", "operation")).replace("_", " ")
+    target = str(item.get("target", "local system"))
+    messages = {
+        "requested": f"🛡️ Approval requested: {action} for {target}. It is waiting in Mission Control Approvals.",
+        "executing": f"✅ Approval granted: {action} for {target} is now executing.",
+        "executed": f"✅ Approved action completed: {action} for {target}.",
+        "failed": f"⚠️ Approved action failed: {action} for {target}. Review Mission Control Approvals for details.",
+        "expired": f"⌛ Approval expired: {action} for {target}. Submit a fresh request if it is still needed.",
+    }
+    text = messages.get(event)
+    if text:
+        conv_append(profile, conv, {"role": "system", "text": text, "ts": _now()})
+
+
+def _reconcile_host_operations(store: dict[str, Any]) -> None:
+    """Pick up completion records written by the Windows-host queue runner."""
+    if not HOST_OPERATIONS_QUEUE_DIR:
+        return
+    changed = False
+    for item in store.get("operations", []):
+        if item.get("action") != "host_powershell" or item.get("status") != "executing":
+            continue
+        result_file = HOST_OPERATIONS_QUEUE_DIR / "results" / f"{item['id']}.json"
+        try:
+            result = json.loads(result_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        item["status"] = "executed" if result.get("ok") else "failed"
+        item["result"] = result
+        _notify_operation_thread(item, item["status"])
+        changed = True
+    if changed:
+        _write_store(store)
+
+
+def _maintain_operations(store: dict[str, Any]) -> None:
+    """Archive terminal approvals after 30 days; retain audit evidence 180 days."""
+    now = datetime.now(timezone.utc)
+    terminal = {"executed", "failed", "expired", "unknown"}
+    kept: list[dict[str, Any]] = []
+    changed = False
+    for item in store.get("operations", []):
+        try:
+            created = datetime.fromisoformat(str(item.get("created_at", "")).replace("Z", "+00:00"))
+        except ValueError:
+            kept.append(item); continue
+        age = (now - created).days
+        if item.get("status") in terminal and age >= OPERATIONS_RETENTION_DAYS:
+            changed = True
+            continue
+        if item.get("status") in terminal and age >= OPERATIONS_ARCHIVE_AFTER_DAYS and not item.get("archived_at"):
+            item["archived_at"] = _now(); changed = True
+        kept.append(item)
+    if changed:
+        store["operations"] = kept
+        _write_store(store)
+
+
+@router.get("/api/operations")
+def operations_list(_: None = Depends(require_admin)) -> JSONResponse:
+    store = _read_store()
+    _reconcile_host_operations(store)
+    _maintain_operations(store)
+    items = sorted(store.get("operations", []), key=lambda x: x.get("created_at", ""), reverse=True)
+    return JSONResponse(content={"enabled": _operations_enabled(),
+                                 "actions": ["start", "stop", "restart", "docker_api", "host_powershell"],
+                                 "targets": sorted(_operation_targets()),
+                                 "archive_after_days": OPERATIONS_ARCHIVE_AFTER_DAYS,
+                                 "retention_days": OPERATIONS_RETENTION_DAYS,
+                                 "requests": [_operation_view(x) for x in items]})
+
+
+def _create_operation_request(req: OperationRequestCreate, requested_by: str | None = None) -> dict[str, Any]:
+    if not _operations_enabled():
+        raise HTTPException(status_code=503, detail="operations runner is not configured")
+    if req.action not in ("docker_api", "host_powershell") and req.target not in _operation_targets():
+        raise HTTPException(status_code=400, detail="target is not an enabled profile gateway")
+    if req.action == "docker_api" and (not req.method or not req.path):
+        raise HTTPException(status_code=400, detail="docker_api requires method and path")
+    if req.action == "host_powershell" and (not req.script or not req.script.strip()):
+        raise HTTPException(status_code=400, detail="host_powershell requires a non-empty script")
+    item = {
+        "id": f"op-{uuid.uuid4().hex}", "action": req.action, "target": req.target,
+        "reason": req.reason.strip(), "requested_by": (requested_by or req.requested_by).strip(),
+        "status": "pending_approval", "created_at": _now(), "approved_at": None,
+        "approved_by": None, "approval_note": "", "result": None,
+    }
+    if req.action == "docker_api":
+        item["docker_request"] = {"method": req.method, "path": req.path,
+                                  "body": req.body or {}}
+    if req.action == "host_powershell":
+        item["script"] = req.script
+        item["risk"] = req.risk
+    store = _read_store()
+    store.setdefault("operations", []).append(item)
+    _notify_operation_thread(item, "requested")
+    _write_store(store)
+    return item
+
+
+@router.post("/api/operations/requests")
+def operations_request(req: OperationRequestCreate, _: None = Depends(require_admin)) -> JSONResponse:
+    item = _create_operation_request(req)
+    return JSONResponse(status_code=201, content={"ok": True, "request": _operation_view(item)})
+
+
+@router.post("/api/operations/requests/octo")
+def octo_operations_request(req: OperationRequestCreate,
+                            _: None = Depends(require_octo_operations_submit)) -> JSONResponse:
+    """Octo's narrow proposal ingress. It cannot approve or execute requests."""
+    item = _create_operation_request(req, requested_by="octo")
+    return JSONResponse(status_code=201, content={"ok": True, "request": _operation_view(item)})
+
+
+@router.post("/api/operations/requests/littlejohn")
+def littlejohn_operations_request(req: OperationRequestCreate,
+                                  _: None = Depends(require_littlejohn_operations_submit)) -> JSONResponse:
+    """Little John's proposal ingress. It cannot approve or execute requests."""
+    if req.action != "host_powershell":
+        raise HTTPException(status_code=403, detail="Little John may request Windows host changes only")
+    item = _create_operation_request(req, requested_by="littlejohn")
+    return JSONResponse(status_code=201, content={"ok": True, "request": _operation_view(item)})
+
+
+@router.post("/api/operations/{operation_id}/approve")
+def operations_approve(operation_id: str, approval: OperationApproval,
+                       _: None = Depends(require_admin)) -> JSONResponse:
+    if not _operations_enabled():
+        raise HTTPException(status_code=503, detail="operations runner is not configured")
+    store = _read_store()
+    item = next((x for x in store.get("operations", []) if x.get("id") == operation_id), None)
+    if item is None:
+        raise HTTPException(status_code=404, detail="operation request not found")
+    if item.get("status") != "pending_approval":
+        raise HTTPException(status_code=409, detail="operation request is no longer pending")
+    try:
+        created = datetime.fromisoformat(str(item["created_at"]).replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=409, detail="operation request has invalid timestamp")
+    if (datetime.now(timezone.utc) - created).total_seconds() > OPERATIONS_APPROVAL_TTL:
+        item["status"] = "expired"
+        item["expired_at"] = _now()
+        _notify_operation_thread(item, "expired")
+        _write_store(store)
+        raise HTTPException(status_code=409, detail="operation request expired; submit a fresh request")
+
+    # Stamp approval before calling the runner, so even a network timeout leaves
+    # an auditable record.  A runner-side request-id ledger prevents replays.
+    item["status"] = "executing"
+    item["approved_at"] = _now()
+    item["approved_by"] = approval.approved_by.strip()
+    item["approval_note"] = approval.note.strip()
+    _notify_operation_thread(item, "executing")
+    _write_store(store)
+    runner_payload = {"request_id": item["id"], "action": item["action"],
+                      "target": item["target"]}
+    if item.get("docker_request"):
+        runner_payload["docker_request"] = item["docker_request"]
+    if item["action"] == "host_powershell":
+        if not HOST_OPERATIONS_QUEUE_DIR:
+            item["status"] = "failed"; item["result"] = {"error": "host operation queue is not configured"}; _write_store(store)
+            raise HTTPException(status_code=503, detail="host operation queue is not configured")
+        HOST_OPERATIONS_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+        jobs = HOST_OPERATIONS_QUEUE_DIR / "jobs"; jobs.mkdir(exist_ok=True)
+        job = {"request_id": item["id"], "action": item["action"], "target": item["target"],
+               "script": item["script"], "risk": item.get("risk", "medium")}
+        temp = jobs / f"{item['id']}.tmp"; final = jobs / f"{item['id']}.json"
+        temp.write_text(json.dumps(job), encoding="utf-8"); os.replace(temp, final)
+        return JSONResponse(status_code=202, content={"ok": True, "request": _operation_view(item)})
+    else:
+        runner_url, runner_token, timeout = OPERATIONS_RUNNER_URL, OPERATIONS_RUNNER_TOKEN, 45
+    if not runner_url or not runner_token:
+        item["status"] = "failed"
+        item["result"] = {"error": "required operation runner is not configured"}
+        _write_store(store)
+        raise HTTPException(status_code=503, detail="required operation runner is not configured")
+    body = json.dumps(runner_payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{runner_url}/v1/execute", data=body, method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {runner_token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        item["status"] = "executed"
+        item["result"] = payload.get("result", payload)
+    except urllib.error.HTTPError as exc:
+        item["status"] = "failed"
+        item["result"] = {"error": f"runner rejected request ({exc.code})"}
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        item["status"] = "unknown"
+        item["result"] = {"error": f"runner response unavailable: {exc}"}
+    _notify_operation_thread(item, "executed" if item["status"] == "executed" else "failed")
+    _write_store(store)
+    return JSONResponse(status_code=200 if item["status"] == "executed" else 502,
+                        content={"ok": item["status"] == "executed", "request": _operation_view(item)})
 
 
 app = FastAPI(title="Hermes Mission Control", version="0.1.0")
