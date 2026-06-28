@@ -1348,20 +1348,23 @@ def _publish_report_packages(reports: list[dict]) -> None:
 
 
 def _list_all_tasks() -> dict[str, dict]:
-    """Single dict of every task (active + archived) by id, via two CLI calls.
-    Returns {} if either call fails so the index degrades gracefully."""
-    by_id: dict[str, dict] = {}
-    for archived in (False, True):
-        argv = ["list", "--json"]
-        if archived:
-            argv.append("--archived")
-        code, payload = _kanban_run(argv, parse_json=True)
-        if code != 200 or not payload.get("ok"):
-            continue
-        for t in (payload.get("data") or []):
-            if isinstance(t, dict) and t.get("id"):
-                by_id.setdefault(t["id"], t)
-    return by_id
+    """Single dict of every task (active + archived) by id.
+
+    Reports/Apps are read-only projections, so avoid spawning `hermes kanban
+    list` twice on every page open. The bridge already owns read-only SQLite
+    access for links; task metadata is safe to read the same way.
+    """
+    db = os.path.join(KANBAN_HOME, "kanban.db")
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute("SELECT * FROM tasks").fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return {}
+    return {row["id"]: dict(row) for row in rows if row["id"]}
 
 
 def _read_links() -> list[tuple[str, str]]:

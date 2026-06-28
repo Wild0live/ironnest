@@ -1699,8 +1699,14 @@ function teamSkillCounts() {
 
 async function loadTeam() {
   const grid = $("#teamGrid");
-  if (grid && !grid.children.length) grid.innerHTML = `<p class="muted team-loading">Loading team…</p>`;
-  await Promise.all(state.profiles.map((p) => loadAgentInfo(p.name)));
+  if (grid && !grid.children.length) renderTeam();
+  const jobs = state.profiles.map(async (p) => {
+    const cached = chat.agentInfo[p.name];
+    if (cached && cached.loaded && cached.online !== false) return;
+    await loadAgentInfo(p.name);
+    if ($("#view-team")?.classList.contains("active")) renderTeam();
+  });
+  await Promise.allSettled(jobs);
   renderTeam();
 }
 
@@ -2396,6 +2402,7 @@ async function loadAgentInfo(profile, attempt = 0) {
     chat.agentInfo[profile] = { ...(chat.agentInfo[profile] || {}), loaded: true, online: false };
   }
   if (profile === currentProfile()) renderAgentCard();
+  if ($("#view-team")?.classList.contains("active")) renderTeam();
   // Re-poll until the role summary lands (or we give up after ~5 tries).
   const kind = (chat.agentInfo[profile] || {}).description_kind;
   clearTimeout(_roleTimers[profile]);
