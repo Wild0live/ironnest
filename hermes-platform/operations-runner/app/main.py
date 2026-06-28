@@ -25,9 +25,13 @@ from pydantic import BaseModel, Field
 TOKEN = os.environ.get("OPERATIONS_RUNNER_TOKEN", "").strip()
 ALLOWED_CONTAINERS = frozenset(item.strip() for item in os.environ.get(
     "OPERATIONS_ALLOWED_CONTAINERS", "").split(",") if item.strip())
+ALLOW_ALL_CONTAINERS = os.environ.get("OPERATIONS_ALLOW_ALL_CONTAINERS", "").strip().lower() in {
+    "1", "true", "yes", "on"}
 FACTORY_PREFIX = os.environ.get("FACTORY_CONTAINER_PREFIX", "factory-").strip()
 FACTORY_HOST_ROOTS = tuple(p.strip().replace("\\", "/").rstrip("/").lower() for p in os.environ.get(
     "FACTORY_HOST_PATH_ROOTS", "").split(",") if p.strip())
+FACTORY_ALLOWED_IMAGES = frozenset(item.strip() for item in os.environ.get(
+    "FACTORY_ALLOWED_IMAGES", "").split(",") if item.strip())
 STATE_FILE = Path(os.environ.get("OPERATIONS_RUNNER_STATE_FILE", "/var/lib/operations-runner/executed.json"))
 SOCKET_PATH = os.environ.get("DOCKER_SOCKET", "/var/run/docker.sock")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
@@ -98,9 +102,30 @@ def factory_name(value: str) -> bool:
     return bool(FACTORY_PREFIX and value.startswith(FACTORY_PREFIX) and _NAME.fullmatch(value))
 
 
+def lifecycle_target_allowed(value: str) -> bool:
+    """Permit lifecycle actions for configured names, or all valid Docker names."""
+    return bool(_NAME.fullmatch(value)) and (ALLOW_ALL_CONTAINERS or value in ALLOWED_CONTAINERS)
+
+
 def host_path_allowed(source: str) -> bool:
     source = source.replace("\\", "/").rstrip("/").lower()
     return any(source == root or source.startswith(root + "/") for root in FACTORY_HOST_ROOTS)
+
+
+def validate_image_pull(query: dict[str, list[str]]) -> None:
+    """Allow an approved pull of one explicitly configured image only."""
+    if set(query) - {"fromImage", "tag", "platform"}:
+        raise HTTPException(status_code=403, detail="unsupported image pull option")
+    sources = query.get("fromImage", [])
+    tags = query.get("tag", [])
+    platforms = query.get("platform", [])
+    if len(sources) != 1 or not sources[0] or len(tags) > 1 or len(platforms) > 1:
+        raise HTTPException(status_code=400, detail="image pull requires exactly one fromImage and optional tag/platform")
+    # Docker's image-create API separates the tag from fromImage. The exact
+    # image string is what operators configure and review in Mission Control.
+    image = sources[0] if not tags else f"{sources[0]}:{tags[0]}"
+    if not FACTORY_ALLOWED_IMAGES or image not in FACTORY_ALLOWED_IMAGES:
+        raise HTTPException(status_code=403, detail="image is outside FACTORY_ALLOWED_IMAGES")
 
 
 def validate_create(body: dict[str, Any], query: dict[str, list[str]]) -> None:
@@ -156,7 +181,12 @@ def validate_factory_request(req: DockerRequest, state: dict[str, Any]) -> tuple
     query = parse_qs(parsed.query, keep_blank_values=True)
     body = req.body
     allowed = False
-    if resource == "containers/create" and req.method == "POST":
+    if resource == "images/create" and req.method == "POST":
+        if body:
+            raise HTTPException(status_code=400, detail="image pull does not accept a request body")
+        validate_image_pull(query)
+        allowed = True
+    elif resource == "containers/create" and req.method == "POST":
         validate_create(body, query)
         allowed = True
     elif m := re.fullmatch(r"containers/([^/]+)/(start|stop|restart|exec)", resource):
@@ -205,7 +235,7 @@ def execute(req: ExecuteRequest, authorization: str | None = Header(default=None
                 raise HTTPException(status_code=400, detail="docker_api request missing payload")
             method, endpoint, payload = validate_factory_request(req.docker_request, state)
         else:
-            if req.target not in ALLOWED_CONTAINERS:
+            if not lifecycle_target_allowed(req.target):
                 raise HTTPException(status_code=403, detail="target is not approved for lifecycle operations")
             method, endpoint, payload = "POST", {
                 "start": f"/v1.47/containers/{req.target}/start",

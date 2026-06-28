@@ -6,6 +6,20 @@ const state = {
   activity: [],
 };
 
+const TERMINAL_STORE_KEY = "mc.terminalTarget";
+const DEFAULT_TERMINAL_TARGET = {
+  id: "platform",
+  kind: "platform",
+  label: "Platform",
+  url: "https://hermes-platform.ironnest.local/",
+  status: "online",
+};
+const terminal = {
+  targets: [DEFAULT_TERMINAL_TARGET],
+  activeId: "platform",
+  loaded: false,
+};
+
 // Kanban lifecycle columns (shared board via the bridge /kanban proxy).
 const KANBAN_COLUMNS = [
   ["triage", "Triage"], ["todo", "Todo"], ["ready", "Ready"],
@@ -47,6 +61,7 @@ async function loadState() {
   const data = await response.json();
   Object.assign(state, data);
   render();
+  loadTerminalTargets();
   $("#syncStatus").textContent = `Synced ${new Date(data.generated_at).toLocaleTimeString()}`;
 }
 
@@ -63,6 +78,7 @@ function render() {
   renderSelects();
   populateAgentProfiles();
   renderKpis();
+  renderTerminalTargets();
 }
 
 function operationLabel(action) {
@@ -138,6 +154,7 @@ async function loadOperations() {
     operations.enabled = false;
   }
   renderOperations();
+  if ($("#view-agent")?.classList.contains("active")) renderChat();
 }
 
 function openOperationApproval(id) {
@@ -146,6 +163,11 @@ function openOperationApproval(id) {
   operations.selected = item;
   $("#approvalExecuteSummary").textContent = `${operationLabel(item.action)} ${item.target}: ${item.reason}`;
   $("#approvalExecuteDialog").showModal();
+}
+
+async function openChatApproval(id) {
+  await loadOperations();
+  openOperationApproval(id);
 }
 
 const approvalTabs = $("#approvalTabs");
@@ -1205,7 +1227,7 @@ let _reportSearchTimer = null;
 // Runnable static webapp deliverables (folders with an index.html). Each app runs
 // LIVE on the sandboxed apps origin (apps.ironnest.local) — a separate browser
 // origin, so agent-authored HTML/JS can never script Mission Control.
-const apps = { items: [], loaded: false, search: "", open: new Set() };
+const apps = { items: [], loaded: false, search: "", open: new Set(), showHistory: false };
 
 async function loadApps() {
   const box = $("#appList");
@@ -1233,6 +1255,24 @@ function appCard(a) {
     ? `<span class="rep-date" title="Last updated ${escapeHtml(fmtEpoch(a.updated))}">${escapeHtml(fmtDate(a.updated))}</span>`
     : "";
   const zip = `/api/kanban/${encodeURIComponent(a.task_id)}/zip${sub ? `?sub=${encodeURIComponent(sub)}` : ""}`;
+  const release = a.release || null;
+  const candidate = a.candidate || null;
+  const status = a.catalog_status || "unclassified";
+  const candidateMeta = candidate
+    ? `<span class="app-candidate-role ${escapeHtml(candidate.role)}">${escapeHtml(candidate.source === "automatic" ? `Suggested ${candidate.role === "product" ? "product" : candidate.role}` : (candidate.role === "product" ? "Release candidate" : candidate.role))}</span>
+       <span class="app-check ${a.release_ready ? "ready" : "pending"}">${a.release_ready ? "Checklist complete" : "Checklist incomplete"}</span>`
+    : `<span class="app-check pending">Unclassified</span>`;
+  const releaseMeta = release
+    ? `<span class="app-release-state ${escapeHtml(status)}">${status === "current" ? "● Current" : "History"}</span>
+       <span class="app-project">${escapeHtml(release.project_name)}${release.release ? ` · ${escapeHtml(release.release)}` : ""}</span>
+       ${release.purpose ? `<span class="app-purpose">${escapeHtml(release.purpose)}</span>` : ""}`
+    : candidateMeta;
+  const classify = status === "current" ? ""
+    : candidate?.role === "product"
+      ? `<button type="button" class="rep-act app-classify" data-classify-task="${escapeHtml(a.task_id)}" data-classify-path="${escapeHtml(sub)}" data-classify-name="${escapeHtml(label)}" data-classify-role="product" title="Record the evidence required for this product candidate">Complete checklist</button>`
+      : `<button type="button" class="rep-act app-classify" data-classify-task="${escapeHtml(a.task_id)}" data-classify-path="${escapeHtml(sub)}" data-classify-name="${escapeHtml(label)}" data-classify-role="${escapeHtml(candidate?.role || "")}" title="Change the automatic artifact classification if needed">Override</button>`;
+  const publish = status === "current" || !a.release_ready ? ""
+    : `<button type="button" class="rep-act app-publish" data-publish-task="${escapeHtml(a.task_id)}" data-publish-path="${escapeHtml(sub)}" data-publish-name="${escapeHtml(label)}" title="Make this the current product release">Publish as current</button>`;
   return `<article class="app-card">
       <header class="rep-head">
         ${avatarHtml(a.assignee || "default", 28)}
@@ -1240,6 +1280,7 @@ function appCard(a) {
           <strong class="rep-title">${escapeHtml(label)}</strong>
           <div class="rep-subline">${dateHtml}</div>
           <div class="rep-meta">
+            ${releaseMeta}
             ${a.status ? `<span class="tag">${escapeHtml(a.status)}</span>` : ""}
             <span class="rep-assignee">${escapeHtml(a.assignee ? displayName(a.assignee) : "—")}</span>
             <span class="rep-count">${Number(a.file_count) || 0} file${Number(a.file_count) === 1 ? "" : "s"} · ${escapeHtml(fmtBytes(a.bytes))}</span>
@@ -1250,6 +1291,8 @@ function appCard(a) {
           <button type="button" class="rep-act app-open" data-open="${escapeHtml(a.url)}" data-name="${escapeHtml(label)}" title="Run this app in a sandboxed preview">▶ Open</button>
           <a class="rep-act" href="${escapeHtml(a.url)}" target="_blank" rel="noopener" title="Open the live app in a new tab">↗ New tab</a>
           <button type="button" class="rep-act rep-dl" data-zip="${escapeHtml(zip)}" data-name="${escapeHtml(label)}" title="Download the whole app folder as a .zip">⤓ .zip</button>
+          ${classify}
+          ${publish}
         </div>
       </header>
     </article>`;
@@ -1263,23 +1306,26 @@ function renderApps() {
     return;
   }
   const q = (apps.search || "").trim().toLowerCase();
-  const rows = apps.items.filter((a) => appMatches(a, q));
+  const rows = apps.items.filter((a) => appMatches(a, q) && (apps.showHistory || a.catalog_status === "current"));
   if (!rows.length) {
-    box.innerHTML = `<p class="empty">No apps match “${escapeHtml(apps.search)}”.</p>`;
+    box.innerHTML = apps.showHistory
+      ? `<p class="empty">No apps match “${escapeHtml(apps.search)}”.</p>`
+      : `<p class="empty">No current products have been published yet. Turn on <strong>Show delivery history</strong>, then choose the artifact that should become the current release.</p>`;
     return;
   }
-  // Group apps by their mother task (the goal) — same goal-walk as Reports. A
-  // standalone app (self-group, not part of a decomposed effort) renders bare;
-  // groups are collapsible, remembered in apps.open, force-open while searching.
+  // Current releases group by product. Delivery history retains its originating
+  // task group so build topology never obscures the product catalogue.
   const groups = new Map();
   for (const a of rows) {
-    const gid = a.group_id || a.task_id;
-    if (!groups.has(gid)) groups.set(gid, { id: gid, title: a.group_title || a.title, items: [] });
+    const published = a.release && a.catalog_status === "current";
+    const gid = published ? `product-${a.release.project_id}` : (a.group_id || a.task_id);
+    const title = published ? a.release.project_name : (a.group_title || a.title);
+    if (!groups.has(gid)) groups.set(gid, { id: gid, title, items: [] });
     groups.get(gid).items.push(a);
   }
   const searching = !!q;
   box.innerHTML = [...groups.values()].map((g) => {
-    const standalone = g.items.length === 1 && g.items[0].task_id === g.id;
+    const standalone = g.items.length === 1 && (g.id.startsWith("product-") || g.items[0].task_id === g.id);
     const cards = g.items.map(appCard).join("");
     if (standalone) return cards;
     const n = g.items.length;
@@ -1303,6 +1349,59 @@ function renderApps() {
     b.addEventListener("click", () => openAppPreview(b.dataset.open, b.dataset.name)));
   box.querySelectorAll("[data-zip]").forEach((b) =>
     b.addEventListener("click", () => triggerDownload(b.dataset.zip)));
+  box.querySelectorAll("[data-publish-task]").forEach((b) =>
+    b.addEventListener("click", () => publishApp(b)));
+  box.querySelectorAll("[data-classify-task]").forEach((b) =>
+    b.addEventListener("click", () => classifyApp(b)));
+}
+
+async function classifyApp(button) {
+  let cleanRole = button.dataset.classifyRole || "product";
+  if (cleanRole !== "product") {
+    const role = window.prompt("Override artifact role: product, implementation, review, deployment, demo, or internal", cleanRole);
+    if (role === null) return;
+    cleanRole = role.trim().toLowerCase();
+  }
+  const validRoles = new Set(["product", "implementation", "review", "deployment", "demo", "internal"]);
+  if (!validRoles.has(cleanRole)) { window.alert("Choose one of: product, implementation, review, deployment, demo, internal."); return; }
+  const payload = { task_id: button.dataset.classifyTask, app_path: button.dataset.classifyPath || "", role: cleanRole };
+  if (cleanRole === "product") {
+    const version = window.prompt("Release version (for example v1.0):", "v1.0"); if (version === null) return;
+    const accepted = window.confirm("Has this exact artifact passed user acceptance testing?");
+    const securityReview = window.prompt("Security review evidence (task name, ID, or URL):", ""); if (securityReview === null) return;
+    const deploymentUrl = window.prompt("Verified deployment URL:", ""); if (deploymentUrl === null) return;
+    const approvedBy = window.prompt("Approved by (person or team):", ""); if (approvedBy === null) return;
+    Object.assign(payload, { version: version.trim(), acceptance_passed: accepted, security_review: securityReview.trim(), deployment_url: deploymentUrl.trim(), approved_by: approvedBy.trim() });
+  }
+  try {
+    await api("/api/apps/candidate", { method: "POST", headers: headers(), body: JSON.stringify(payload) });
+    await loadApps();
+    setSync(cleanRole === "product" ? "Release checklist saved" : "Artifact classified");
+  } catch (err) {
+    setSync("Could not save artifact classification — admin token may be required");
+  }
+}
+
+async function publishApp(button) {
+  const fallback = button.dataset.publishName || "App";
+  const projectName = window.prompt("Product name (this groups its release history):", fallback);
+  if (projectName === null || !projectName.trim()) return;
+  const release = window.prompt("Release label (for example v1.0):", "v1.0");
+  if (release === null) return;
+  const purpose = window.prompt("Short purpose (optional):", "");
+  if (purpose === null) return;
+  try {
+    await api("/api/apps/publish", {
+      method: "POST", headers: headers(),
+      body: JSON.stringify({ task_id: button.dataset.publishTask, app_path: button.dataset.publishPath || "", project_name: projectName.trim(), release: release.trim(), purpose: purpose.trim() }),
+    });
+    apps.showHistory = false;
+    const toggle = $("#appHistoryToggle"); if (toggle) toggle.checked = false;
+    await loadApps();
+    setSync("Current product published");
+  } catch (err) {
+    setSync("Could not publish product — admin token may be required");
+  }
 }
 
 // Open a live app in the sandboxed preview dialog. The iframe points at the apps
@@ -1340,6 +1439,11 @@ let _appSearchTimer = null;
     if (_appSearchTimer) clearTimeout(_appSearchTimer);
     _appSearchTimer = setTimeout(() => { apps.search = el.value.trim(); renderApps(); }, 200);
   });
+})();
+(() => {
+  const el = $("#appHistoryToggle");
+  if (!el) return;
+  el.addEventListener("change", () => { apps.showHistory = el.checked; renderApps(); });
 })();
 
 function renderSchedules() {
@@ -1899,12 +2003,116 @@ document.querySelectorAll(".nav-item").forEach((button) => {
 
 // Lazy-load the embedded ttyd iframe only when the Terminal view is first opened
 // (avoids holding a WebSocket to the agent terminal while it's not in view).
+function savedTerminalTarget() {
+  try { return localStorage.getItem(TERMINAL_STORE_KEY) || "platform"; } catch (e) { return "platform"; }
+}
+terminal.activeId = savedTerminalTarget();
+
+function currentTerminalTarget() {
+  return terminal.targets.find((t) => t.id === terminal.activeId) || terminal.targets[0] || DEFAULT_TERMINAL_TARGET;
+}
+
+function terminalTargetOffline(target) {
+  if (!target || !target.url) return true;
+  if (target.kind === "agent") {
+    const profile = state.profiles.find((p) => p.name === target.id);
+    if (profile && profile.status !== "enabled") return true;
+    if (chat.health[target.id] === false) return true;
+  }
+  return target.status === "offline";
+}
+
+function terminalTargetLabel(target) {
+  if (!target) return "Terminal";
+  return target.kind === "agent" ? displayName(target.id) : (target.label || "Platform");
+}
+
+function terminalTargetSubtitle(target) {
+  if (!target || target.kind === "platform") {
+    return "hermes-platform management terminal · runs as the hermes user · FIDO-gated";
+  }
+  const container = target.container_name || `hermes-pf-${target.id}`;
+  if ((target.url || "").replace(/\/+$/, "") === DEFAULT_TERMINAL_TARGET.url.replace(/\/+$/, "")) {
+    return `${terminalTargetLabel(target)} selected · platform terminal · ${container} · FIDO-gated`;
+  }
+  return `${terminalTargetLabel(target)} shell · ${container} · FIDO-gated`;
+}
+
+function terminalTargetAvatar(target, size) {
+  if (target.kind === "agent") return avatarHtml(target.id, size);
+  const box = `width:${size}px;height:${size}px`;
+  return `<span class="ava term-platform-ava" style="${box};font-size:${Math.round(size * 0.38)}px">PF</span>`;
+}
+
+function syncTerminalTarget(loadFrame = false) {
+  const target = currentTerminalTarget();
+  const url = target.url || DEFAULT_TERMINAL_TARGET.url;
+  const f = $("#termFrame");
+  const open = $("#termOpen");
+  const sub = $("#termSub");
+  if (f) {
+    f.dataset.src = url;
+    f.title = `${terminalTargetLabel(target)} terminal`;
+    if (loadFrame || (f.getAttribute("src") && f.getAttribute("src") !== url)) f.src = url;
+  }
+  if (open) open.href = url;
+  if (sub) sub.textContent = terminalTargetSubtitle(target);
+}
+
+function selectTerminalTarget(id, loadFrame = true) {
+  const target = terminal.targets.find((t) => t.id === id);
+  if (!target || terminalTargetOffline(target)) return;
+  terminal.activeId = id;
+  try { localStorage.setItem(TERMINAL_STORE_KEY, id); } catch (e) { /* storage unavailable */ }
+  renderTerminalTargets();
+  syncTerminalTarget(loadFrame);
+}
+
+function renderTerminalTargets() {
+  const box = $("#termTargetDock");
+  if (!box) return;
+  const targets = terminal.targets.length ? terminal.targets : [DEFAULT_TERMINAL_TARGET];
+  if (terminal.loaded && !targets.some((t) => t.id === terminal.activeId && !terminalTargetOffline(t))) {
+    terminal.activeId = (targets.find((t) => !terminalTargetOffline(t)) || targets[0]).id;
+  }
+  box.innerHTML = targets.map((target) => {
+    const active = target.id === terminal.activeId || (!terminal.loaded && target.id === "platform");
+    const offline = terminalTargetOffline(target);
+    const cls = ["term-target", active ? "active" : "", offline ? "offline" : ""].filter(Boolean).join(" ");
+    const status = offline ? "offline" : "online";
+    const disabled = offline ? "disabled" : "";
+    const label = terminalTargetLabel(target);
+    return `<button type="button" class="${cls}" data-term-target="${escapeHtml(target.id)}" ${disabled} role="tab" aria-selected="${active ? "true" : "false"}" aria-label="${escapeHtml(label)} shell" title="${escapeHtml(label)} · ${status}">
+      ${terminalTargetAvatar(target, active ? 34 : 30)}<span class="status-dot"></span><span class="term-target-name">${escapeHtml(label)}</span>
+    </button>`;
+  }).join("");
+  box.querySelectorAll("[data-term-target]").forEach((el) => {
+    el.addEventListener("click", () => selectTerminalTarget(el.dataset.termTarget, true));
+  });
+  syncTerminalTarget(false);
+}
+
+async function loadTerminalTargets() {
+  try {
+    const data = await api("/api/terminal-targets");
+    const targets = (data && Array.isArray(data.targets) ? data.targets : []).filter((t) => t && t.id);
+    terminal.targets = targets.length ? targets : [DEFAULT_TERMINAL_TARGET];
+    terminal.loaded = true;
+  } catch (err) {
+    terminal.targets = terminal.targets.length ? terminal.targets : [DEFAULT_TERMINAL_TARGET];
+  }
+  renderTerminalTargets();
+}
+
 function ensureTerminal() {
+  if (!terminal.loaded) loadTerminalTargets();
+  syncTerminalTarget(false);
   const f = $("#termFrame");
   if (f && !f.getAttribute("src") && f.dataset.src) f.src = f.dataset.src;
 }
 const _termReload = $("#termReload");
 if (_termReload) _termReload.addEventListener("click", () => {
+  syncTerminalTarget(false);
   const f = $("#termFrame");
   if (f && f.dataset.src) f.src = f.dataset.src;  // reconnect = reload the frame
 });
@@ -1950,14 +2158,24 @@ $("#approvalRequestForm").addEventListener("submit", async (event) => {
 $("#approvalExecuteForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (event.submitter?.value === "cancel") { $("#approvalExecuteDialog").close(); return; }
+  const form = event.currentTarget;
+  if (form.dataset.submitting === "1") return;
   const operation = operations.selected;
   if (!operation) return;
+  form.dataset.submitting = "1";
+  const body = Object.fromEntries(new FormData(form).entries());
+  // Approval has been explicitly submitted. Close promptly rather than making
+  // the operator wait behind a potentially slow action runner.
+  $("#approvalExecuteDialog").close();
+  form.reset(); operations.selected = null;
+  setSync("Approval submitted — executing action…");
   try {
-    const body = Object.fromEntries(new FormData(event.currentTarget).entries());
     await api(`/api/operations/${encodeURIComponent(operation.id)}/approve`, { method: "POST", headers: headers(), body: JSON.stringify(body) });
-    $("#approvalExecuteDialog").close(); event.currentTarget.reset(); operations.selected = null;
     setSync("Approved Docker action executed"); await loadOperations();
-  } catch (err) { setSync("Execution failed — check approval expiry and runner status"); }
+  } catch (err) {
+    setSync("Approval submitted, but execution failed — check Approvals for details");
+    await loadOperations();
+  } finally { form.dataset.submitting = "0"; }
 });
 
 // Kanban: create dialog + archived toggle wiring
@@ -2165,6 +2383,7 @@ const CHAT_HINT = `<p class="chat-hint">Pick an agent and start chatting. Turns 
 
 function currentProfile() { return chat.profile || null; }
 function currentConv() { return chat.activeConv[currentProfile()] || null; }
+function convKey(profile, convId) { return `${profile || ""}::${convId || ""}`; }
 
 async function loadAgentMeta() {
   try {
@@ -2174,6 +2393,7 @@ async function loadAgentMeta() {
     renderAgentCard();
     renderChat();
     renderBrand();
+    renderTerminalTargets();
   } catch (err) { /* ignore — generated defaults still render */ }
 }
 
@@ -2182,6 +2402,7 @@ async function loadAgentsHealth() {
     const data = await api(`/api/agents/health`);
     chat.health = (data && data.health) || {};
     renderAgentPicker();
+    renderTerminalTargets();
     renderKpis();
   } catch (err) { /* ignore — dot stays at last-known/online */ }
 }
@@ -2439,8 +2660,9 @@ async function loadConversations(profile, force) {
     if (!convs.length) {
       const created = await api(`/api/agent/${encodeURIComponent(profile)}/conversations`, { method: "POST" });
       convs = [created.conversation];
-      chat.loadedHist[created.conversation.id] = true;
-      chat.transcripts[created.conversation.id] = [];
+      const key = convKey(profile, created.conversation.id);
+      chat.loadedHist[key] = true;
+      chat.transcripts[key] = [];
     }
     chat.convs[profile] = convs;
     if (!chat.activeConv[profile] || !convs.some((c) => c.id === chat.activeConv[profile])) {
@@ -2457,19 +2679,24 @@ async function loadConversations(profile, force) {
 
 async function loadConvHistory(convId) {
   if (!convId) { renderChat(); return; }
-  if (chat.loadedHist[convId]) { renderChat(); return; }
-  chat.loadedHist[convId] = true;
   const profile = currentProfile();
+  const key = convKey(profile, convId);
+  if (chat.loadedHist[key]) { renderChat(); return; }
+  chat.loadedHist[key] = true;
   try {
     const data = await api(`/api/agent/${encodeURIComponent(profile)}/conversations/${encodeURIComponent(convId)}/history`);
-    chat.transcripts[convId] = ((data && data.messages) || []).map((m) => ({
-      role: m.role === "user" ? "user" : m.role === "error" ? "error" : "agent",
+    chat.transcripts[key] = ((data && data.messages) || []).map((m) => ({
+      role: m.role === "user" ? "user" : m.role === "error" ? "error" : m.role === "system" ? "system" : "agent",
       text: m.text || "",
       attachments: m.attachments || [],
       ts: m.ts || "",
+      approval_id: m.approval_id || "",
+      approval_status: m.approval_status || "",
+      approval_action: m.approval_action || "",
+      approval_target: m.approval_target || "",
     }));
   } catch (err) {
-    chat.transcripts[convId] = chat.transcripts[convId] || [];
+    chat.transcripts[key] = chat.transcripts[key] || [];
   }
   if (convId === currentConv()) renderChat();
 }
@@ -2487,10 +2714,13 @@ function updateConvTitle() {
 // One conversation row: name + a ⋯ kebab that opens the shared actions menu.
 function convItemHtml(c, profile, archived) {
   const active = c.id === chat.activeConv[profile] ? "active" : "";
-  return `<div class="conv-item ${active} ${archived ? "archived" : ""}" data-conv="${escapeHtml(c.id)}">
+  const pinned = !!c.pinned && !archived;
+  return `<div class="conv-item ${active} ${archived ? "archived" : ""} ${pinned ? "pinned" : ""}" data-conv="${escapeHtml(c.id)}">
+            ${pinned ? `<span class="conv-pin" title="Pinned" aria-label="Pinned">📌</span>` : ""}
             <span class="conv-name">${escapeHtml(c.title || "New chat")}</span>
             <button class="conv-kebab" type="button" data-kebab="${escapeHtml(c.id)}"
-                    data-archived="${archived ? "1" : "0"}" aria-label="Conversation actions">⋯</button>
+                    data-archived="${archived ? "1" : "0"}"
+                    data-pinned="${pinned ? "1" : "0"}" aria-label="Conversation actions">⋯</button>
           </div>`;
 }
 
@@ -2501,20 +2731,28 @@ function renderConvList() {
   const profile = currentProfile();
   if (chat.search) {
     const rs = chat.searchResults;
+    const pinnedResults = rs.filter((r) => r.pinned && !r.archived);
+    const regularResults = rs.filter((r) => !(r.pinned && !r.archived));
+    const resultHtml = (r) =>
+      `<div class="conv-item result ${r.id === chat.activeConv[profile] ? "active" : ""} ${r.pinned && !r.archived ? "pinned" : ""}" data-conv="${escapeHtml(r.id)}">
+         <span class="conv-result-title">${r.pinned && !r.archived ? `<span class="conv-pin" title="Pinned" aria-label="Pinned">📌</span>` : ""}<span class="conv-name">${highlight(r.title || "New chat", chat.search)}</span></span>
+         <span class="conv-snippet">${highlight(r.snippet || "", chat.search)}</span>
+       </div>`;
     box.innerHTML = rs.length
-      ? rs.map((r) =>
-          `<div class="conv-item result ${r.id === chat.activeConv[profile] ? "active" : ""}" data-conv="${escapeHtml(r.id)}">
-             <span class="conv-name">${highlight(r.title || "New chat", chat.search)}</span>
-             <span class="conv-snippet">${highlight(r.snippet || "", chat.search)}</span>
-           </div>`
-        ).join("")
+      ? `${pinnedResults.length ? `<div class="conv-section-label">Pinned</div>${pinnedResults.map(resultHtml).join("")}` : ""}`
+        + `${pinnedResults.length && regularResults.length ? `<div class="conv-section-label">Recent</div>` : ""}`
+        + regularResults.map(resultHtml).join("")
       : `<p class="conv-empty">No matches</p>`;
   } else {
     const all = chat.convs[profile] || [];
     const active = all.filter((c) => !c.archived);
+    const pinned = active.filter((c) => c.pinned);
+    const recent = active.filter((c) => !c.pinned);
     const archived = all.filter((c) => c.archived);
     let html = active.length
-      ? active.map((c) => convItemHtml(c, profile, false)).join("")
+      ? `${pinned.length ? `<div class="conv-section-label">Pinned</div>${pinned.map((c) => convItemHtml(c, profile, false)).join("")}` : ""}`
+        + `${pinned.length && recent.length ? `<div class="conv-section-label">Recent</div>` : ""}`
+        + recent.map((c) => convItemHtml(c, profile, false)).join("")
       : `<p class="conv-empty">No conversations</p>`;
     if (archived.length) {
       const open = !!chat.showArchived;
@@ -2556,8 +2794,10 @@ function openConvMenu(kebabEl) {
   if (!m) return;
   const convId = kebabEl.dataset.kebab;
   const isArchived = kebabEl.dataset.archived === "1";
+  const isPinned = kebabEl.dataset.pinned === "1";
   if (!m.hidden && m.dataset.conv === convId) { closeConvMenu(); return; }  // toggle off
   m.dataset.conv = convId;
+  m.querySelector('[data-act="pin"]').textContent = isPinned ? "Unpin" : "Pin to top";
   m.querySelector('[data-act="archive"]').textContent = isArchived ? "Unarchive" : "Archive";
   m.hidden = false;
   // Position under the kebab, kept within the viewport.
@@ -2608,8 +2848,9 @@ async function newConv() {
     const data = await api(`/api/agent/${encodeURIComponent(profile)}/conversations`, { method: "POST" });
     const c = data.conversation;
     chat.convs[profile] = [c, ...(chat.convs[profile] || [])];
-    chat.transcripts[c.id] = [];
-    chat.loadedHist[c.id] = true;
+    const key = convKey(profile, c.id);
+    chat.transcripts[key] = [];
+    chat.loadedHist[key] = true;
     selectConv(c.id);
   } catch (err) { /* ignore */ }
 }
@@ -2651,6 +2892,25 @@ async function archiveConv(convId, archived) {
   renderConvList();
 }
 
+async function pinConv(convId, pinned) {
+  const profile = currentProfile();
+  convId = convId || currentConv();
+  if (!convId) return;
+  try {
+    await fetch(`/api/agent/${encodeURIComponent(profile)}/conversations/${encodeURIComponent(convId)}/pin`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pinned }),
+    });
+  } catch (err) { /* ignore — UI still updates optimistically */ }
+  const c = (chat.convs[profile] || []).find((x) => x.id === convId);
+  if (c) {
+    c.pinned = pinned;
+    c.pinned_at = pinned ? new Date().toISOString() : null;
+  }
+  chat.searchResults = (chat.searchResults || []).map((r) =>
+    r.id === convId ? { ...r, pinned, pinned_at: pinned ? new Date().toISOString() : null } : r);
+  renderConvList();
+}
+
 async function deleteConv(convId) {
   const profile = currentProfile();
   convId = convId || currentConv();
@@ -2660,8 +2920,8 @@ async function deleteConv(convId) {
     await fetch(`/api/agent/${encodeURIComponent(profile)}/conversations/${encodeURIComponent(convId)}`, { method: "DELETE" });
   } catch (err) { /* ignore */ }
   chat.convs[profile] = (chat.convs[profile] || []).filter((x) => x.id !== convId);
-  delete chat.transcripts[convId];
-  delete chat.loadedHist[convId];
+  delete chat.transcripts[convKey(profile, convId)];
+  delete chat.loadedHist[convKey(profile, convId)];
   chat.activeConv[profile] = null;
   const next = (chat.convs[profile] || []).find((x) => !x.archived) || chat.convs[profile][0];
   if (next) {
@@ -2689,14 +2949,14 @@ function dlLink(profile, name, label) {
 function renderChat() {
   const log = $("#chatLog");
   const convId = currentConv();
-  const msgs = (convId && chat.transcripts[convId]) || [];
+  const profile = currentProfile();
+  const msgs = (convId && chat.transcripts[convKey(profile, convId)]) || [];
   if (!msgs.length) {
     log.innerHTML = CHAT_HINT;
     return;
   }
-  const profile = currentProfile();
   const agentMeta = `${avatarHtml(profile, 22)}<span>${escapeHtml(displayName(profile))}</span>`;
-  log.innerHTML = msgs.map((m) => {
+  const messagesHtml = msgs.map((m) => {
     if (m.role === "thinking" || (m.role === "agent" && m.streaming && !m.text)) {
       return `<div class="msg agent"><span class="meta">${agentMeta}</span><span class="thinking-dots"><span></span><span></span><span></span></span></div>`;
     }
@@ -2713,13 +2973,32 @@ function renderChat() {
     ).join("");
     const cursor = m.role === "agent" && m.streaming ? `<span class="cursor"></span>` : "";
     const timeHtml = m.ts ? `<time class="msg-time" datetime="${escapeHtml(m.ts)}">${escapeHtml(formatTime(m.ts))}</time>` : "";
-    return `<div class="msg ${cls}"><span class="meta">${metaInner}${timeHtml}</span><div class="md-body msg-md">${renderMarkdown(m.text, profile)}</div>${cursor}${atts}</div>`;
+    const approvalAction = m.approval_id && m.approval_status === "requested"
+      ? `<button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(m.approval_id)}">Approve &amp; execute</button>` : "";
+    // Agents commonly cite proposal IDs in their own response. Make those
+    // references actionable in-place, rather than making the operator hunt for
+    // a separate system notification below the reply.
+    const referenced = m.role === "agent"
+      ? [...new Set((m.text.match(/op-[a-f0-9]{32}/gi) || []))]
+          .map((id) => operations.requests.find((item) => item.id === id && item.status === "pending_approval"))
+          .filter(Boolean) : [];
+    const referencedActions = referenced.length ? `<div class="chat-inline-approvals">${referenced.map((item) =>
+      `<button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(item.id)}">Approve ${escapeHtml(operationLabel(item.action))}</button>`).join("")}</div>` : "";
+    return `<div class="msg ${cls}"><span class="meta">${metaInner}${timeHtml}</span><div class="md-body msg-md">${renderMarkdown(m.text, profile)}</div>${approvalAction}${referencedActions}${cursor}${atts}</div>`;
   }).join("");
+  const pendingApprovals = operations.requests.filter((item) =>
+    item.status === "pending_approval" && item.requested_by === profile);
+  const approvalPanel = pendingApprovals.length ? `<section class="chat-approval-panel">
+    <div class="chat-approval-panel-title">🛡️ Pending approvals <span>${pendingApprovals.length}</span></div>
+    ${pendingApprovals.map((item) => `<div class="chat-approval-row"><div><strong>${escapeHtml(operationLabel(item.action))}</strong><p>${escapeHtml(item.target)} · ${escapeHtml(item.reason)}</p></div><button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(item.id)}">Approve &amp; execute</button></div>`).join("")}
+  </section>` : "";
+  log.innerHTML = messagesHtml + approvalPanel;
   log.scrollTop = log.scrollHeight;
 }
 
 function pushMsg(convId, msg) {
-  (chat.transcripts[convId] = chat.transcripts[convId] || []).push(msg);
+  const key = convKey(currentProfile(), convId);
+  (chat.transcripts[key] = chat.transcripts[key] || []).push(msg);
   if (convId === currentConv()) renderChat();
 }
 
@@ -3000,7 +3279,7 @@ async function handleSlash(profile, cmd, arg) {
   }
 
   if (cmd === "retry") {
-    const msgs = chat.transcripts[convId] || [];
+    const msgs = chat.transcripts[convKey(profile, convId)] || [];
     let lastUser = null;
     for (let i = msgs.length - 1; i >= 0; i--) { if (msgs[i].role === "user") { lastUser = msgs[i]; break; } }
     if (!lastUser) { pushSystem(convId, "Nothing to re-ask yet."); return; }
@@ -3017,10 +3296,11 @@ async function handleSlash(profile, cmd, arg) {
 // Skipped if the user has renamed the thread (server enforces this too).
 async function maybeAutoTitle(profile, convId) {
   chat.autoTitled = chat.autoTitled || new Set();
-  if (chat.autoTitled.has(convId)) return;
-  const msgs = (chat.transcripts[convId] || []).filter((m) => m.role === "user" || m.role === "agent");
+  const key = convKey(profile, convId);
+  if (chat.autoTitled.has(key)) return;
+  const msgs = (chat.transcripts[key] || []).filter((m) => m.role === "user" || m.role === "agent");
   if (msgs.length !== 2) return;  // only the very first user+agent exchange
-  chat.autoTitled.add(convId);
+  chat.autoTitled.add(key);
   try {
     const r = await api(`/api/agent/${encodeURIComponent(profile)}/conversations/${encodeURIComponent(convId)}/autotitle`, { method: "POST" });
     if (r && r.ok && r.title) {
@@ -3051,6 +3331,10 @@ $("#convDeleteBtn").addEventListener("click", () => deleteConv());
     if (!convId) return;
     if (act === "rename") renameConv(convId);
     else if (act === "delete") deleteConv(convId);
+    else if (act === "pin") {
+      const c = (chat.convs[currentProfile()] || []).find((x) => x.id === convId);
+      pinConv(convId, !(c && c.pinned));
+    }
     else if (act === "archive") {
       const c = (chat.convs[currentProfile()] || []).find((x) => x.id === convId);
       archiveConv(convId, !(c && c.archived));
@@ -3091,7 +3375,9 @@ const _chatLogEl = $("#chatLog");
 if (_chatLogEl) {
   _chatLogEl.addEventListener("click", (e) => {
     const youName = (chat.agentMeta["__you"] || {}).label || "you";
-    if (e.target.closest(".you-ava-btn")) openAvatarEditor("__you", youName);
+    const approval = e.target.closest("[data-chat-approval]");
+    if (approval) openChatApproval(approval.dataset.chatApproval);
+    else if (e.target.closest(".you-ava-btn")) openAvatarEditor("__you", youName);
     else if (e.target.closest(".you-name-btn")) editYouName();
   });
 }
@@ -3157,6 +3443,7 @@ $("#avatarForm").addEventListener("submit", async (e) => {
   renderAgentCard();
   renderChat();
   renderBrand();
+  renderTerminalTargets();
 });
 // ── Agent settings (SOUL.md + model + icon) ─────────────────────────────────
 let settingsTarget = null;
@@ -3295,7 +3582,7 @@ async function saveLabel() {
     const data = await r.json();
     chat.agentMeta[profile] = (data && data.meta) || chat.agentMeta[profile];
     setSettingsStatus(label ? "Display name saved." : "Display name cleared.");
-    renderAgentPicker(); renderAgentCard(); renderChat(); renderBrand();
+    renderAgentPicker(); renderAgentCard(); renderChat(); renderBrand(); renderTerminalTargets();
   } catch (err) { setSettingsStatus("Save failed (unreachable)."); }
 }
 

@@ -149,6 +149,7 @@
             </aside>
             <!-- Shared per-conversation actions menu, positioned next to the clicked ⋯ -->
             <div id="convMenu" class="conv-menu" role="menu" hidden>
+              <button type="button" data-act="pin" role="menuitem">Pin to top</button>
               <button type="button" data-act="rename" role="menuitem">Rename</button>
               <button type="button" data-act="archive" role="menuitem">Archive</button>
               <button type="button" data-act="delete" role="menuitem" class="danger">Delete</button>
@@ -183,9 +184,13 @@
             <div class="panel-head term-head">
               <div class="term-id">
                 <span class="term-dots"><i></i><i></i><i></i></span>
-                <div>
+                <div class="term-title-block">
                   <h2>Terminal</h2>
-                  <span class="term-sub">hermes-platform management terminal · runs as the hermes user · FIDO-gated</span>
+                  <span id="termSub" class="term-sub">hermes-platform management terminal · runs as the hermes user · FIDO-gated</span>
+                  <div class="term-target-row">
+                    <span class="term-target-label">Shell access</span>
+                    <div id="termTargetDock" class="term-target-dock" role="tablist" aria-label="Select shell access target"></div>
+                  </div>
                 </div>
               </div>
               <div class="term-actions">
@@ -193,7 +198,8 @@
                 <a id="termOpen" class="ghost-btn" href="https://hermes-platform.ironnest.local/" target="_blank" rel="noopener">Open in new tab ↗</a>
               </div>
             </div>
-            <iframe id="termFrame" class="term-frame" title="Hermes Platform terminal" data-src="https://hermes-platform.ironnest.local/"></iframe>
+            <iframe id="termFrame" class="term-frame" title="Hermes Platform terminal" data-src="https://hermes-platform.ironnest.local/"
+                    sandbox="allow-scripts allow-forms allow-same-origin" allow="clipboard-read; clipboard-write"></iframe>
             <div class="term-foot">Embedded live terminal. If it stays blank, your login may have expired — use <strong>Open in new tab</strong> to re-auth, then Reconnect.</div>
           </div>
         </section>
@@ -246,9 +252,12 @@
           <div class="panel">
             <div class="panel-head">
               <h2>Apps</h2>
+            </div>
+            <div class="apps-toolbar">
+              <label class="apps-history-toggle"><input id="appHistoryToggle" type="checkbox" /> Show delivery history</label>
               <input id="appSearch" class="conv-search report-search" type="search" autocomplete="off" placeholder="Search apps — name · agent · status…" aria-label="Search apps" />
             </div>
-            <p class="apps-hint">Complete webapp deliverables. Each app a task saves into its own folder (with an <code>index.html</code>) runs live here, isolated on a separate origin.</p>
+            <p class="apps-hint">Your catalog shows deliberately published current products. Delivery artifacts are classified automatically; a suggested product needs acceptance, review evidence, a deployment URL, version, and approver before it can be published.</p>
             <div id="appList" class="app-list"><p class="empty">Loading…</p></div>
           </div>
         </section>

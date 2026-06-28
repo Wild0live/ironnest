@@ -12,7 +12,8 @@ read-only role scoped to the Wazuh alert/monitoring indices.
 ```sh
 # inside the indexer container
 docker exec -it wazuh.indexer \
-  bash /usr/share/wazuh-indexer/plugins/opensearch-security/tools/hash.sh -p 'YOUR_STRONG_PASSWORD'
+  bash -lc 'export OPENSEARCH_JAVA_HOME=/usr/share/wazuh-indexer/jdk; \
+    /usr/share/wazuh-indexer/plugins/opensearch-security/tools/hash.sh -p "YOUR_STRONG_PASSWORD"'
 # → copy the printed $2y$... hash
 ```
 
@@ -62,6 +63,7 @@ wazuh_alerts_readonly:
 ```sh
 docker exec -it wazuh.indexer bash -lc '
   export INSTALLDIR=/usr/share/wazuh-indexer
+  export OPENSEARCH_JAVA_HOME=/usr/share/wazuh-indexer/jdk
   bash $INSTALLDIR/plugins/opensearch-security/tools/securityadmin.sh \
     -cd $INSTALLDIR/config/opensearch-security \
     -icl -nhnv \

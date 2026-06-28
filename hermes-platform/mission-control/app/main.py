@@ -58,6 +58,11 @@ BRIDGE_TIMEOUT = int(os.environ.get("AGENT_BRIDGE_PROXY_TIMEOUT", "270"))
 # the internal operations-runner; it is never exposed to profile agents.
 OPERATIONS_RUNNER_URL = os.environ.get("OPERATIONS_RUNNER_URL", "").rstrip("/")
 OPERATIONS_RUNNER_TOKEN = os.environ.get("OPERATIONS_RUNNER_TOKEN", "").strip()
+OPERATIONS_ALLOWED_CONTAINERS = frozenset(item.strip() for item in os.environ.get(
+    "OPERATIONS_ALLOWED_CONTAINERS", "").split(",") if item.strip())
+OPERATIONS_ALLOW_ALL_CONTAINERS = os.environ.get("OPERATIONS_ALLOW_ALL_CONTAINERS", "").strip().lower() in {
+    "1", "true", "yes", "on"}
+_DOCKER_CONTAINER_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
 OPERATIONS_APPROVAL_TTL = int(os.environ.get("OPERATIONS_APPROVAL_TTL_SECONDS", "600"))
 OPERATIONS_ARCHIVE_AFTER_DAYS = int(os.environ.get("OPERATIONS_ARCHIVE_AFTER_DAYS", "30"))
 OPERATIONS_RETENTION_DAYS = int(os.environ.get("OPERATIONS_RETENTION_DAYS", "180"))
@@ -78,6 +83,10 @@ HOST_OPERATIONS_QUEUE_DIR = Path(os.environ.get("HOST_OPERATIONS_QUEUE_DIR", "")
 # serves app bytes itself.
 APPS_BASE = os.environ.get("MISSION_CONTROL_APPS_BASE",
                            "https://apps.ironnest.local").rstrip("/")
+TERMINAL_PLATFORM_URL = os.environ.get("MISSION_CONTROL_PLATFORM_TERMINAL_URL",
+                                       "https://hermes-platform.ironnest.local/").strip()
+AGENT_TERMINAL_URL_PATTERN = os.environ.get("MISSION_CONTROL_AGENT_TERMINAL_URL_PATTERN",
+                                            "{platform_url}terminal/{profile}/").strip()
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 _STORE_LOCK = threading.Lock()
@@ -151,6 +160,27 @@ class OperationApproval(BaseModel):
     note: str = Field(default="", max_length=500)
 
 
+class AppReleasePublish(BaseModel):
+    """An explicit promotion of a runnable artifact into the Apps catalogue."""
+    task_id: str = Field(..., min_length=1, max_length=160)
+    app_path: str = Field(default="", max_length=500)
+    project_name: str = Field(..., min_length=1, max_length=120)
+    release: str = Field(default="", max_length=80)
+    purpose: str = Field(default="", max_length=500)
+
+
+class AppReleaseCandidateSet(BaseModel):
+    """Release-readiness evidence kept beside, never inside, an artifact."""
+    task_id: str = Field(..., min_length=1, max_length=160)
+    app_path: str = Field(default="", max_length=500)
+    role: Literal["product", "implementation", "review", "deployment", "demo", "internal"]
+    version: str = Field(default="", max_length=80)
+    acceptance_passed: bool = False
+    security_review: str = Field(default="", max_length=240)
+    deployment_url: str = Field(default="", max_length=500)
+    approved_by: str = Field(default="", max_length=120)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -207,6 +237,10 @@ def _default_store() -> dict[str, Any]:
         ],
         "schedules": [],
         "operations": [],
+        # Release metadata is Mission Control-owned. It never changes the
+        # gateway-owned artifacts that supplied the runnable app.
+        "app_releases": [],
+        "app_candidates": [],
     }
 
 
@@ -223,6 +257,8 @@ def _read_store() -> dict[str, Any]:
     data.setdefault("tasks", [])
     data.setdefault("schedules", [])
     data.setdefault("operations", [])
+    data.setdefault("app_releases", [])
+    data.setdefault("app_candidates", [])
     return data
 
 
@@ -259,6 +295,27 @@ def _profiles() -> list[dict[str, Any]]:
             "policy_loaded": policy_loaded,
         })
     return sorted(out, key=lambda item: item["name"])
+
+
+def _with_trailing_slash(url: str) -> str:
+    return url if not url or url.endswith("/") else f"{url}/"
+
+
+def _agent_terminal_url(profile: dict[str, Any]) -> str:
+    if not AGENT_TERMINAL_URL_PATTERN:
+        return _with_trailing_slash(TERMINAL_PLATFORM_URL)
+    name = str(profile.get("name", ""))
+    container_name = str(profile.get("container_name") or f"hermes-pf-{name}")
+    try:
+        return _with_trailing_slash(AGENT_TERMINAL_URL_PATTERN.format(
+            profile=name,
+            name=name,
+            platform_url=_with_trailing_slash(TERMINAL_PLATFORM_URL),
+            container_name=container_name,
+            container=container_name,
+        ))
+    except (KeyError, ValueError):
+        return ""
 
 
 def _recent_activity(limit: int = 40) -> list[dict[str, Any]]:
@@ -393,7 +450,9 @@ def search_profile(profile: str, query: str, limit: int = 50) -> list[dict[str, 
                     snippet = _snippet(text, q)
         if title_hit or matches:
             results.append({"id": cid, "title": title, "updated_at": c.get("updated_at", ""),
-                            "snippet": snippet or title, "matches": matches})
+                            "snippet": snippet or title, "matches": matches,
+                            "pinned": bool(c.get("pinned")),
+                            "archived": bool(c.get("archived"))})
         if len(results) >= limit:
             break
     return results
@@ -447,6 +506,20 @@ def set_conversation_archived(profile: str, conv: str, archived: bool) -> bool:
             return False
         entry["archived"] = bool(archived)
         entry["updated_at"] = _now()
+        _write_json(_index_path(profile), {"conversations": convs})
+    return True
+
+
+def set_conversation_pinned(profile: str, conv: str, pinned: bool) -> bool:
+    """Flip a conversation's pinned flag. Returns True if the conv was found."""
+    with _HIST_LOCK:
+        idx = _read_json(_index_path(profile))
+        convs = idx.get("conversations", [])
+        entry = next((c for c in convs if c.get("id") == conv), None)
+        if entry is None:
+            return False
+        entry["pinned"] = bool(pinned)
+        entry["pinned_at"] = _now() if pinned else None
         _write_json(_index_path(profile), {"conversations": convs})
     return True
 
@@ -672,6 +745,30 @@ async def create_schedule(req: ScheduleCreate, _: None = Depends(require_admin))
 def agents() -> JSONResponse:
     """Profiles that can be chatted with (same roster as /api/state)."""
     return JSONResponse(content={"agents": _profiles()})
+
+
+@router.get("/api/terminal-targets")
+def terminal_targets() -> JSONResponse:
+    targets: list[dict[str, Any]] = [{
+        "id": "platform",
+        "kind": "platform",
+        "label": "Platform",
+        "url": _with_trailing_slash(TERMINAL_PLATFORM_URL),
+        "status": "online" if TERMINAL_PLATFORM_URL else "offline",
+    }]
+    for p in _profiles():
+        name = p["name"]
+        url = _agent_terminal_url(p)
+        targets.append({
+            "id": name,
+            "kind": "agent",
+            "label": name,
+            "profile": name,
+            "container_name": p.get("container_name", ""),
+            "url": url,
+            "status": "online" if p.get("status") == "enabled" and url else "offline",
+        })
+    return JSONResponse(content={"targets": targets})
 
 
 @router.post("/api/agent/{profile}/chat")
@@ -1005,6 +1102,10 @@ class ConvArchive(BaseModel):
     archived: bool = True
 
 
+class ConvPin(BaseModel):
+    pinned: bool = True
+
+
 @router.get("/api/agent/{profile}/conversations")
 def conversations_list(profile: str) -> JSONResponse:
     return JSONResponse(content={"conversations": list_conversations(profile)})
@@ -1052,6 +1153,13 @@ def conversations_archive(profile: str, conv: str, req: ConvArchive) -> JSONResp
     if not set_conversation_archived(profile, conv, req.archived):
         raise HTTPException(status_code=404, detail="unknown conversation")
     return JSONResponse(content={"ok": True, "archived": req.archived})
+
+
+@router.post("/api/agent/{profile}/conversations/{conv}/pin")
+def conversations_pin(profile: str, conv: str, req: ConvPin) -> JSONResponse:
+    if not set_conversation_pinned(profile, conv, req.pinned):
+        raise HTTPException(status_code=404, detail="unknown conversation")
+    return JSONResponse(content={"ok": True, "pinned": req.pinned})
 
 
 @router.post("/api/agent/{profile}/conversations/{conv}/reset")
@@ -1736,6 +1844,57 @@ def _show_task(tid: str, cache: dict[str, dict]) -> dict:
     return cache[tid]
 
 
+def _project_id(name: str) -> str:
+    """Stable, human-readable key for one product's release history."""
+    key = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+    return key[:80] or "app"
+
+
+def _release_key(task_id: str, app_path: str) -> tuple[str, str]:
+    return task_id, app_path.strip().strip("/")
+
+
+def _candidate_ready(candidate: dict[str, Any] | None) -> bool:
+    """A product cannot be published until its acceptance evidence is complete."""
+    if not isinstance(candidate, dict) or candidate.get("role") != "product":
+        return False
+    return bool(candidate.get("acceptance_passed") and candidate.get("version", "").strip()
+                and candidate.get("security_review", "").strip()
+                and candidate.get("deployment_url", "").strip()
+                and candidate.get("approved_by", "").strip())
+
+
+def _infer_artifact_role(app: dict[str, Any]) -> dict[str, str]:
+    """Classify delivery work from durable task metadata, never from code bytes.
+
+    The result is intentionally a suggestion: it removes routine catalog
+    housekeeping without claiming that an untested artifact is production-ready.
+    """
+    text = " ".join(str(app.get(k, "")) for k in ("name", "title", "group_title", "detail")).lower()
+    rules = (
+        ("review", ("review", "audit", "security", "qa", "test")),
+        ("deployment", ("rancher", "docker", "container", "kubernetes", "k8s", "helm", "deploy")),
+        ("implementation", ("implement", "implementation", "backend", "frontend", "source", "scaffold", "prototype")),
+        ("demo", ("demo", "example", "sample", "showcase")),
+        ("internal", ("internal", "admin", "diagnostic", "tooling")),
+    )
+    for role, markers in rules:
+        if any(marker in text for marker in markers):
+            return {"role": role, "source": "automatic"}
+    # A remaining runnable app is the best product candidate in its delivery
+    # group. It is still blocked from publishing until its evidence is supplied.
+    return {"role": "product", "source": "automatic"}
+
+
+def _indexed_app_exists(task_id: str, app_path: str) -> bool:
+    code, payload = _kanban_bridge({"action": "apps_index"})
+    indexed = (payload.get("apps") if isinstance(payload, dict) else None) or []
+    return code == 200 and any(
+        _release_key(str(app.get("task_id", "")), str(app.get("app_path", ""))) == (task_id, app_path)
+        for app in indexed if isinstance(app, dict)
+    )
+
+
 @router.get("/api/reports")
 def reports() -> JSONResponse:
     code, payload = _kanban_bridge({"action": "reports_index"})
@@ -1746,12 +1905,92 @@ def reports() -> JSONResponse:
 def apps_library() -> JSONResponse:
     code, payload = _kanban_bridge({"action": "apps_index"})
     if code == 200 and isinstance(payload, dict) and isinstance(payload.get("apps"), list):
+        store = _read_store()
+        releases = store.get("app_releases", [])
+        candidates = store.get("app_candidates", [])
+        by_artifact = {
+            _release_key(str(r.get("task_id", "")), str(r.get("app_path", ""))): r
+            for r in releases if isinstance(r, dict)
+        }
+        candidate_by_artifact = {
+            _release_key(str(c.get("task_id", "")), str(c.get("app_path", ""))): c
+            for c in candidates if isinstance(c, dict)
+        }
         # The bridge returns a relative `url_path` per app; the public origin
         # (apps.ironnest.local) lives in MC config, so prefix it here.
         for a in payload["apps"]:
             a["url"] = APPS_BASE + (a.get("url_path") or "/")
+            key = _release_key(str(a.get("task_id", "")), str(a.get("app_path", "")))
+            release = by_artifact.get(key)
+            candidate = candidate_by_artifact.get(key) or _infer_artifact_role(a)
+            a["candidate"] = candidate
+            a["release_ready"] = _candidate_ready(candidate)
+            if release:
+                a["release"] = release
+                a["catalog_status"] = "current" if release.get("status") == "current" else "historical"
+            else:
+                a["catalog_status"] = "unclassified"
         payload["apps_base"] = APPS_BASE
     return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/apps/candidate", status_code=201)
+def app_release_candidate_set(req: AppReleaseCandidateSet, _: None = Depends(require_admin)) -> JSONResponse:
+    """Record whether an artifact is product, review, deployment, etc., plus
+    the auditable evidence required before a product can be published."""
+    task_id, app_path = _release_key(req.task_id, req.app_path)
+    if not _indexed_app_exists(task_id, app_path):
+        raise HTTPException(status_code=404, detail="runnable artifact not found in Apps index")
+    store = _read_store()
+    candidates = store["app_candidates"]
+    candidate = next((item for item in candidates
+                      if _release_key(str(item.get("task_id", "")), str(item.get("app_path", ""))) == (task_id, app_path)), None)
+    now = _now()
+    if candidate is None:
+        candidate = {"id": f"candidate-{uuid.uuid4().hex[:12]}", "task_id": task_id,
+                     "app_path": app_path, "created_at": now}
+        candidates.append(candidate)
+    candidate.update({**req.model_dump(exclude={"task_id", "app_path"}), "updated_at": now})
+    _write_store(store)
+    return JSONResponse(status_code=201, content={"ok": True, "candidate": candidate,
+                                                   "release_ready": _candidate_ready(candidate)})
+
+
+@router.post("/api/apps/publish", status_code=201)
+def app_publish(req: AppReleasePublish, _: None = Depends(require_admin)) -> JSONResponse:
+    """Make one runnable artifact the current release for a product.
+
+    Previous releases stay as history. This intentionally requires an operator
+    action instead of guessing from a task name, timestamp, or index.html.
+    """
+    task_id, app_path = _release_key(req.task_id, req.app_path)
+    if not _indexed_app_exists(task_id, app_path):
+        raise HTTPException(status_code=404, detail="runnable artifact not found in Apps index")
+    project_name = req.project_name.strip()
+    project_id = _project_id(project_name)
+    store = _read_store()
+    candidate = next((item for item in store["app_candidates"]
+                      if _release_key(str(item.get("task_id", "")), str(item.get("app_path", ""))) == (task_id, app_path)), None)
+    if not _candidate_ready(candidate):
+        raise HTTPException(status_code=409, detail="complete the release-candidate checklist before publishing")
+    releases = store["app_releases"]
+    now = _now()
+    for item in releases:
+        if item.get("project_id") == project_id and item.get("status") == "current":
+            item["status"] = "superseded"
+            item["superseded_at"] = now
+    release = next((item for item in releases
+                    if _release_key(str(item.get("task_id", "")), str(item.get("app_path", ""))) == (task_id, app_path)), None)
+    if release is None:
+        release = {"id": f"release-{uuid.uuid4().hex[:12]}", "task_id": task_id,
+                   "app_path": app_path, "created_at": now}
+        releases.append(release)
+    release.update({"project_id": project_id, "project_name": project_name,
+                    "release": req.release.strip() or "Current release",
+                    "purpose": req.purpose.strip(), "status": "current", "published_at": now})
+    release.pop("superseded_at", None)
+    _write_store(store)
+    return JSONResponse(status_code=201, content={"ok": True, "release": release})
 
 
 @router.post("/api/kanban/{task_id}/hide")
@@ -1916,12 +2155,18 @@ def _operations_enabled() -> bool:
 
 
 def _operation_targets() -> set[str]:
-    """Only profile gateway containers may be requested from Mission Control.
+    """Containers eligible for individual approval-gated lifecycle actions.
 
-    The runner is authoritative and has its own static allowlist; this check
-    keeps a malformed or stale dashboard request from becoming a proposal.
+    The runner independently enforces the same configured exact-name allowlist.
+    This check prevents a stale or malformed dashboard request from becoming a
+    proposal; it is not a Docker discovery or proxy endpoint.
     """
-    return {str(p.get("container_name") or f"hermes-pf-{p['name']}") for p in _profiles()}
+    return set(OPERATIONS_ALLOWED_CONTAINERS)
+
+
+def _operation_target_allowed(value: str) -> bool:
+    return bool(_DOCKER_CONTAINER_NAME.fullmatch(value)) and (
+        OPERATIONS_ALLOW_ALL_CONTAINERS or value in OPERATIONS_ALLOWED_CONTAINERS)
 
 
 def _operation_view(item: dict[str, Any]) -> dict[str, Any]:
@@ -1950,7 +2195,9 @@ def _notify_operation_thread(item: dict[str, Any], event: str) -> None:
     }
     text = messages.get(event)
     if text:
-        conv_append(profile, conv, {"role": "system", "text": text, "ts": _now()})
+        conv_append(profile, conv, {"role": "system", "text": text, "ts": _now(),
+                                    "approval_id": item.get("id"), "approval_status": event,
+                                    "approval_action": action, "approval_target": target})
 
 
 def _reconcile_host_operations(store: dict[str, Any]) -> None:
@@ -2002,6 +2249,13 @@ def operations_list(_: None = Depends(require_admin)) -> JSONResponse:
     store = _read_store()
     _reconcile_host_operations(store)
     _maintain_operations(store)
+    backfilled = False
+    for item in store.get("operations", []):
+        if item.get("status") == "pending_approval" and not item.get("conversation_id"):
+            _notify_operation_thread(item, "requested")
+            backfilled = True
+    if backfilled:
+        _write_store(store)
     items = sorted(store.get("operations", []), key=lambda x: x.get("created_at", ""), reverse=True)
     return JSONResponse(content={"enabled": _operations_enabled(),
                                  "actions": ["start", "stop", "restart", "docker_api", "host_powershell"],
@@ -2014,8 +2268,8 @@ def operations_list(_: None = Depends(require_admin)) -> JSONResponse:
 def _create_operation_request(req: OperationRequestCreate, requested_by: str | None = None) -> dict[str, Any]:
     if not _operations_enabled():
         raise HTTPException(status_code=503, detail="operations runner is not configured")
-    if req.action not in ("docker_api", "host_powershell") and req.target not in _operation_targets():
-        raise HTTPException(status_code=400, detail="target is not an enabled profile gateway")
+    if req.action not in ("docker_api", "host_powershell") and not _operation_target_allowed(req.target):
+        raise HTTPException(status_code=400, detail="target is not approved for lifecycle operations")
     if req.action == "docker_api" and (not req.method or not req.path):
         raise HTTPException(status_code=400, detail="docker_api requires method and path")
     if req.action == "host_powershell" and (not req.script or not req.script.strip()):

@@ -195,6 +195,70 @@ http:
       service: hermes-platform
       tls: {}
 
+    hermes-terminal-default:
+      rule: "Host(`hermes-platform.ironnest.local`) && PathPrefix(`/terminal/default`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, strict-rate-limit, authelia, frame-mission]
+      service: hermes-terminal-default
+      priority: 100
+      tls: {}
+
+    hermes-terminal-mark:
+      rule: "Host(`hermes-platform.ironnest.local`) && PathPrefix(`/terminal/mark`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, strict-rate-limit, authelia, frame-mission]
+      service: hermes-terminal-mark
+      priority: 100
+      tls: {}
+
+    hermes-terminal-steve:
+      rule: "Host(`hermes-platform.ironnest.local`) && PathPrefix(`/terminal/steve`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, strict-rate-limit, authelia, frame-mission]
+      service: hermes-terminal-steve
+      priority: 100
+      tls: {}
+
+    hermes-terminal-qa:
+      rule: "Host(`hermes-platform.ironnest.local`) && PathPrefix(`/terminal/qa`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, strict-rate-limit, authelia, frame-mission]
+      service: hermes-terminal-qa
+      priority: 100
+      tls: {}
+
+    hermes-terminal-littlejohn:
+      rule: "Host(`hermes-platform.ironnest.local`) && PathPrefix(`/terminal/littlejohn`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, strict-rate-limit, authelia, frame-mission]
+      service: hermes-terminal-littlejohn
+      priority: 100
+      tls: {}
+
+    hermes-terminal-jaime:
+      rule: "Host(`hermes-platform.ironnest.local`) && PathPrefix(`/terminal/jaime`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, strict-rate-limit, authelia, frame-mission]
+      service: hermes-terminal-jaime
+      priority: 100
+      tls: {}
+
+    hermes-terminal-bigbert:
+      rule: "Host(`hermes-platform.ironnest.local`) && PathPrefix(`/terminal/bigbert`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, strict-rate-limit, authelia, frame-mission]
+      service: hermes-terminal-bigbert
+      priority: 100
+      tls: {}
+
+    hermes-terminal-octo:
+      rule: "Host(`hermes-platform.ironnest.local`) && PathPrefix(`/terminal/octo`)"
+      entryPoints: [websecure]
+      middlewares: [trusted-networks, strict-rate-limit, authelia, frame-mission]
+      service: hermes-terminal-octo
+      priority: 100
+      tls: {}
+
     # ── Hermes Platform web dashboard (on-demand) ─────────────────────────────────
     # The platform dashboard is a Vite SPA (NOT the legacy Python dashboard) and
     # fires multiple asset requests on initial load, so we use loose `rate-limit`
@@ -330,6 +394,46 @@ http:
       loadBalancer:
         servers:
           - url: "http://hermes-platform-ttyd:7682"
+
+    hermes-terminal-default:
+      loadBalancer:
+        servers:
+          - url: "http://hermes-pf-default:7682"
+
+    hermes-terminal-mark:
+      loadBalancer:
+        servers:
+          - url: "http://hermes-pf-mark:7682"
+
+    hermes-terminal-steve:
+      loadBalancer:
+        servers:
+          - url: "http://hermes-pf-steve:7682"
+
+    hermes-terminal-qa:
+      loadBalancer:
+        servers:
+          - url: "http://hermes-pf-qa:7682"
+
+    hermes-terminal-littlejohn:
+      loadBalancer:
+        servers:
+          - url: "http://hermes-pf-littlejohn:7682"
+
+    hermes-terminal-jaime:
+      loadBalancer:
+        servers:
+          - url: "http://hermes-pf-jaime:7682"
+
+    hermes-terminal-bigbert:
+      loadBalancer:
+        servers:
+          - url: "http://hermes-pf-bigbert:7682"
+
+    hermes-terminal-octo:
+      loadBalancer:
+        servers:
+          - url: "http://hermes-pf-octo:7682"
 
     hermes-platform-dashboard:
       loadBalancer:

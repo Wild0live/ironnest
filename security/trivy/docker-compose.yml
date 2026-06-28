@@ -6,7 +6,7 @@
 #
 # The scanner talks to the read-only socket-proxy to list/inspect images — it
 # never has direct /var/run/docker.sock access. Scan reports land on host at
-# G:\rancher-stack-backups\trivy\ via bind mount.
+# E:\rancher-stack-backups\trivy\ via bind mount.
 
 name: trivy
 
@@ -65,7 +65,7 @@ services:
   # Usage examples:
   #   docker compose run --rm scanner image <image-ref>
   #   docker compose run --rm scanner image --format json -o /reports/nginx.json nginx:latest
-  # Reports written to G:\rancher-stack-backups\trivy\ via bind mount.
+  # Reports written to E:\rancher-stack-backups\trivy\ via bind mount.
   scanner:
     image: aquasec/trivy:0.70.0
     profiles: ["scanner"]         # never starts with `up` — only `run --rm scanner`
@@ -79,7 +79,7 @@ services:
       NO_PROXY: "socket-proxy,trivy-server,localhost,127.0.0.1,.local"
     volumes:
       - trivy-cache:/cache
-      - G:/rancher-stack-backups/trivy:/reports
+      - E:/rancher-stack-backups/trivy:/reports
     networks:
       - platform-net
     dns:

@@ -59,6 +59,12 @@ services:
       - DAC_READ_SEARCH
     security_opt:
       - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "test -d /view && test -r /view && test -w /tmp && test -w /root/.vscode-server"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     deploy:
       resources:
         limits:

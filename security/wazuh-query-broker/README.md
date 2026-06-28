@@ -31,10 +31,14 @@ hermes-pf-john ─┘   (bearer token, read-only)  └─ wazuh.manager:55000 (a
 
 All but `/health` require `Authorization: Bearer <token>`.
 
-## Deploy (you run this — needs Wazuh credentials)
+## Deployment status
 
-> The build-out was prepared by Claude; the steps that authenticate to the live
-> SIEM are left to you on purpose.
+**2026-06-20:** deployed for `hermes-pf-littlejohn`. The broker is healthy,
+`broker_ro` can search alerts but receives `403` on writes, and Littlejohn has a
+scoped `WAZUH_QUERY_TOKEN` from Infisical plus a `NO_PROXY` exception for
+`wazuh-query`. Octo is not enabled by this rollout.
+
+## Deploy / extend
 
 1. **Create the read-only indexer user** — see [setup-readonly-user.md](setup-readonly-user.md).
    (You *can* start with the existing `admin` password to smoke-test, but don't

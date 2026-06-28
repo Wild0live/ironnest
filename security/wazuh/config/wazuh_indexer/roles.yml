@@ -1,0 +1,25 @@
+---
+# Dedicated least-privilege role for the agent-facing Wazuh query broker.
+# The broker itself only makes search requests; this role also prevents writes
+# if its credential is ever misused outside the broker.
+_meta:
+  type: "roles"
+  config_version: 2
+
+wazuh_alerts_readonly:
+  reserved: false
+  hidden: false
+  cluster_permissions:
+  - "cluster_composite_ops_ro"
+  index_permissions:
+  - index_patterns:
+    - "wazuh-alerts-*"
+    - "wazuh-monitoring-*"
+    - "wazuh-states-*"
+    allowed_actions:
+    - "read"
+    - "indices:data/read/search"
+    - "indices:data/read/scroll"
+    - "indices:admin/mappings/get"
+  tenant_permissions: []
+  static: false

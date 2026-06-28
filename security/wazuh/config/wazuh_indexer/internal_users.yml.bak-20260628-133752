@@ -58,6 +58,6 @@ snapshotrestore:
 # Dedicated identity for the agent-facing Wazuh query broker. Its mapped role
 # is limited to read operations on Wazuh alert and monitoring indices.
 broker_ro:
-  hash: "$2y$12$tYaVE6ZFqfTEzI3PTvAHIO6zHQKvGxuyZPq3A0/9ayz92uuWZssH6"
+  hash: "$2y$12$EWeV3cdvl9vRIjXoXh6vMuc5BOOuOVRouYs3xeHQ67efynDd0.8Ui"
   reserved: false
   description: "Read-only user for wazuh-query-broker"

@@ -41,7 +41,7 @@ webauthn:
 
 authentication_backend:
   password_reset:
-    disable: true   # no SMTP wired up; resets handled by editing users.yml
+    disable: true   # resets still handled by editing users.yml
   file:
     path: /config/users.yml
     password:
@@ -71,13 +71,11 @@ storage:
   local:
     path: /data/db.sqlite3
 
-# We have no SMTP wired up. Authelia requires *some* notifier configured;
-# filesystem notifier writes notifications to a file (we won't use them since
-# password_reset is disabled and webauthn registration goes through the UI).
 notifier:
-  disable_startup_check: true
-  filesystem:
-    filename: /data/notifications.txt
+  smtp:
+    address: 'submission://smtp.gmail.com:587'
+    username: 'harddy25359@gmail.com'
+    sender: 'IronNest Authelia <harddy25359@gmail.com>'
 
 identity_validation:
   reset_password:

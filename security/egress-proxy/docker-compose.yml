@@ -75,6 +75,12 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /blocklists/malicious_ips.txt"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 2m
     deploy:
       resources:
         limits:

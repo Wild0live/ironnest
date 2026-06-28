@@ -12,6 +12,7 @@ be re-applied after a profile rebuild.
 authored-skills/
   littlejohn/security/nvd-epss-kev-lookup/   → installed (live)
   littlejohn/security/wazuh-query/           → installed (live)
+  littlejohn/security/trivy-running-container-scan/ → installed (live)
   mark/research/pse-edge-disclosures/        → installed (live)
   wifey/household/electrical-load-230v/      → installed (live)
   wifey/household/recipe-scaling-substitution/ → installed (live)

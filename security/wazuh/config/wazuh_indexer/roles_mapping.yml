@@ -93,3 +93,14 @@ manage_wazuh_index:
   users:
   - "kibanaserver"
   and_backend_roles: []
+
+# Dedicated broker identity for agent-facing, read-only Wazuh alert queries.
+wazuh_alerts_readonly:
+  reserved: false
+  hidden: false
+  backend_roles: []
+  hosts: []
+  users:
+  - "broker_ro"
+  and_backend_roles: []
+  description: "Read-only alert access for wazuh-query-broker"

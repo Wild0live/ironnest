@@ -138,6 +138,7 @@ services:
       AUTHELIA_SESSION_SECRET_FILE: /secrets/session.txt
       AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE: /secrets/storage.txt
       AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE: /secrets/jwt.txt
+      AUTHELIA_NOTIFIER_SMTP_PASSWORD_FILE: /secrets/smtp-password.txt
     # All OIDC fields (hmac_secret, jwks, clients, cors) live in the snippet
     # rendered by ingress-infisical-agent. Authelia merges it into the base
     # configuration.yml at startup.
@@ -146,7 +147,8 @@ services:
       - "--config=/config/configuration.yml"
       - "--config=/oidc-secrets/oidc-snippet.yml"
     networks:
-      - platform-net              # only reached by Traefik on this network
+      - platform-net              # reached by Traefik on this network
+      - platform-egress           # outbound SMTP to Gmail
     dns:
       - 172.30.0.10               # AdGuard
     depends_on:

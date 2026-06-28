@@ -454,6 +454,8 @@ services:
       # or the Operations endpoints remain disabled.
       OPERATIONS_RUNNER_URL:          "http://operations-runner:8091"
       OPERATIONS_RUNNER_TOKEN:        "${OPERATIONS_RUNNER_TOKEN:-}"
+      OPERATIONS_ALLOWED_CONTAINERS:  "${OPERATIONS_ALLOWED_CONTAINERS:-hermes-pf-default,hermes-pf-mark,hermes-pf-steve,hermes-pf-qa,hermes-pf-littlejohn,hermes-pf-jaime,hermes-pf-bigbert,hermes-pf-octo}"
+      OPERATIONS_ALLOW_ALL_CONTAINERS: "${OPERATIONS_ALLOW_ALL_CONTAINERS:-0}"
       OPERATIONS_APPROVAL_TTL_SECONDS: "${OPERATIONS_APPROVAL_TTL_SECONDS:-600}"
       OCTO_OPERATIONS_SUBMIT_TOKEN:   "${OCTO_OPERATIONS_SUBMIT_TOKEN:-}"
       LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN: "${LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN:-}"
@@ -503,10 +505,19 @@ services:
     restart: unless-stopped
     environment:
       OPERATIONS_RUNNER_TOKEN: "${OPERATIONS_RUNNER_TOKEN:-}"
-      OPERATIONS_ALLOWED_CONTAINERS: "hermes-pf-default,hermes-pf-mark,hermes-pf-steve,hermes-pf-qa,hermes-pf-littlejohn,hermes-pf-jaime,hermes-pf-bigbert,hermes-pf-octo"
+      # Exact container names eligible for individually approved lifecycle actions.
+      # Keep this an explicit list; this runner must never discover or control
+      # arbitrary Docker containers merely because their name shares a prefix.
+      OPERATIONS_ALLOWED_CONTAINERS: "${OPERATIONS_ALLOWED_CONTAINERS:-hermes-pf-default,hermes-pf-mark,hermes-pf-steve,hermes-pf-qa,hermes-pf-littlejohn,hermes-pf-jaime,hermes-pf-bigbert,hermes-pf-octo}"
+      # When enabled, exact start/stop/restart requests may target any valid
+      # Rancher Desktop container name, still requiring a separate approval.
+      OPERATIONS_ALLOW_ALL_CONTAINERS: "${OPERATIONS_ALLOW_ALL_CONTAINERS:-0}"
       # Comma-separated Docker-host paths Octo may request as bind sources.
       # Empty = factory bind mounts are rejected (named volumes remain allowed).
       FACTORY_HOST_PATH_ROOTS: "${FACTORY_HOST_PATH_ROOTS:-}"
+      # Exact image references Octo may pull after an individual operator approval.
+      # Keep this list small; e.g. nginx:alpine,nginx:1.27-alpine.
+      FACTORY_ALLOWED_IMAGES: "${FACTORY_ALLOWED_IMAGES:-}"
       OPERATIONS_RUNNER_STATE_FILE: "/var/lib/operations-runner/executed.json"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -674,6 +685,8 @@ services:
         # Mission Control chat bridge — background co-process; a crash here
         # never affects the foreground agent below.
         /usr/bin/python3 /opt/ironnest/agent-chat-bridge.py &
+        ttyd --port=7682 --writable --base-path="/terminal/$${HERMES_PROFILE}" \
+          bash -lc 'cd /opt/data/workspace; echo "IronNest Hermes Agent terminal. Profile: $${HERMES_PROFILE:-unknown}"; exec bash' &
         exec hermes gateway run
     volumes:
       - hermes-platform-data-default:/opt/data
@@ -719,6 +732,8 @@ services:
         hermes config set memory.user_profile_enabled true >/dev/null
         hermes config set memory.provider ironnest_gateway >/dev/null
         /usr/bin/python3 /opt/ironnest/agent-chat-bridge.py &
+        ttyd --port=7682 --writable --base-path="/terminal/$${HERMES_PROFILE}" \
+          bash -lc 'cd /opt/data/workspace; echo "IronNest Hermes Agent terminal. Profile: $${HERMES_PROFILE:-unknown}"; exec bash' &
         exec hermes gateway run
     volumes:
       - hermes-platform-data-mark:/opt/data
@@ -758,6 +773,8 @@ services:
         hermes config set memory.user_profile_enabled true >/dev/null
         hermes config set memory.provider ironnest_gateway >/dev/null
         /usr/bin/python3 /opt/ironnest/agent-chat-bridge.py &
+        ttyd --port=7682 --writable --base-path="/terminal/$${HERMES_PROFILE}" \
+          bash -lc 'cd /opt/data/workspace; echo "IronNest Hermes Agent terminal. Profile: $${HERMES_PROFILE:-unknown}"; exec bash' &
         exec hermes gateway run
     volumes:
       - hermes-platform-data-steve:/opt/data
@@ -797,6 +814,8 @@ services:
         hermes config set memory.user_profile_enabled true >/dev/null
         hermes config set memory.provider ironnest_gateway >/dev/null
         /usr/bin/python3 /opt/ironnest/agent-chat-bridge.py &
+        ttyd --port=7682 --writable --base-path="/terminal/$${HERMES_PROFILE}" \
+          bash -lc 'cd /opt/data/workspace; echo "IronNest Hermes Agent terminal. Profile: $${HERMES_PROFILE:-unknown}"; exec bash' &
         exec hermes gateway run
     volumes:
       - hermes-platform-data-qa:/opt/data
@@ -828,8 +847,8 @@ services:
       # The read-only Wazuh broker is an internal platform service. Bypass
       # Squid for this hostname so Littlejohn can query it with the scoped
       # token injected from Infisical; no other profile receives this route.
-      NO_PROXY:    "memory-gateway,browser-intent-mcp,infisical,adguard,squid,socket-proxy,wazuh-query,localhost,127.0.0.1,.local"
-      no_proxy:    "memory-gateway,browser-intent-mcp,infisical,adguard,squid,socket-proxy,wazuh-query,localhost,127.0.0.1,.local"
+      NO_PROXY:    "memory-gateway,mission-control,browser-intent-mcp,infisical,adguard,squid,socket-proxy,wazuh-query,trivy-server,localhost,127.0.0.1,.local"
+      no_proxy:    "memory-gateway,mission-control,browser-intent-mcp,infisical,adguard,squid,socket-proxy,wazuh-query,trivy-server,localhost,127.0.0.1,.local"
     command:
       - with-infisical
       - sh
@@ -843,6 +862,8 @@ services:
         hermes config set memory.user_profile_enabled true >/dev/null
         hermes config set memory.provider ironnest_gateway >/dev/null
         /usr/bin/python3 /opt/ironnest/agent-chat-bridge.py &
+        ttyd --port=7682 --writable --base-path="/terminal/$${HERMES_PROFILE}" \
+          bash -lc 'cd /opt/data/workspace; echo "IronNest Hermes Agent terminal. Profile: $${HERMES_PROFILE:-unknown}"; exec bash' &
         exec hermes gateway run
     volumes:
       - hermes-platform-data-littlejohn:/opt/data
@@ -861,3 +882,4 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+

@@ -176,6 +176,7 @@ services:
       - ./config/wazuh_indexer/internal_users.yml:/usr/share/wazuh-indexer/config/opensearch-security/internal_users.yml:ro
       # OIDC + roles mapping — pushed via securityadmin.sh after first start.
       - ./config/wazuh_indexer/config.yml:/usr/share/wazuh-indexer/config/opensearch-security/config.yml:ro
+      - ./config/wazuh_indexer/roles.yml:/usr/share/wazuh-indexer/config/opensearch-security/roles.yml:ro
       - ./config/wazuh_indexer/roles_mapping.yml:/usr/share/wazuh-indexer/config/opensearch-security/roles_mapping.yml:ro
       # Trust anchor for Traefik's self-signed cert (CN=ironnest.local,
       # SAN *.ironnest.local) so the openid plugin can fetch JWKS over HTTPS.

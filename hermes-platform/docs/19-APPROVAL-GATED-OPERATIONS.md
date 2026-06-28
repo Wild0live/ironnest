@@ -10,14 +10,15 @@ approve once.
 The runner supports two approval-gated operation classes:
 
 - Profile lifecycle: `start`, `stop`, and `restart` for the eight listed
-  `hermes-pf-*` gateways.
-- Factory Docker requests: create named `factory-*` containers, start/stop/
-  restart them, create and start exec sessions, create `factory-*` networks,
-  and connect/disconnect factory containers from factory networks.
+  `hermes-pf-*` gateways and any other explicitly configured container.
+- Factory Docker requests: pull an explicitly allowlisted image, create named
+  `factory-*` containers, start/stop/restart them, create and start exec
+  sessions, create `factory-*` networks, and connect/disconnect factory
+  containers from factory networks.
 
 Each factory request retains its exact HTTP method, Docker API path, and JSON
 body in the approval record. The runner rejects all other Docker endpoints. It
-does not allow image build/pull operations, privileged containers, host
+does not allow image builds, unallowlisted image pulls, privileged containers, host
 network/PID/IPC/UTS/user namespaces, or Windows/host shell commands.
 
 For host bind mounts, set `FACTORY_HOST_PATH_ROOTS` to comma-separated,
@@ -39,7 +40,21 @@ Create a high-entropy token in the uncommitted `hermes-platform/.env` file:
 $token = -join ((1..64) | ForEach-Object { 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[(Get-Random -Maximum 62)] })
 Add-Content .env "`nOPERATIONS_RUNNER_TOKEN=$token"
 Add-Content .env "`nFACTORY_HOST_PATH_ROOTS=D:\claude-workspace\software-factory"
+Add-Content .env "`nFACTORY_ALLOWED_IMAGES=nginx:alpine,nginx:1.27-alpine"
+Add-Content .env "`nOPERATIONS_ALLOWED_CONTAINERS=hermes-pf-default,hermes-pf-mark,hermes-pf-steve,hermes-pf-qa,hermes-pf-littlejohn,hermes-pf-jaime,hermes-pf-bigbert,hermes-pf-octo,openclaw-gateway,openclaw-ttyd,openclaw-infisical-agent"
+Add-Content .env "`nOPERATIONS_ALLOW_ALL_CONTAINERS=1"
 ```
+
+`OPERATIONS_ALLOWED_CONTAINERS` is an exact-name allowlist shared by Mission
+Control and the runner. Add a container name here before Octo can propose an
+approved start, stop, or restart. Do not use wildcard entries: each container
+remains visible and reviewable in the approval record.
+
+Set `OPERATIONS_ALLOW_ALL_CONTAINERS=1` only when Octo is the platform
+infrastructure administrator. It permits lifecycle actions for any valid
+Rancher Desktop container name, but each exact action and target remains a
+single-use, human-approved request; it does not expose a Docker socket or raw
+Docker API to Octo.
 
 Create a separate random `OCTO_OPERATIONS_SUBMIT_TOKEN`. Put the same value in
 both `hermes-platform/.env` (for Mission Control) and the Infisical secret path
@@ -94,6 +109,22 @@ Example factory-container proposal (`target` is the audit label):
       "Binds": ["D:\\claude-workspace\\software-factory:/workspace:rw"]
     }
   }
+}
+```
+
+If the image is not already available locally, submit and approve a separate
+pull request before creating the container. The image must exactly match an
+entry in `FACTORY_ALLOWED_IMAGES`:
+
+```json
+{
+  "action": "docker_api",
+  "target": "factory-image-nginx-alpine",
+  "reason": "Pull the reviewed base image required by factory-api.",
+  "requested_by": "octo",
+  "method": "POST",
+  "path": "/v1.47/images/create?fromImage=nginx&tag=alpine",
+  "body": {}
 }
 ```
 

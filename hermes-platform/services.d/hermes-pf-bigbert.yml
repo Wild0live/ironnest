@@ -69,6 +69,8 @@ services:
         hermes config set memory.user_profile_enabled true >/dev/null
         hermes config set memory.provider ironnest_gateway >/dev/null
         /usr/bin/python3 /opt/ironnest/agent-chat-bridge.py &
+        ttyd --port=7682 --writable --base-path="/terminal/$${HERMES_PROFILE}" \
+          bash -lc 'cd /opt/data/workspace; echo "IronNest Hermes Agent terminal. Profile: $${HERMES_PROFILE:-unknown}"; exec bash' &
         exec hermes gateway run
     volumes:
       - hermes-platform-data-bigbert:/opt/data
@@ -110,3 +112,4 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
