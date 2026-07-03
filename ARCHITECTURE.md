@@ -129,15 +129,15 @@ The **Reachable from host** column lists the URL or port a user/operator types t
 | `hermes-platform-ollama` | Local embedding inference for OpenViking (GPU-accelerated via WSL2 passthrough since 2026-06-13) | hermes-platform | `ollama/ollama:0.4.6` | — |
 | `hermes-platform-openviking` | Long-term memory backend | hermes-platform | `platform/hermes-platform-openviking:0.1.0` | — |
 | `hermes-platform-memory-gateway` | Policy-enforcing memory front door | hermes-platform | `platform/hermes-platform-memory-gateway:0.1.0` | `127.0.0.1:18080` |
-| `hermes-platform-ttyd` | Hermes Platform management terminal + dashboard | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | `127.0.0.1:8123`, `127.0.0.1:8124` |
-| `hermes-pf-default` | Hermes Platform gateway — `default` profile | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | — (internal only) |
-| `hermes-pf-mark` | Hermes Platform gateway — `mark` profile | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | — (internal only) |
-| `hermes-pf-steve` | Hermes Platform gateway — `steve` profile | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | — (internal only) |
-| `hermes-pf-qa` | Hermes Platform gateway — `qa` profile (QA/verification; renamed from `wifey` 2026-06-14) | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | — (internal only) |
-| `hermes-pf-littlejohn` | Hermes Platform gateway — `littlejohn` profile | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | — (internal only) |
-| `hermes-pf-jaime` | Hermes Platform gateway — `jaime` profile | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | — (internal only) |
-| `hermes-pf-bigbert` | Hermes Platform gateway — `bigbert` profile | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | — (internal only) |
-| `hermes-pf-octo` | Hermes Platform gateway — `octo` profile (platform-ops; added 2026-06-12) | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | — (internal only) |
+| `hermes-platform-ttyd` | Hermes Platform management terminal + dashboard | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | `127.0.0.1:8123`, `127.0.0.1:8124` |
+| `hermes-pf-default` | Hermes Platform gateway — `default` profile | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | — (internal only) |
+| `hermes-pf-mark` | Hermes Platform gateway — `mark` profile | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | — (internal only) |
+| `hermes-pf-steve` | Hermes Platform gateway — `steve` profile | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | — (internal only) |
+| `hermes-pf-qa` | Hermes Platform gateway — `qa` profile (QA/verification; renamed from `wifey` 2026-06-14) | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | — (internal only) |
+| `hermes-pf-littlejohn` | Hermes Platform gateway — `littlejohn` profile | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | — (internal only) |
+| `hermes-pf-jaime` | Hermes Platform gateway — `jaime` profile | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | — (internal only) |
+| `hermes-pf-bigbert` | Hermes Platform gateway — `bigbert` profile | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | — (internal only) |
+| `hermes-pf-octo` | Hermes Platform gateway — `octo` profile (platform-ops; added 2026-06-12) | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | — (internal only) |
 | `hermes-platform-mission-control` | Mission Control ops dashboard (standalone FastAPI; reads registry + audit log read-only, holds NO secrets) | hermes-platform | `platform/hermes-platform-mission-control:0.1.0` | — (internal only; reachable via `https://mission.ironnest.local/`) |
 | `hermes-platform-operations-runner` | Approval-gated lifecycle/factory operations runner | hermes-platform | `platform/hermes-platform-operations-runner:0.1.0` | — (internal only on `mission-control-ops-net`; reached by Mission Control only) |
 | `hermes-platform-artifact-apps` | Sandboxed read-only static server for complete webapp artifacts from the Kanban shared volume | hermes-platform | `nginxinc/nginx-unprivileged:alpine` | — (internal only; reachable via `https://apps.ironnest.local/`) |
@@ -161,7 +161,7 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 | Image (compose / built tag) | Dockerfile `FROM` pin | Upstream version | Pin method |
 |---|---|---|---|
 | `platform/openclaw:2026.4.23-1-codex` | `ghcr.io/openclaw/openclaw:2026.4.23-1-amd64` | 2026.4.23-1 | Calendar semver |
-| `platform/hermes-agent:v2026.6.5-patched` | upstream Hermes image (set in `hermes/Dockerfile`) | v0.16.0 (tag `v2026.6.5`, "The Surface Release"; upgraded from v0.15.2 on 2026-06-13) | Calendar semver |
+| `platform/hermes-agent:v2026.6.19-patched` | upstream Hermes image (set in `hermes/Dockerfile`) | v0.17.0 (tag `v2026.6.19`; upgraded from v0.16.0 on 2026-06-19) | Calendar semver |
 | `platform/infisical-cli:0.43.76-patched` | `infisical/cli@sha256:dba406b3…` | 0.43.76 (binary) | Digest |
 | `platform/infisical:pg-36438985-patched` | `infisical/infisical@sha256:36438985…` | unknown (floating upstream) | Digest |
 | `platform/postgres:16.13-alpine-patched` | `postgres:16.13-alpine` | PostgreSQL 16.13 | Semver tag |
@@ -359,6 +359,8 @@ A remote attacker who has taken over the operator's Windows session (RDP, stolen
 
 **Total declared memory budget:** ~8.7 GB for the 18 always-on bootstrap containers with limits. Add ~18.7 GB when all limited on-demand containers run (OpenClaw ~5.06 GB / 3, Hermes Platform ~11.3 GB / 15 limited containers, Browser Intent ~2.31 GB / 3) for ~27.4 GB across the 39 currently limited regular containers. Two live support/control containers (`wazuh-query-broker` and `hermes-platform-operations-runner`) do not currently declare Compose resource limits, so the regular 41-container deployment is not fully budgeted until those limits are added. Hermes Platform's declared budget is ~11.3 GB across its limited containers because the eight `hermes-pf-*` (incl. `octo`, added 2026-06-12) were bumped from 0.5 CPU / 512 MB to **2.0 CPU / 768 MB** and Ollama from 2.0 to **5.0 CPU** during the Mission Control chat-latency work (2026-06-07; CPU starvation was the real throttle on warm agent turns), plus the 128 MB Mission Control container and the 64 MB artifact app server. Note: as of 2026-06-13 Ollama runs embeddings on the host **GTX 1650 GPU** (WSL2 passthrough), so its 5.0 CPU ceiling is now largely idle — embeddings fell from ~20–31 s to ~1 s.
 
+**Wazuh low-I/O startup profile:** Wazuh remains enabled for syscollector, SCA, vulnerability detection, and FIM, but startup-time full scans are disabled (`scan_on_start=no`) and vulnerability feed refreshes run every 4 h. This avoids repeated disk/CPU bursts on the Windows-local Rancher VM while preserving scheduled collection.
+
 ---
 
 ## Key Integration Points
@@ -407,7 +409,7 @@ Live source: `security/egress-proxy/squid.conf`. The current policy is **allow-b
 - `malicious_dst` — IPs from Spamhaus DROP/EDROP, Feodo Tracker
 - `malicious_dstdomain` — domains from Emerging Threats and merged feeds
 
-Both files are written by `blocklist-updater` every 6 h; an inotifywait watchdog inside the egress-proxy container triggers `squid -k reconfigure` automatically when either file changes.
+Both files are written by `blocklist-updater` every 6 h; an inotifywait watchdog inside the egress-proxy container triggers `squid -k reconfigure` automatically when either file changes. The Squid entrypoint initializes the UFS cache tree on every boot before starting the foreground process, and the Compose healthcheck verifies the live `squid` process directly instead of relying on a PID file that foreground mode may not leave behind.
 
 A per-stack `dst_browser_intent` ACL is defined in `squid.conf` (`.colfinancial.com`, `.maxihealth.com.ph`, `.april.fr`, `.hi-precision.com.ph`) but is **not currently referenced** in any `http_access` rule. Per-stack destination restriction for Browser Intent is enforced at the Playwright layer instead — see `browser-intent/policies/sites.json` `allowedDomains` per site, which includes `*.healthonlineasia.com` for the Hi-Precision results host. Re-enabling Squid-level per-stack allowlisting requires wiring `dst_browser_intent` (and new equivalent ACLs for other stacks) into a deny-by-default rule above `http_access allow platform_clients`.
 
@@ -696,6 +698,7 @@ Why `--no-build`? Both Hermes services have both `build:` and `image:` in compos
 - **Data sources (read-only, no gateway API calls):** the profile registry (`registry/profiles-registry.yaml`, `:ro`), the gateway audit log (`memory-gateway-log` volume, `:ro`), the policies dir (`:ro`, only to compute `policy_loaded`), plus its own `mission-control-state` volume for tasks/schedules/chat history.
 - **Network:** `platform-net` for Traefik routing plus `mission-control-ops-net` for the private operations-runner path. Route `mission` → `http://mission-control:8080`, middlewares `[trusted-networks, rate-limit, authelia]` — behind the same FIDO gate as every other route.
 - **Agent chat + file downloads** are served by a tiny **in-container agent-chat bridge** (`agent-bridge/agent-chat-bridge.py`, Python stdlib, no deps), bind-mounted read-only into **each** `hermes-pf-*` and launched as a background co-process before `hermes gateway run`. It listens on `:8011` (token-gated by `MISSION_CONTROL_BRIDGE_TOKEN`) and drives a persistent `hermes acp` (Agent Client Protocol) session **for its own profile only** — no Docker socket, no cross-profile access, per-profile isolation preserved. Mission Control proxies chat over `POST /api/agent/{profile}/chat[/stream]` (SSE token streaming) and serves agent-produced files over `GET /api/agent/{profile}/file/{name}` → the bridge's hardened `GET /file` (basename-only, charset-restricted, realpath-prefixed to `/opt/data/.mission-control-uploads`). This is the one egress path for files to leave an agent container to the operator's browser; it stays within `platform-net` and the FIDO gate.
+- **Shared Kanban control:** Goal decomposition runs through the profile-local bridge and surfaces structured decomposer failures as Mission Control errors instead of treating them as successful bridge replies. Goal cleanup is archival, not destructive delete: moving or archiving a goal archives the whole linked effort (goal plus subtasks, transitively), and the drawer's "Delete goal from active board" action uses the same archive path so task history and links remain recoverable.
 - **Approval-gated operations:** Mission Control can submit approved lifecycle and factory requests to `hermes-platform-operations-runner` over `mission-control-ops-net`. The runner requires its bearer token, consumes each approval only once, checks exact container/image/bind allowlists, persists execution state in `operations-runner-state`, and intentionally excludes arbitrary Docker exec/build/API access. This keeps operator-approved start/stop/restart and bounded factory actions out of the profile agents and memory gateway.
 - **Why the `hermes-pf-*`/Ollama resource bumps:** running `hermes acp` alongside `hermes gateway run` in 0.5 CPU starved warm chat turns; the `x-hermes-pf-base` anchor was raised to 2.0 CPU / 768 MB and Ollama to 5.0 CPU. Embeddings were originally CPU-bound (~20–31 s each, gating every memory-backed chat turn); as of **2026-06-13 Ollama offloads `mxbai-embed-large` to the host GTX 1650 GPU** (WSL2 passthrough), cutting embeddings to ~1 s. See **Service Resource Limits** and the Ollama container note above.
 - The sidebar **Memory** item is an external link to the LLM Wiki (`https://wiki.ironnest.local`), not an in-app view.
