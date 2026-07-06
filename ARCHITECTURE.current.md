@@ -6,7 +6,7 @@
 
 All human-facing UIs are reachable only via `https://*.ironnest.local/` through Traefik, and **every route now requires a physical FIDO key tap (WebAuthn passkey)** to establish a session — most via Authelia's ForwardAuth middleware, and the **Wazuh dashboard via OIDC SSO** against Authelia acting as the OpenID Provider (wired 2026-05-28; the earlier "Wazuh is the one exception" ForwardAuth carve-out is gone). Backend services no longer publish loopback ports — the FIDO gate cannot be bypassed by an attacker who has access to the host's network stack. A coarse `trusted-networks` IP allowlist (RFC1918 + Docker bridge ranges) sits in front of Authelia on the sensitive routes; note that `127.0.0.1/32` is **deliberately excluded** so that even an attacker on the host loopback must pass the FIDO gate (Traefik publishes on `0.0.0.0:443`, so the host reaches services over the LAN-facing listener, not a loopback bypass).
 
-**Footprint:** 12 Compose projects — **18 always-on** containers (across the 9 bootstrap stacks; Wazuh now runs 4 — manager + indexer + dashboard + `wazuh-infisical-agent` — and Ingress now runs 3 — traefik + authelia + `ingress-infisical-agent` — both gained a sidecar for the OIDC rollout) + **21 on-demand** containers (openclaw 3 + hermes-platform 15 + browser-intent 3) = **39 regular containers** when every runtime stack is running. The optional LLM Wiki companion (separate project at `D:\LLM Wiki`) adds 5 more. There is also **1 one-shot Trivy scanner profile**. The on-demand stacks (`openclaw`, `hermes-platform`, `browser-intent`) are not started by `bootstrap.sh`; the logon autostart task brings them up. The legacy `hermes/` Compose stack was **removed 2026-05-31** — `docker-compose.yml` and `start.sh` deleted; the `hermes/` directory is now solely the build context for `platform/hermes-agent` image (Dockerfile + build.sh). Hermes Platform (`hermes-platform/`) is the sole agent stack, with **15** containers: eight isolated `hermes-pf-*` profile gateways (incl. `octo`, added 2026-06-12), `hermes-platform-ttyd`, the memory gateway, OpenViking, Ollama, the OpenViking Infisical sidecar, the **Mission Control** ops dashboard (`hermes-platform-mission-control`, added 2026-06-07), and the sandboxed static artifact app server (`hermes-platform-artifact-apps`). Mission Control also relies on a tiny in-container **agent-chat bridge** co-process running inside each `hermes-pf-*` (not a separate container) for dashboard chat + file downloads — see **Hermes Platform Stack → Mission Control** below.
+**Footprint:** 13 regular Compose projects — **19 always-on/support** containers (across the 9 bootstrap stacks plus the internal `wazuh-query-broker` support stack; Wazuh runs 4 — manager + indexer + dashboard + `wazuh-infisical-agent` — and Ingress runs 3 — traefik + authelia + `ingress-infisical-agent`) + **22 on-demand** containers (openclaw 3 + hermes-platform 16 + browser-intent 3) = **41 regular containers** when every runtime stack is running. The optional `ironnest-browse` diagnostic stack adds 1 container, the optional LittleJohn Kali MCP sidecar adds 1 container when started with the Hermes Platform `kali` profile, and the optional LLM Wiki companion (separate project at `D:\LLM Wiki`) adds 6 more. There is also **1 one-shot Trivy scanner profile**. The on-demand stacks (`openclaw`, `hermes-platform`, `browser-intent`) are not started by `bootstrap.sh`; the logon autostart task brings them up. The legacy `hermes/` Compose stack was **removed 2026-05-31** — `docker-compose.yml` and `start.sh` deleted; the `hermes/` directory is now solely the build context for `platform/hermes-agent` image (Dockerfile + build.sh). Hermes Platform (`hermes-platform/`) is the sole agent stack, with **16 core** containers: eight isolated `hermes-pf-*` profile gateways (incl. `octo`, added 2026-06-12), `hermes-platform-ttyd`, the memory gateway, OpenViking, Ollama, the OpenViking Infisical sidecar, the **Mission Control** ops dashboard (`hermes-platform-mission-control`, added 2026-06-07), the approval-gated **operations runner** (`hermes-platform-operations-runner`), and the sandboxed static artifact app server (`hermes-platform-artifact-apps`). Mission Control also relies on a tiny in-container **agent-chat bridge** co-process running inside each `hermes-pf-*` (not a separate container) for dashboard chat + file downloads — see **Hermes Platform Stack → Mission Control** below.
 
 **Platform root (canonical):** `D:\claude-workspace\platform\` — git repo, remote `https://github.com/Wild0live/ironnest`, branch `master`. Every running container's `com.docker.compose.project.config_files` label points under this tree (verified 2026-05-14 against egress-proxy, traefik, hermes, etc.). A separate clone at `D:\claude-workspace\gitHub\ironnest\` exists for documentation drafting only; it is not bind-mounted into any container.  
 **Docker storage:** `F:\wsl\rancher-desktop-data\ext4.vhdx` (off the C: drive)  
@@ -17,7 +17,7 @@ All human-facing UIs are reachable only via `https://*.ironnest.local/` through 
 ## Design Principles
 
 ### 1. Blast-radius isolation
-Each capability lives in its own Compose project. Restarting or resetting one stack cannot affect others. OpenClaw, Hermes, and Browser Intent have zero Docker socket access and zero lifecycle control over any other container.
+Each capability lives in its own Compose project. Restarting or resetting one stack cannot affect others. OpenClaw, Hermes Platform profile agents, and Browser Intent have zero Docker socket access and zero lifecycle control over any other container; the only lifecycle-control path is Mission Control's private, approval-gated operations runner.
 
 ### 2. Least privilege everywhere
 - All containers drop capabilities they don't need; most use `cap_drop: ALL`.
@@ -25,8 +25,8 @@ Each capability lives in its own Compose project. Restarting or resetting one st
 - `no-new-privileges: true` on every service that accepts it.
 - Healthchecks use proper credentials where the service requires auth (e.g. wazuh.indexer passes `WAZUH_INDEXER_PASSWORD` and asserts HTTP 200, not 401). Accepting 401 as healthy masks auth misconfiguration.
 
-### 3. Zero raw socket access
-No container mounts `/var/run/docker.sock` directly. All Docker API consumers (Dozzle, Wazuh, Trivy, `monitoring-container-sync`) talk to the `socket-proxy` service, which exposes only read-only endpoints (CONTAINERS, EVENTS, IMAGES, INFO, NETWORKS, PING, VERSION, VOLUMES). All write/exec/build operations are blocked.
+### 3. No raw Docker control except the approved runner
+Dozzle, Wazuh, Trivy, and `monitoring-container-sync` talk to the `socket-proxy` service, which exposes only read-only endpoints (CONTAINERS, EVENTS, IMAGES, INFO, NETWORKS, PING, VERSION, VOLUMES). Write/exec/build operations stay blocked through the proxy. The only scoped exception is `hermes-platform-operations-runner`, which mounts the Docker socket read-only and is reachable only from Mission Control on `mission-control-ops-net`; it enforces bearer auth, single-use approvals, exact allowlists, and a narrow action set instead of exposing a general Docker API.
 
 ### 4. DNS-first filtering
 Every service sets `dns: 172.30.0.10` (AdGuard). DNS-layer blocking is the first line of defence against malicious domain resolution before any TCP connection is attempted.
@@ -63,8 +63,8 @@ At logon, two Task Scheduler tasks chain the entire bring-up; see **Autostart** 
 ### 9. Backup completeness and verifiability
 Every backup run produces a `SHA256SUMS` file. `restore.sh` verifies checksums before touching anything. Fourteen-day retention with automatic pruning.
 
-### 10. Resource limits on everything
-Every service has explicit `cpus` and `memory` limits. This prevents a runaway container from starving the WSL2 VM and degrading Rancher Desktop.
+### 10. Resource limits by default
+Long-running services should have explicit `cpus` and `memory` limits to prevent a runaway container from starving the WSL2 VM and degrading Rancher Desktop. Current documented gaps are called out in **Service Resource Limits** so they can be closed deliberately.
 
 ### 11. FIDO-gated identity at the edge
 Every human-facing UI is reachable only via `https://*.ironnest.local/` through Traefik and requires a WebAuthn passkey (FIDO key tap or Windows Hello) to establish a session. Most routers are wrapped in an Authelia **ForwardAuth** middleware; the **Wazuh dashboard** uses **OIDC SSO** against Authelia (the dashboard runs its own OpenID Connect flow, so it never gets a 302-to-HTML mid-SPA the way ForwardAuth broke it — see **Identity Gate (Authelia)** below). Backend services do **not** publish loopback ports — an attacker who has remote control of the host's network stack still cannot reach Infisical, Dozzle, AdGuard, Wazuh, OpenClaw, Hermes, or any dashboard without producing the physical key. Sessions are short (1h inactivity, 4h max, no remember-me) so a stolen cookie has a small useful window. See **Identity Gate (Authelia)** below.
@@ -73,7 +73,7 @@ Every human-facing UI is reachable only via `https://*.ironnest.local/` through 
 
 ## Stack Inventory
 
-12 Compose projects (9 always-on + 3 on-demand). Always-on stacks are brought up by `bootstrap.sh`; on-demand stacks need their own `start.sh`, documented compose command, or the autostart task. (LLM Wiki at `D:\LLM Wiki` is a 13th, separate project — not part of this tree but sharing the network and Traefik routes `wiki`/`chat`.)
+13 regular Compose projects (9 bootstrap always-on + 1 internal support stack + 3 on-demand). Always-on bootstrap stacks are brought up by `bootstrap.sh`; `wazuh-query-broker` is an internal support stack on `platform-net`; on-demand stacks need their own `start.sh`, documented compose command, or the autostart task. Optional `ironnest-browse` diagnostics and LLM Wiki at `D:\LLM Wiki` are separate companion projects, not part of the regular platform count.
 
 The **Reachable from host** column lists the URL or port a user/operator types to access the service. Most services no longer publish any host port — they are reachable only via Traefik at a `*.ironnest.local` hostname (which itself sits behind Authelia's FIDO gate). The **Wazuh dashboard's `127.0.0.1:8443` escape hatch was closed 2026-05-27** when it moved to OIDC SSO — Wazuh is now reachable only at `https://wazuh.ironnest.local/`. The **only** remaining direct loopback escape hatch is the Traefik dashboard (`http://127.0.0.1:8880/dashboard/`), kept as a last resort for when Traefik's own routing breaks.
 
@@ -88,9 +88,10 @@ The **Reachable from host** column lists the URL or port a user/operator types t
 | trivy | `security/trivy/` | 1 server (+ on-demand scanner) | always-on (server) | — |
 | ingress | `security/ingress/` | 3 (traefik + authelia + ingress-infisical-agent) | always-on | `0.0.0.0:80` (→ HTTPS redirect), `0.0.0.0:443` (all `*.ironnest.local` routes), `https://traefik.ironnest.local/dashboard/` (Authelia-gated) **+ escape hatch** `http://127.0.0.1:8880/dashboard/`. Authelia itself at `https://auth.ironnest.local/`, no host port. |
 | monitoring | `monitoring/` | 2 (fluent-bit + container-sync) | always-on | — |
+| wazuh-query-broker | `security/wazuh-query-broker/` | 1 (read-only query API) | support | — (internal only on `platform-net`; no host port) |
 | openclaw | `openclaw/` | 3 (gateway + ttyd + infisical-agent) | on-demand | `https://openclaw.ironnest.local/` (Authelia-gated). `openclaw-ttyd` no longer published. |
 | hermes | `hermes/` | **Build context only** — `docker-compose.yml` removed 2026-05-31. `hermes/` now contains only Dockerfile + build.sh for building `platform/hermes-agent` image shared by hermes-platform. | — | — |
-| hermes-platform | `hermes-platform/` | 15 (OpenViking + Ollama + memory-gateway + management ttyd + 8 isolated `hermes-pf-*` gateways + OpenViking Infisical sidecar + Mission Control dashboard + artifact app server) | on-demand | `https://hermes-platform.ironnest.local/` (ttyd, Authelia-gated), `https://hermes-platform-dashboard.ironnest.local/` (dashboard, Authelia-gated), `https://mission.ironnest.local/` (Mission Control ops dashboard, Authelia-gated), `https://apps.ironnest.local/` (sandboxed artifact app server, Authelia-gated). Loopback `127.0.0.1:8123`/`8124` (ttyd/dashboard) and `127.0.0.1:18080` (memory-gateway admin/diagnostic, **not behind Authelia**) remain for direct/in-network access. |
+| hermes-platform | `hermes-platform/` | 16 core (OpenViking + Ollama + memory-gateway + management ttyd + 8 isolated `hermes-pf-*` gateways + OpenViking Infisical sidecar + Mission Control dashboard + operations runner + artifact app server) + optional `kali-mcp-littlejohn` profile container | on-demand | `https://hermes-platform.ironnest.local/` (ttyd, Authelia-gated), `https://hermes-platform-dashboard.ironnest.local/` (dashboard, Authelia-gated), `https://mission.ironnest.local/` (Mission Control ops dashboard, Authelia-gated), `https://apps.ironnest.local/` (sandboxed artifact app server, Authelia-gated). Loopback `127.0.0.1:8123`/`8124` (ttyd/dashboard) and `127.0.0.1:18080` (memory-gateway admin/diagnostic, **not behind Authelia**) remain for direct/in-network access. The operations runner has no host route and is reachable only by Mission Control. The Kali MCP sidecar publishes no host port and is reachable only by LittleJohn over `littlejohn-kali-net`. |
 | browser-intent | `browser-intent/` | 3 (mcp-server + worker + infisical-agent) | on-demand | 127.0.0.1:18901 (MCP API endpoint, not browser-facing — not behind Authelia) |
 
 > Infisical is published on **18090** rather than 8090 because Rancher Desktop's port forwarder intercepts low-numbered host ports inside the container netns. See the "Infisical agent TCP timeout" runbook below. (Note: as of 2026-05-27 the 18090 publish is commented out; Infisical is only reachable via `https://infisical.ironnest.local/`. Uncomment to restore direct loopback.)
@@ -108,11 +109,12 @@ The **Reachable from host** column lists the URL or port a user/operator types t
 | `infisical` | Secrets manager UI/API | secrets | `platform/infisical:pg-36438985-patched` | — (loopback closed 2026-05-27; reachable only via `https://infisical.ironnest.local/`) |
 | `infisical-postgres` | Infisical database | secrets | `platform/postgres:16.13-alpine-patched` | — |
 | `infisical-redis` | Infisical cache | secrets | `platform/redis:7.4.8-alpine-patched` | — |
-| `dozzle` | Log viewer | dozzle | `amir20/dozzle:v10.6.5` | — (was `0.0.0.0:8888`, **LAN-exposed**; closed 2026-05-27; reachable only via `https://dozzle.ironnest.local/`) |
+| `dozzle` | Log viewer | dozzle | `amir20/dozzle:v10.6.7` | — (was `0.0.0.0:8888`, **LAN-exposed**; closed 2026-05-27; reachable only via `https://dozzle.ironnest.local/`) |
 | `wazuh.manager` | SIEM log collection/analysis | wazuh | `wazuh/wazuh-manager:4.14.5` | `127.0.0.1:1514–1515` |
 | `wazuh.indexer` | SIEM OpenSearch index (also validates Authelia ID tokens via OIDC; joins `platform-net` to reach `auth.ironnest.local`) | wazuh | `wazuh/wazuh-indexer:4.14.5` | — |
 | `wazuh.dashboard` | SIEM dashboard (OIDC SSO against Authelia) | wazuh | `wazuh/wazuh-dashboard:4.14.5` | — (loopback `8443` closed 2026-05-27; reachable only via `https://wazuh.ironnest.local/`) |
 | `wazuh-infisical-agent` | Renders `WAZUH_OIDC_CLIENT_SECRET` for the dashboard's OIDC client | wazuh | `platform/infisical-cli:0.43.76-patched` | — |
+| `wazuh-query` | Read-only Wazuh Query Broker for profile agents | wazuh-query-broker | `ironnest/wazuh-query-broker:1.0.0` | — (internal only on `platform-net`) |
 | `trivy-server` | CVE/image vulnerability scanner | trivy | `aquasec/trivy:0.70.0` | — |
 | `traefik` | Public reverse proxy + TLS termination | ingress | `traefik:v3.3.4` | `0.0.0.0:80`, `0.0.0.0:443`, `127.0.0.1:8880` (dashboard — kept as escape hatch; also reachable Authelia-gated at `https://traefik.ironnest.local/dashboard/`) |
 | `authelia` | Identity gate / WebAuthn portal + OIDC provider (for Wazuh) | ingress | `authelia/authelia:4.39.20` | — (no host port; reachable only via Traefik at `https://auth.ironnest.local/`). State persisted in named volume `ingress_authelia-data`. |
@@ -127,20 +129,24 @@ The **Reachable from host** column lists the URL or port a user/operator types t
 | `hermes-platform-ollama` | Local embedding inference for OpenViking (GPU-accelerated via WSL2 passthrough since 2026-06-13) | hermes-platform | `ollama/ollama:0.4.6` | — |
 | `hermes-platform-openviking` | Long-term memory backend | hermes-platform | `platform/hermes-platform-openviking:0.1.0` | — |
 | `hermes-platform-memory-gateway` | Policy-enforcing memory front door | hermes-platform | `platform/hermes-platform-memory-gateway:0.1.0` | `127.0.0.1:18080` |
-| `hermes-platform-ttyd` | Hermes Platform management terminal + dashboard | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | `127.0.0.1:8123`, `127.0.0.1:8124` |
-| `hermes-pf-default` | Hermes Platform gateway — `default` profile | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | — (internal only) |
-| `hermes-pf-mark` | Hermes Platform gateway — `mark` profile | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | — (internal only) |
-| `hermes-pf-steve` | Hermes Platform gateway — `steve` profile | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | — (internal only) |
-| `hermes-pf-qa` | Hermes Platform gateway — `qa` profile (QA/verification; renamed from `wifey` 2026-06-14) | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | — (internal only) |
-| `hermes-pf-littlejohn` | Hermes Platform gateway — `littlejohn` profile | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | — (internal only) |
-| `hermes-pf-jaime` | Hermes Platform gateway — `jaime` profile | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | — (internal only) |
-| `hermes-pf-bigbert` | Hermes Platform gateway — `bigbert` profile | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | — (internal only) |
-| `hermes-pf-octo` | Hermes Platform gateway — `octo` profile (platform-ops; added 2026-06-12) | hermes-platform | `platform/hermes-agent:v2026.6.5-patched` | — (internal only) |
+| `hermes-platform-ttyd` | Hermes Platform management terminal + dashboard | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | `127.0.0.1:8123`, `127.0.0.1:8124` |
+| `hermes-pf-default` | Hermes Platform gateway — `default` profile | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | — (internal only) |
+| `hermes-pf-mark` | Hermes Platform gateway — `mark` profile | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | — (internal only) |
+| `hermes-pf-steve` | Hermes Platform gateway — `steve` profile | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | — (internal only) |
+| `hermes-pf-qa` | Hermes Platform gateway — `qa` profile (QA/verification; renamed from `wifey` 2026-06-14) | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | — (internal only) |
+| `hermes-pf-littlejohn` | Hermes Platform gateway — `littlejohn` profile | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | — (internal only) |
+| `hermes-pf-jaime` | Hermes Platform gateway — `jaime` profile | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | — (internal only) |
+| `hermes-pf-bigbert` | Hermes Platform gateway — `bigbert` profile | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | — (internal only) |
+| `hermes-pf-octo` | Hermes Platform gateway — `octo` profile (platform-ops; added 2026-06-12) | hermes-platform | `platform/hermes-agent:v2026.6.19-patched` | — (internal only) |
 | `hermes-platform-mission-control` | Mission Control ops dashboard (standalone FastAPI; reads registry + audit log read-only, holds NO secrets) | hermes-platform | `platform/hermes-platform-mission-control:0.1.0` | — (internal only; reachable via `https://mission.ironnest.local/`) |
+| `hermes-platform-operations-runner` | Approval-gated lifecycle/factory operations runner | hermes-platform | `platform/hermes-platform-operations-runner:0.1.0` | — (internal only on `mission-control-ops-net`; reached by Mission Control only) |
 | `hermes-platform-artifact-apps` | Sandboxed read-only static server for complete webapp artifacts from the Kanban shared volume | hermes-platform | `nginxinc/nginx-unprivileged:alpine` | — (internal only; reachable via `https://apps.ironnest.local/`) |
+| `kali-mcp-littlejohn` | Optional on-demand Kali Linux MCP sidecar for LittleJohn security tooling | hermes-platform (`kali` profile) | `platform/kali-mcp-littlejohn:2026.07.03` | — (internal only; `:8000` exposed only on `littlejohn-kali-net`) |
 | `browser-intent-mcp` | Intent-level MCP facade | browser-intent | `platform/browser-intent-mcp:0.1.0` | `127.0.0.1:18901` |
 | `browser-intent-worker` | Playwright browser worker (pinned at `172.30.0.30` so Squid can ACL it independently) | browser-intent | `platform/browser-intent-worker:0.1.0` | — |
 | `browser-intent-infisical-agent` | Secrets sidecar | browser-intent | `platform/infisical-cli:0.43.76-patched` | — |
+
+**Live image note (2026-07-06):** the eight `hermes-pf-*` profile gateways are running `platform/hermes-agent:v2026.6.19-patched`; `hermes-platform-ttyd` is still running an older `platform/hermes-agent:v2026.6.5-patched` container created before the tag bump and should be recreated when the operator wants the management terminal image to match the current Compose declaration.
 
 **Functional layers (outermost → core):**
 ```
@@ -158,7 +164,7 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 | Image (compose / built tag) | Dockerfile `FROM` pin | Upstream version | Pin method |
 |---|---|---|---|
 | `platform/openclaw:2026.4.23-1-codex` | `ghcr.io/openclaw/openclaw:2026.4.23-1-amd64` | 2026.4.23-1 | Calendar semver |
-| `platform/hermes-agent:v2026.6.5-patched` | upstream Hermes image (set in `hermes/Dockerfile`) | v0.16.0 (tag `v2026.6.5`, "The Surface Release"; upgraded from v0.15.2 on 2026-06-13) | Calendar semver |
+| `platform/hermes-agent:v2026.6.19-patched` | upstream Hermes image (set in `hermes/Dockerfile`) | v0.17.0 (tag `v2026.6.19`; upgraded from v0.16.0 on 2026-06-19) | Calendar semver |
 | `platform/infisical-cli:0.43.76-patched` | `infisical/cli@sha256:dba406b3…` | 0.43.76 (binary) | Digest |
 | `platform/infisical:pg-36438985-patched` | `infisical/infisical@sha256:36438985…` | unknown (floating upstream) | Digest |
 | `platform/postgres:16.13-alpine-patched` | `postgres:16.13-alpine` | PostgreSQL 16.13 | Semver tag |
@@ -174,7 +180,7 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 | `wazuh/wazuh-dashboard:4.14.5` | — (used directly) | 4.14.5 | Semver tag |
 | `aquasec/trivy:0.70.0` | — (used directly) | 0.70.0 | Semver tag |
 | `adguard/adguardhome:v0.107.74` | — (used directly) | v0.107.74 | Semver tag |
-| `amir20/dozzle:v10.6.5` | — (used directly) | v10.6.5 | Semver tag |
+| `amir20/dozzle:v10.6.7` | — (used directly) | v10.6.7 | Semver tag |
 
 > Digest-pinned images (infisical, squid, socket-proxy) have no upstream semver release tag. On upgrade, pull the new image, record the new digest, and update both the `FROM` line and the compose `image:` tag.
 
@@ -330,6 +336,7 @@ A remote attacker who has taken over the operator's Windows session (RDP, stolen
 | ingress-infisical-agent | 0.25 | 64 MB |
 | monitoring-fluent-bit | 0.5 | 128 MB |
 | monitoring-container-sync | 0.1 | 32 MB |
+| wazuh-query-broker | not declared | not declared |
 | OpenClaw gateway | 4.0 | 4 GB |
 | openclaw-ttyd | 0.5 | 1 GB |
 | openclaw-infisical-agent | 0.25 | 64 MB |
@@ -347,12 +354,16 @@ A remote attacker who has taken over the operator's Windows session (RDP, stolen
 | hermes-pf-bigbert | 2.0 | 768 MB |
 | hermes-pf-octo | 2.0 | 768 MB |
 | hermes-platform-mission-control | 0.5 | 128 MB |
+| hermes-platform-operations-runner | not declared | not declared |
 | hermes-platform-artifact-apps | 0.5 | 64 MB |
+| kali-mcp-littlejohn (optional) | 2.0 | 2 GB |
 | Browser Intent MCP | 0.5 | 256 MB |
 | Browser Intent worker | 2.0 | 2 GB |
 | browser-intent-infisical-agent | 0.25 | 64 MB |
 
-**Total memory budget (from live limits):** ~8.7 GB always-on (18 containers). Add ~18.7 GB when all on-demand stacks run (OpenClaw ~5.06 GB / 3, Hermes Platform ~11.3 GB / 15, Browser Intent ~2.31 GB / 3) for ~27.4 GB / 39 containers total. Hermes Platform alone now reserves ~11.3 GB across its 15 containers, because the eight `hermes-pf-*` (incl. `octo`, added 2026-06-12) were bumped from 0.5 CPU / 512 MB to **2.0 CPU / 768 MB** and Ollama from 2.0 to **5.0 CPU** during the Mission Control chat-latency work (2026-06-07; CPU starvation was the real throttle on warm agent turns), plus the 128 MB Mission Control container and the 64 MB artifact app server. Note: as of 2026-06-13 Ollama runs embeddings on the host **GTX 1650 GPU** (WSL2 passthrough), so its 5.0 CPU ceiling is now largely idle — embeddings fell from ~20–31 s to ~1 s.
+**Total declared memory budget:** ~8.7 GB for the 18 always-on bootstrap containers with limits. Add ~18.7 GB when all limited on-demand containers run (OpenClaw ~5.06 GB / 3, Hermes Platform ~11.3 GB / 15 limited containers, Browser Intent ~2.31 GB / 3) for ~27.4 GB across the 39 currently limited regular containers. Two live support/control containers (`wazuh-query-broker` and `hermes-platform-operations-runner`) do not currently declare Compose resource limits, so the regular 41-container deployment is not fully budgeted until those limits are added. Hermes Platform's declared budget is ~11.3 GB across its limited containers because the eight `hermes-pf-*` (incl. `octo`, added 2026-06-12) were bumped from 0.5 CPU / 512 MB to **2.0 CPU / 768 MB** and Ollama from 2.0 to **5.0 CPU** during the Mission Control chat-latency work (2026-06-07; CPU starvation was the real throttle on warm agent turns), plus the 128 MB Mission Control container and the 64 MB artifact app server. Note: as of 2026-06-13 Ollama runs embeddings on the host **GTX 1650 GPU** (WSL2 passthrough), so its 5.0 CPU ceiling is now largely idle — embeddings fell from ~20–31 s to ~1 s.
+
+**Wazuh low-I/O startup profile:** Wazuh remains enabled for syscollector, SCA, vulnerability detection, and FIM, but startup-time full scans are disabled (`scan_on_start=no`) and vulnerability feed refreshes run every 4 h. This avoids repeated disk/CPU bursts on the Windows-local Rancher VM while preserving scheduled collection.
 
 ---
 
@@ -367,6 +378,9 @@ A remote attacker who has taken over the operator's Windows session (RDP, stolen
 | Trivy scanner | socket-proxy | `DOCKER_HOST=tcp://socket-proxy:2375` (read-only) |
 | `monitoring-container-sync` | socket-proxy | `GET /containers/json` every 60 s; writes `/lookups/containers.tsv` |
 | `monitoring-fluent-bit` | All container stdouts/stderrs + `containers.tsv` | Tails `/var/lib/docker/containers/*.log`, enriches via lua filter, ships to `wazuh.indexer` (`ironnest-containers-*`) |
+| Profile agents | `wazuh-query` | Read-only SIEM query API on `platform-net`; token-gated broker in front of Wazuh indexer/API |
+| Mission Control | `hermes-platform-operations-runner` | Token-gated approval execution on `mission-control-ops-net`; lifecycle/factory actions only |
+| `hermes-pf-littlejohn` | `kali-mcp-littlejohn` | Optional SSE MCP endpoint at `http://kali-mcp-littlejohn:8000/sse` on `littlejohn-kali-net`; no host port, no `platform-net`, no memory-net |
 | `*-infisical-agent` sidecars (OpenClaw, Browser Intent on `platform-net`; Ingress, Wazuh on `platform-egress`) | Infisical | `http://infisical:8090` (Universal Auth, polled every 60 s; Ingress renders the OIDC snippet, Wazuh renders the OIDC client secret) |
 | `hermes-platform-ttyd`, `hermes-pf-*`, `memory-gateway` | Infisical | `/usr/local/bin/with-infisical` injects per-profile and gateway tokens from `/hermes-platform/*` paths |
 | `hermes-pf-*` | `hermes-platform-memory-gateway` | Internal HTTP on `hermes-platform-app-net`; bearer token from Infisical |
@@ -400,7 +414,7 @@ Live source: `security/egress-proxy/squid.conf`. The current policy is **allow-b
 - `malicious_dst` — IPs from Spamhaus DROP/EDROP, Feodo Tracker
 - `malicious_dstdomain` — domains from Emerging Threats and merged feeds
 
-Both files are written by `blocklist-updater` every 6 h; an inotifywait watchdog inside the egress-proxy container triggers `squid -k reconfigure` automatically when either file changes.
+Both files are written by `blocklist-updater` every 6 h; an inotifywait watchdog inside the egress-proxy container triggers `squid -k reconfigure` automatically when either file changes. The Squid entrypoint initializes the UFS cache tree on every boot before starting the foreground process, and the Compose healthcheck verifies the live `squid` process directly instead of relying on a PID file that foreground mode may not leave behind.
 
 A per-stack `dst_browser_intent` ACL is defined in `squid.conf` (`.colfinancial.com`, `.maxihealth.com.ph`, `.april.fr`, `.hi-precision.com.ph`) but is **not currently referenced** in any `http_access` rule. Per-stack destination restriction for Browser Intent is enforced at the Playwright layer instead — see `browser-intent/policies/sites.json` `allowedDomains` per site, which includes `*.healthonlineasia.com` for the Hi-Precision results host. Re-enabling Squid-level per-stack allowlisting requires wiring `dst_browser_intent` (and new equivalent ACLs for other stacks) into a deny-by-default rule above `http_access allow platform_clients`.
 
@@ -667,7 +681,9 @@ Why `--no-build`? Both Hermes services have both `build:` and `image:` in compos
 | `hermes-pf-bigbert` | `bigbert` profile gateway | — | Mounts only `hermes-platform_data-bigbert:/opt/data`; Telegram is configured through Infisical. |
 | `hermes-pf-octo` | `octo` profile gateway (platform-ops) | — | Mounts only `hermes-platform_data-octo:/opt/data`; added 2026-06-12, gateway auth and post-provisioning gaps resolved 2026-06-13. |
 | `hermes-platform-mission-control` | Ops dashboard (standalone FastAPI) | — | `platform-net` only; reachable via `https://mission.ironnest.local/`. Holds NO secrets; reads registry + audit log read-only. Hardened: `cap_drop: ALL`, `no-new-privileges`, `read_only` rootfs + tmpfs, non-root uid 11002. See **Mission Control** below. |
+| `hermes-platform-operations-runner` | Approval-gated operations runner | — | Internal only on `mission-control-ops-net`; reached by Mission Control. It validates bearer auth, single-use approvals, exact container/image/bind allowlists, and persisted execution state before running lifecycle or factory actions. It is the only Hermes Platform service with Docker socket access, mounted read-only, and is not a general Docker API/exec/build proxy. |
 | `hermes-platform-artifact-apps` | Sandboxed static webapp artifact server | — | `platform-net` only; reachable via `https://apps.ironnest.local/`. Serves complete generated webapp folders from the Kanban shared artifacts volume read-only on a separate origin with a restrictive CSP, so agent-authored HTML/JS is isolated from Mission Control. |
+| `kali-mcp-littlejohn` | Optional Kali Linux MCP sidecar for LittleJohn | — | Off by default under Compose profile `kali`. Serves SSE on `:8000` only to `hermes-pf-littlejohn` through `littlejohn-kali-net`; joins `littlejohn-kali-egress-net` for Kali-only tool/package egress; never joins `platform-net` or `hermes-platform-mem-net`. Persistent `/work` is a named volume, and `/reports` maps to `shared/littlejohn/kali` for artifact handoff. |
 
 **Memory isolation:** `hermes-pf-*` containers do not join `hermes-platform-mem-net` and cannot reach OpenViking directly. Every memory request must go through `hermes-platform-memory-gateway`, which authenticates with profile bearer tokens from Infisical and enforces deny-first profile policies.
 
@@ -686,8 +702,11 @@ Why `--no-build`? Both Hermes services have both `build:` and `image:` in compos
 `hermes-platform-mission-control` is a **standalone** least-privilege ops dashboard (image `platform/hermes-platform-mission-control:0.1.0`, built from `hermes-platform/mission-control/`). It is deliberately **decoupled from the memory-gateway policy kernel** (an earlier iteration baked it into the gateway image and was reverted) so the security-critical kernel stays small. It holds **no** OpenViking key, profile tokens, or Infisical creds.
 
 - **Data sources (read-only, no gateway API calls):** the profile registry (`registry/profiles-registry.yaml`, `:ro`), the gateway audit log (`memory-gateway-log` volume, `:ro`), the policies dir (`:ro`, only to compute `policy_loaded`), plus its own `mission-control-state` volume for tasks/schedules/chat history.
-- **Network:** `platform-net` only (so Traefik can route to it). Route `mission` → `http://mission-control:8080`, middlewares `[trusted-networks, rate-limit, authelia]` — behind the same FIDO gate as every other route.
+- **Network:** `platform-net` for Traefik routing plus `mission-control-ops-net` for the private operations-runner path. Route `mission` → `http://mission-control:8080`, middlewares `[trusted-networks, rate-limit, authelia]` — behind the same FIDO gate as every other route.
 - **Agent chat + file downloads** are served by a tiny **in-container agent-chat bridge** (`agent-bridge/agent-chat-bridge.py`, Python stdlib, no deps), bind-mounted read-only into **each** `hermes-pf-*` and launched as a background co-process before `hermes gateway run`. It listens on `:8011` (token-gated by `MISSION_CONTROL_BRIDGE_TOKEN`) and drives a persistent `hermes acp` (Agent Client Protocol) session **for its own profile only** — no Docker socket, no cross-profile access, per-profile isolation preserved. Mission Control proxies chat over `POST /api/agent/{profile}/chat[/stream]` (SSE token streaming) and serves agent-produced files over `GET /api/agent/{profile}/file/{name}` → the bridge's hardened `GET /file` (basename-only, charset-restricted, realpath-prefixed to `/opt/data/.mission-control-uploads`). This is the one egress path for files to leave an agent container to the operator's browser; it stays within `platform-net` and the FIDO gate.
+- **Shared Kanban control:** Goal decomposition runs through the profile-local bridge and surfaces structured decomposer failures as Mission Control errors instead of treating them as successful bridge replies. Goal cleanup is archival, not destructive delete: moving or archiving a goal archives the whole linked effort (goal plus subtasks, transitively), and the drawer's "Delete goal from active board" action uses the same archive path so task history and links remain recoverable.
+- **Approval-gated operations:** Mission Control can submit approved lifecycle and factory requests to `hermes-platform-operations-runner` over `mission-control-ops-net`. The runner requires its bearer token, consumes each approval only once, checks exact container/image/bind allowlists, persists execution state in `operations-runner-state`, and intentionally excludes arbitrary Docker exec/build/API access. This keeps operator-approved start/stop/restart and bounded factory actions out of the profile agents and memory gateway.
+- **LittleJohn Kali MCP:** `kali-mcp-littlejohn` is an optional, off-by-default Kali Linux MCP sidecar. LittleJohn can reach it only over `littlejohn-kali-net` after it is created/started with the `kali` profile or through the pre-approved lifecycle path for that exact container. It publishes no Windows host port, does not join `platform-net` or `hermes-platform-mem-net`, keeps `/work` in a named volume, and hands reports back through `shared/littlejohn/kali`.
 - **Why the `hermes-pf-*`/Ollama resource bumps:** running `hermes acp` alongside `hermes gateway run` in 0.5 CPU starved warm chat turns; the `x-hermes-pf-base` anchor was raised to 2.0 CPU / 768 MB and Ollama to 5.0 CPU. Embeddings were originally CPU-bound (~20–31 s each, gating every memory-backed chat turn); as of **2026-06-13 Ollama offloads `mxbai-embed-large` to the host GTX 1650 GPU** (WSL2 passthrough), cutting embeddings to ~1 s. See **Service Resource Limits** and the Ollama container note above.
 - The sidebar **Memory** item is an external link to the LLM Wiki (`https://wiki.ironnest.local`), not an in-app view.
 
@@ -818,7 +837,7 @@ Two Task Scheduler tasks registered for user `phoenix`, both triggered "At logon
 
 **Why two tasks, not one?** Separation lets each task have its own ExecutionTimeLimit and `LastTaskResult` for diagnosis. RD launch is bounded (30 min); platform bring-up may legitimately take longer (Wazuh + first-time Hermes build).
 
-**Verified end-to-end (2026-05-14):** RD process up at +18 s after logon, Docker responsive at +40 s, all 23 containers healthy and `platform-autostart` exiting `LastTaskResult: 0` at +140 s. Footprint has since grown to 39 regular containers / 40 compose-defined services with Hermes Platform dynamic profiles and the Trivy scanner profile; re-time after the next cold boot.
+**Verified end-to-end (2026-05-14):** RD process up at +18 s after logon, Docker responsive at +40 s, all 23 containers healthy and `platform-autostart` exiting `LastTaskResult: 0` at +140 s. Footprint has since grown to 41 regular containers when all runtime stacks are up, plus optional `ironnest-browse`, LLM Wiki, and the Trivy scanner profile; re-time after the next cold boot.
 
 **Prerequisite:** Rancher Desktop's own "Automatically start at login" toggle (Preferences → Application → Behavior) must be **off** so it doesn't race with `rancher-desktop-autostart`.
 
