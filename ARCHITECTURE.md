@@ -25,8 +25,8 @@ Each capability lives in its own Compose project. Restarting or resetting one st
 - `no-new-privileges: true` on every service that accepts it.
 - Healthchecks use proper credentials where the service requires auth (e.g. wazuh.indexer passes `WAZUH_INDEXER_PASSWORD` and asserts HTTP 200, not 401). Accepting 401 as healthy masks auth misconfiguration.
 
-### 3. No raw Docker control except the approved runner
-Dozzle, Wazuh, Trivy, and `monitoring-container-sync` talk to the `socket-proxy` service, which exposes only read-only endpoints (CONTAINERS, EVENTS, IMAGES, INFO, NETWORKS, PING, VERSION, VOLUMES). Write/exec/build operations stay blocked through the proxy. The only scoped exception is `hermes-platform-operations-runner`, which mounts the Docker socket read-only and is reachable only from Mission Control on `mission-control-ops-net`; it enforces bearer auth, single-use approvals, exact allowlists, and a narrow action set instead of exposing a general Docker API.
+### 3. No raw Docker control except approved narrow lanes
+Dozzle, Wazuh, Trivy, and `monitoring-container-sync` talk to the `socket-proxy` service; none mounts `/var/run/docker.sock` directly. The proxy exposes observability read endpoints (CONTAINERS, EVENTS, LOGS, IMAGES, INFO, NETWORKS, PING, VERSION, VOLUMES) plus a deliberately narrow container lifecycle lane for `POST /containers/<id>/{start,stop,restart}` so Dozzle can offer bounded controls. Exec, build, remove, update, arbitrary POST, and DELETE traffic stay blocked by the HAProxy template. The other scoped exception is `hermes-platform-operations-runner`, which mounts the Docker socket read-only and is reachable only from Mission Control on `mission-control-ops-net`; it enforces bearer auth, single-use approvals, exact allowlists, and a narrow action set instead of exposing a general Docker API.
 
 ### 4. DNS-first filtering
 Every service sets `dns: 172.30.0.10` (AdGuard). DNS-layer blocking is the first line of defence against malicious domain resolution before any TCP connection is attempted.
@@ -102,7 +102,7 @@ The **Reachable from host** column lists the URL or port a user/operator types t
 
 | Container | Role | Stack | Image | Host Port |
 |-----------|------|-------|-------|-----------|
-| `socket-proxy` | Read-only Docker socket proxy | socket-proxy | `platform/socket-proxy:0.4.2-patched` | — |
+| `socket-proxy` | Docker socket proxy with read endpoints plus path-limited start/stop/restart | socket-proxy | `platform/socket-proxy:0.4.2-patched` | — |
 | `adguard` | DNS filter (pinned at `172.30.0.10`) | adguard | `adguard/adguardhome:v0.107.74` | — (admin UI loopback closed 2026-05-27; reachable only via `https://adguard.ironnest.local/`) |
 | `egress-proxy` | HTTP allowlist proxy (Squid) | egress-proxy | `platform/squid:6.13-patched` | — |
 | `blocklist-updater` | Periodic threat-feed fetcher feeding Squid | egress-proxy | `platform/blocklist-updater:1.0` | — |
@@ -110,9 +110,9 @@ The **Reachable from host** column lists the URL or port a user/operator types t
 | `infisical-postgres` | Infisical database | secrets | `platform/postgres:16.13-alpine-patched` | — |
 | `infisical-redis` | Infisical cache | secrets | `platform/redis:7.4.8-alpine-patched` | — |
 | `dozzle` | Log viewer | dozzle | `amir20/dozzle:v10.6.7` | — (was `0.0.0.0:8888`, **LAN-exposed**; closed 2026-05-27; reachable only via `https://dozzle.ironnest.local/`) |
-| `wazuh.manager` | SIEM log collection/analysis | wazuh | `wazuh/wazuh-manager:4.14.5` | `127.0.0.1:1514–1515` |
-| `wazuh.indexer` | SIEM OpenSearch index (also validates Authelia ID tokens via OIDC; joins `platform-net` to reach `auth.ironnest.local`) | wazuh | `wazuh/wazuh-indexer:4.14.5` | — |
-| `wazuh.dashboard` | SIEM dashboard (OIDC SSO against Authelia) | wazuh | `wazuh/wazuh-dashboard:4.14.5` | — (loopback `8443` closed 2026-05-27; reachable only via `https://wazuh.ironnest.local/`) |
+| `wazuh.manager` | SIEM log collection/analysis | wazuh | `wazuh/wazuh-manager:4.14.6` | `127.0.0.1:1514–1515` |
+| `wazuh.indexer` | SIEM OpenSearch index (also validates Authelia ID tokens via OIDC; joins `platform-net` to reach `auth.ironnest.local`) | wazuh | `wazuh/wazuh-indexer:4.14.6` | — |
+| `wazuh.dashboard` | SIEM dashboard (OIDC SSO against Authelia) | wazuh | `wazuh/wazuh-dashboard:4.14.6` | — (loopback `8443` closed 2026-05-27; reachable only via `https://wazuh.ironnest.local/`) |
 | `wazuh-infisical-agent` | Renders `WAZUH_OIDC_CLIENT_SECRET` for the dashboard's OIDC client | wazuh | `platform/infisical-cli:0.43.76-patched` | — |
 | `wazuh-query` | Read-only Wazuh Query Broker for profile agents | wazuh-query-broker | `ironnest/wazuh-query-broker:1.0.0` | — (internal only on `platform-net`) |
 | `trivy-server` | CVE/image vulnerability scanner | trivy | `aquasec/trivy:0.70.0` | — |
@@ -175,9 +175,9 @@ All images are pinned — no `latest` or floating tags anywhere in IronNest. Sem
 | `platform/socket-proxy:0.4.2-patched` | `tecnativa/docker-socket-proxy@sha256:1f3a6f30…` | v0.4.2 | Digest |
 | `traefik:v3.3.4` | — (used directly) | v3.3.4 | Semver tag |
 | `platform/monitoring-fluent-bit:3.2` | `fluent/fluent-bit:3.2-debug` | Fluent Bit 3.2 | Semver tag (in-house; bakes `fluent-bit.conf`, lua scripts, root-CA) |
-| `wazuh/wazuh-manager:4.14.5` | — (used directly) | 4.14.5 | Semver tag |
-| `wazuh/wazuh-indexer:4.14.5` | — (used directly) | 4.14.5 | Semver tag |
-| `wazuh/wazuh-dashboard:4.14.5` | — (used directly) | 4.14.5 | Semver tag |
+| `wazuh/wazuh-manager:4.14.6` | — (used directly) | 4.14.6 | Semver tag |
+| `wazuh/wazuh-indexer:4.14.6` | — (used directly) | 4.14.6 | Semver tag |
+| `wazuh/wazuh-dashboard:4.14.6` | — (used directly) | 4.14.6 | Semver tag |
 | `aquasec/trivy:0.70.0` | — (used directly) | 0.70.0 | Semver tag |
 | `adguard/adguardhome:v0.107.74` | — (used directly) | v0.107.74 | Semver tag |
 | `amir20/dozzle:v10.6.7` | — (used directly) | v10.6.7 | Semver tag |
@@ -218,7 +218,7 @@ IronNest uses **three Docker network classes**, each with a distinct trust postu
   │  fluent-bit (172.30.0.15)          ││    │   │  Infisical (SMTP)                    │
   │  BrowserIntent worker (172.30.0.30)││    │   │  Wazuh manager / indexer (feeds)     │
   │  Squid (ingress side)              ││    │   │  Trivy server (CVE DB)               │
-  │  socket-proxy :2375 (r/o)          ││    │   │  *-infisical-agent sidecars          │
+  │  socket-proxy :2375 (read + ctl)   ││    │   │  *-infisical-agent sidecars          │
   │  Infisical (HTTP API)              ││    │   │                                      │
   │  Wazuh manager/indexer/dashboard   ││    │   └──────────────────▲──────────────────┘
   │  Trivy server (HTTP)               ││    │                       │
@@ -373,7 +373,7 @@ A remote attacker who has taken over the operator's Windows session (RDP, stolen
 |----------|----------|-----------|
 | All containers | AdGuard | DNS `172.30.0.10` |
 | HTTP clients | Squid | `HTTP_PROXY=http://squid:3128` (blocklist filtering; see Egress Filtering section) |
-| Dozzle | socket-proxy | `DOCKER_HOST=tcp://socket-proxy:2375` (read-only) |
+| Dozzle | socket-proxy | `DOCKER_HOST=tcp://socket-proxy:2375`; reads logs/events and may call path-limited container start/stop/restart |
 | Wazuh manager | socket-proxy | `DOCKER_HOST=tcp://socket-proxy:2375` (read-only) |
 | Trivy scanner | socket-proxy | `DOCKER_HOST=tcp://socket-proxy:2375` (read-only) |
 | `monitoring-container-sync` | socket-proxy | `GET /containers/json` every 60 s; writes `/lookups/containers.tsv` |
@@ -693,7 +693,9 @@ Why `--no-build`? Both Hermes services have both `build:` and `image:` in compos
 
 **Shared artifact exchange (scoped exception to data isolation):** Separate from the audited gateway/OpenViking memory path, every `hermes-pf-*` also mounts a host-bind tree at `/opt/shared` for cross-agent binary/file handoff — its own slice read-write at `/opt/shared/mine` and the whole tree read-only at `/opt/shared/all` (write-own / read-all). The tree is host-visible at `D:\claude-workspace\platform\hermes-platform\shared\`. This channel is **not** audited and exists only because OpenViking cannot hold binaries; `/opt/data` and OpenViking isolation are unaffected. See `hermes-platform/docs/08-SECURITY-MODEL.md §"Shared artifact exchange"` and decision D-013.
 
-**Profile-owned automations:** legacy shared-volume automations have been migrated into isolated Hermes Platform profiles. `hermes-pf-mark` owns the Merx trading-bot scripts, Merx repo, and cron jobs (`start-merx-daily-0845-manila`, `check-merx-health-0855-manila`, `merx-heartbeat-hourly-market-hours-manila`, `stop-merx-market-close-1520-manila`). `hermes-pf-littlejohn` owns the CVE watch scripts, acknowledgement helper, copied CVE state, and watcher cron jobs (`cve-watch-infra-os`, `cve-watch-web-facing`, `cve-watch-package-supply-chain`). The legacy `hermes_hermes-data` copies remain archival/reference only.
+**IronNest Task / shared Kanban coordination:** Every profile mounts `hermes-platform_kanban-shared` at `/opt/kanban`; this is a deliberate shared work board, not private memory. Raw Hermes Kanban remains the substrate, while IronNest Task is the Mission Control workflow on top of it: triage goals can be decomposed by the configured orchestrator, routed to specialists from `registry/profiles-registry.yaml`, run inside the assignee's own profile container, and reviewed through logs, durable artifacts, Reports, Apps, QA, and security gates. Task artifacts live under `/opt/kanban/artifacts/<task_id>/`, so they survive the worker turn and can be exposed through Mission Control or the sandboxed `apps.ironnest.local` origin when a complete app folder contains `index.html`.
+
+**Profile-owned automations:** legacy shared-volume automations have been migrated into isolated Hermes Platform profiles. `hermes-pf-mark` owns the Merx trading-bot scripts, Merx repo, and cron jobs (`start-merx-daily-0845-manila`, `check-merx-health-0855-manila`, `merx-heartbeat-hourly-market-hours-manila`, `stop-merx-market-close-1520-manila`). `hermes-pf-littlejohn` owns the CVE watch scripts, acknowledgement helper, copied CVE state, and watcher cron jobs (`cve-watch-infra-os`, `cve-watch-web-facing`, `cve-watch-package-supply-chain`). Mission Control can ask a profile bridge to catch up missed cron work after downtime. The legacy `hermes_hermes-data` copies remain archival/reference only.
 
 **Legacy transition note:** `hermes-ttyd` on `127.0.0.1:7682/9119` reads the old shared `hermes_hermes-data` volume. The new platform UI is `127.0.0.1:8123/8124`.
 
@@ -704,8 +706,8 @@ Why `--no-build`? Both Hermes services have both `build:` and `image:` in compos
 - **Data sources (read-only, no gateway API calls):** the profile registry (`registry/profiles-registry.yaml`, `:ro`), the gateway audit log (`memory-gateway-log` volume, `:ro`), the policies dir (`:ro`, only to compute `policy_loaded`), plus its own `mission-control-state` volume for tasks/schedules/chat history.
 - **Network:** `platform-net` for Traefik routing plus `mission-control-ops-net` for the private operations-runner path. Route `mission` → `http://mission-control:8080`, middlewares `[trusted-networks, rate-limit, authelia]` — behind the same FIDO gate as every other route.
 - **Agent chat + file downloads** are served by a tiny **in-container agent-chat bridge** (`agent-bridge/agent-chat-bridge.py`, Python stdlib, no deps), bind-mounted read-only into **each** `hermes-pf-*` and launched as a background co-process before `hermes gateway run`. It listens on `:8011` (token-gated by `MISSION_CONTROL_BRIDGE_TOKEN`) and drives a persistent `hermes acp` (Agent Client Protocol) session **for its own profile only** — no Docker socket, no cross-profile access, per-profile isolation preserved. Mission Control proxies chat over `POST /api/agent/{profile}/chat[/stream]` (SSE token streaming) and serves agent-produced files over `GET /api/agent/{profile}/file/{name}` → the bridge's hardened `GET /file` (basename-only, charset-restricted, realpath-prefixed to `/opt/data/.mission-control-uploads`). This is the one egress path for files to leave an agent container to the operator's browser; it stays within `platform-net` and the FIDO gate.
-- **Shared Kanban control:** Goal decomposition runs through the profile-local bridge and surfaces structured decomposer failures as Mission Control errors instead of treating them as successful bridge replies. Goal cleanup is archival, not destructive delete: moving or archiving a goal archives the whole linked effort (goal plus subtasks, transitively), and the drawer's "Delete goal from active board" action uses the same archive path so task history and links remain recoverable.
-- **Approval-gated operations:** Mission Control can submit approved lifecycle and factory requests to `hermes-platform-operations-runner` over `mission-control-ops-net`. The runner requires its bearer token, consumes each approval only once, checks exact container/image/bind allowlists, persists execution state in `operations-runner-state`, and intentionally excludes arbitrary Docker exec/build/API access. This keeps operator-approved start/stop/restart and bounded factory actions out of the profile agents and memory gateway.
+- **IronNest Task control:** Goal decomposition runs through the profile-local bridge and surfaces structured decomposer failures as Mission Control errors instead of treating them as successful bridge replies. Archiving a goal archives the whole linked effort (goal plus subtasks, transitively). Permanent deletion is an explicit, typed-confirmation action that removes the goal, linked subtasks, and Kanban-owned logs/workspaces/artifacts; ordinary cleanup should use archive when history must remain recoverable.
+- **Approval-gated operations:** Mission Control can submit approved lifecycle and factory requests to `hermes-platform-operations-runner` over `mission-control-ops-net`. The runner requires its bearer token, consumes each approval only once, checks exact container/image/bind allowlists, persists execution state in `operations-runner-state`, and intentionally excludes arbitrary Docker exec/build/API access. LittleJohn also has a separate scoped submission token for Windows-host remediation proposals; approved host jobs are written to a local queue for the Windows runner, which defaults to a scoped remediation runner unless raw PowerShell mode is explicitly enabled.
 - **LittleJohn Kali MCP:** `kali-mcp-littlejohn` is an optional, off-by-default Kali Linux MCP sidecar. LittleJohn can reach it only over `littlejohn-kali-net` after it is created/started with the `kali` profile or through the pre-approved lifecycle path for that exact container. It publishes no Windows host port, does not join `platform-net` or `hermes-platform-mem-net`, keeps `/work` in a named volume, and hands reports back through `shared/littlejohn/kali`.
 - **Why the `hermes-pf-*`/Ollama resource bumps:** running `hermes acp` alongside `hermes gateway run` in 0.5 CPU starved warm chat turns; the `x-hermes-pf-base` anchor was raised to 2.0 CPU / 768 MB and Ollama to 5.0 CPU. Embeddings were originally CPU-bound (~20–31 s each, gating every memory-backed chat turn); as of **2026-06-13 Ollama offloads `mxbai-embed-large` to the host GTX 1650 GPU** (WSL2 passthrough), cutting embeddings to ~1 s. See **Service Resource Limits** and the Ollama container note above.
 - The sidebar **Memory** item is an external link to the LLM Wiki (`https://wiki.ironnest.local`), not an in-app view.
