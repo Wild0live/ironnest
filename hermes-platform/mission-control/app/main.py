@@ -87,7 +87,13 @@ HOST_OPERATIONS_QUEUE_DIR = Path(os.environ.get("HOST_OPERATIONS_QUEUE_DIR", "")
 APPS_BASE = os.environ.get("MISSION_CONTROL_APPS_BASE",
                            "https://apps.ironnest.local").rstrip("/")
 TERMINAL_PLATFORM_URL = os.environ.get("MISSION_CONTROL_PLATFORM_TERMINAL_URL",
-                                       "https://hermes-platform.ironnest.local/").strip()
+                                        "https://hermes-platform.ironnest.local/").strip()
+WIKI_PUBLIC_URL = os.environ.get("MISSION_CONTROL_WIKI_URL",
+                                 "https://wiki.ironnest.local/").strip()
+WIKI_SESSION_COOKIE_DOMAIN = os.environ.get("MISSION_CONTROL_WIKI_COOKIE_DOMAIN",
+                                            ".ironnest.local").strip() or None
+WIKI_SESSION_COOKIE_SECURE = os.environ.get(
+    "MISSION_CONTROL_WIKI_COOKIE_SECURE", "true").strip().lower() not in {"0", "false", "no", "off"}
 AGENT_TERMINAL_URL_PATTERN = os.environ.get("MISSION_CONTROL_AGENT_TERMINAL_URL_PATTERN",
                                             "{platform_url}terminal/{profile}/").strip()
 
@@ -2585,6 +2591,45 @@ def kanban_publish(task_id: str, req: WikiPublish, _: None = Depends(require_adm
                                  {"action": "publish_wiki", "id": task_id,
                                   "name": req.name, "title": req.title}, timeout=70)
     return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/wiki/session")
+def wiki_session(_: None = Depends(require_admin)) -> JSONResponse:
+    """Create a browser wiki_session via the bridge-held WIKI_ADMIN_TOKEN.
+
+    Mission Control never receives the raw wiki admin token. It asks the board
+    gateway bridge to sign in to wiki-service server-side, then sets the returned
+    HTTP-only session cookie for the local IronNest domain so the embedded wiki
+    dashboard opens already connected.
+    """
+    code, payload = _bridge_json(_board_profile(), "POST", "/kanban",
+                                 {"action": "wiki_session"}, timeout=30)
+    if code != 200 or not payload.get("ok"):
+        return JSONResponse(status_code=code, content=payload)
+    cookie_name = str(payload.get("cookie_name") or "wiki_session")
+    cookie_value = str(payload.get("cookie_value") or "")
+    if not cookie_value:
+        return JSONResponse(status_code=502, content={
+            "ok": False, "error": "bridge did not return a wiki session cookie"})
+    try:
+        max_age = int(payload.get("max_age") or 30 * 24 * 60 * 60)
+    except (TypeError, ValueError):
+        max_age = 30 * 24 * 60 * 60
+    response = JSONResponse(content={
+        "ok": True,
+        "wiki_url": str(payload.get("wiki_url") or WIKI_PUBLIC_URL),
+    })
+    response.set_cookie(
+        key=cookie_name,
+        value=cookie_value,
+        max_age=max_age,
+        httponly=True,
+        secure=WIKI_SESSION_COOKIE_SECURE,
+        samesite="strict",
+        domain=WIKI_SESSION_COOKIE_DOMAIN,
+        path="/",
+    )
+    return response
 
 
 @router.post("/api/kanban/{task_id}/decompose")

@@ -21,6 +21,7 @@ const terminal = {
   activeId: "platform",
   loaded: false,
 };
+const wiki = { sessionPromise: null };
 
 // Kanban lifecycle columns (shared board via the bridge /kanban proxy).
 const KANBAN_COLUMNS = [
@@ -2872,15 +2873,55 @@ if (_termReload) _termReload.addEventListener("click", () => {
   if (f && f.dataset.src) f.src = f.dataset.src;  // reconnect = reload the frame
 });
 
-// Lazy-load the embedded LLM Wiki iframe only when its view is first opened.
+function setWikiStatus(text) {
+  const el = $("#wikiStatus");
+  if (el) el.textContent = text;
+}
+
+function ensureWikiSession() {
+  if (!wiki.sessionPromise) {
+    wiki.sessionPromise = fetch("/api/wiki/session", {
+      method: "POST",
+      headers: headers(),
+      credentials: "same-origin",
+    }).then(async (resp) => {
+      let data = {};
+      try { data = await resp.json(); } catch (e) { data = {}; }
+      if (!resp.ok) throw new Error(data.error || data.detail || `HTTP ${resp.status}`);
+      return data;
+    }).catch((err) => {
+      wiki.sessionPromise = null;
+      throw err;
+    });
+  }
+  return wiki.sessionPromise;
+}
+
+// Lazy-load the embedded LLM Wiki iframe only after MC mints the wiki session.
 function ensureWiki() {
   const f = $("#wikiFrame");
-  if (f && !f.getAttribute("src") && f.dataset.src) f.src = f.dataset.src;
+  if (!f || f.getAttribute("src") || !f.dataset.src) return;
+  setWikiStatus("Connecting the embedded wiki session...");
+  ensureWikiSession().then(() => {
+    if (!f.getAttribute("src")) f.src = f.dataset.src;
+    setWikiStatus("Embedded LLM Wiki dashboard connected through Mission Control.");
+  }).catch((err) => {
+    if (!f.getAttribute("src")) f.src = f.dataset.src;
+    setWikiStatus(`Wiki auto-connect failed: ${err.message}. Manual token entry is still available in the iframe.`);
+  });
 }
 const _wikiReload = $("#wikiReload");
 if (_wikiReload) _wikiReload.addEventListener("click", () => {
   const f = $("#wikiFrame");
-  if (f && f.dataset.src) f.src = f.dataset.src;  // reload the frame
+  if (!f || !f.dataset.src) return;
+  setWikiStatus("Refreshing the embedded wiki session...");
+  ensureWikiSession().then(() => {
+    f.src = f.dataset.src;  // reload the frame
+    setWikiStatus("Embedded LLM Wiki dashboard connected through Mission Control.");
+  }).catch((err) => {
+    f.src = f.dataset.src;
+    setWikiStatus(`Wiki auto-connect failed: ${err.message}. Manual token entry is still available in the iframe.`);
+  });
 });
 
 $("#refreshBtn").addEventListener("click", () => { loadState(); loadKanban(); loadOperations(); });

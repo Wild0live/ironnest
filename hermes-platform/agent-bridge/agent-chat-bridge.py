@@ -41,6 +41,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from datetime import datetime, timedelta
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -1367,6 +1368,45 @@ def _publish_to_wiki(task_id: str, name: str, title: str = ""):
                  "filename": fname, "wiki_url": WIKI_PUBLIC_URL}
 
 
+def _wiki_session_cookie():
+    """Mint a wiki dashboard session without exposing WIKI_ADMIN_TOKEN to MC."""
+    token = _read_wiki_token()
+    if not token:
+        return 501, {"ok": False, "error": "wiki admin session is not configured on this gateway"}
+    body = json.dumps({"token": token}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{WIKI_SERVICE_URL}/api/session", data=body, method="POST",
+        headers={"Content-Type": "application/json"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=20) as resp:
+            set_cookie_headers = resp.headers.get_all("Set-Cookie") or []
+            resp.read()
+    except urllib.error.HTTPError as exc:
+        code = exc.code if exc.code in (401, 403) else 502
+        return code, {"ok": False, "error": f"wiki session failed: HTTP {exc.code}"}
+    except Exception as exc:  # noqa: BLE001 — unreachable, timeout, bad headers
+        return 502, {"ok": False, "error": f"wiki unreachable: {exc}"}
+
+    cookies = SimpleCookie()
+    for header in set_cookie_headers:
+        cookies.load(header)
+    morsel = cookies.get("wiki_session")
+    if not morsel or not morsel.value:
+        return 502, {"ok": False, "error": "wiki session response did not include wiki_session"}
+    try:
+        max_age = int(morsel["max-age"] or 30 * 24 * 60 * 60)
+    except ValueError:
+        max_age = 30 * 24 * 60 * 60
+    return 200, {
+        "ok": True,
+        "cookie_name": "wiki_session",
+        "cookie_value": morsel.value,
+        "max_age": max_age,
+        "wiki_url": WIKI_PUBLIC_URL,
+    }
+
+
 # ── Reports / Apps projection (board-gateway only) ──────────────────────────
 # A persisted per-task index of artifact-dir contents so the Reports + Apps
 # views don't re-scan the whole shared volume on every read. The projection
@@ -2196,6 +2236,9 @@ def _kanban_action(data: dict):
         if not name:
             return 400, {"ok": False, "error": "missing name"}
         return _publish_to_wiki(tid, name, str(data.get("title") or "")[:200])
+
+    if action == "wiki_session":
+        return _wiki_session_cookie()
 
     return 400, {"ok": False, "error": f"unknown action '{action}'"}
 
