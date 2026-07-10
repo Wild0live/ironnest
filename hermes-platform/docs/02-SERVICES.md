@@ -2,7 +2,7 @@
 
 Machine-readable mirror at `spec/services.yaml`.
 
-Current stack size: **14 containers**.
+Current stack size: **14 core containers** plus **1 optional on-demand Kali MCP container**.
 
 | Container | Image | Role | Listens | Publishes | Networks |
 |---|---|---|---|---|---|
@@ -11,8 +11,8 @@ Current stack size: **14 containers**.
 | `hermes-platform-openviking` | `platform/hermes-platform-openviking:0.1.0` | Long-term memory backend (volcengine/OpenViking) | `1933/tcp` | none | `hermes-platform-mem-net` |
 | `hermes-platform-memory-gateway` | `platform/hermes-platform-memory-gateway:0.1.0` | Policy-enforcing front door (FastAPI) | `8080/tcp` | `127.0.0.1:18080:8080` | `platform-net`, `hermes-platform-mem-net`, `hermes-platform-app-net`, `ingress` |
 | `hermes-platform-mission-control` | `platform/hermes-platform-mission-control:0.1.0` | Ops dashboard + browser chat control plane | `8080/tcp` | none | `platform-net` |
-| `hermes-platform-ttyd` | `platform/hermes-agent:v2026.6.5-patched` | Browser terminal + Hermes dashboard for default profile | `7682/tcp`, `9119/tcp` | `127.0.0.1:8123:7682`, `127.0.0.1:8124:9119` | `platform-net`, `ingress` |
-| `hermes-pf-default` | `platform/hermes-agent:v2026.6.5-patched` | Agent (default profile) + Mission Control bridge | `8011/tcp` | none | `platform-net`, `hermes-platform-app-net` |
+| `hermes-platform-ttyd` | `platform/hermes-agent:v2026.6.19-patched` | Browser terminal + Hermes dashboard for default profile | `7682/tcp`, `9119/tcp` | `127.0.0.1:8123:7682`, `127.0.0.1:8124:9119` | `platform-net`, `ingress` |
+| `hermes-pf-default` | `platform/hermes-agent:v2026.6.19-patched` | Agent (default profile) + Mission Control bridge | `8011/tcp` | none | `platform-net`, `hermes-platform-app-net` |
 | `hermes-pf-mark` | same | Agent (mark profile) + Mission Control bridge | `8011/tcp` | none | same |
 | `hermes-pf-steve` | same | Agent (steve profile) + Mission Control bridge | `8011/tcp` | none | same |
 | `hermes-pf-qa` | same | Agent (qa / QA-verification profile, renamed from wifey 2026-06-14) + Mission Control bridge | `8011/tcp` | none | same |
@@ -20,6 +20,7 @@ Current stack size: **14 containers**.
 | `hermes-pf-jaime` | same | Agent (jaime profile) + Mission Control bridge | `8011/tcp` | none | same |
 | `hermes-pf-bigbert` | same | Agent (bigbert profile) + Mission Control bridge | `8011/tcp` | none | same |
 | `hermes-pf-octo` | same | Agent (octo / platform-ops profile, added 2026-06-12) + Mission Control bridge | `8011/tcp` | none | same |
+| `kali-mcp-littlejohn` | `platform/kali-mcp-littlejohn:2026.07.03` | On-demand Kali Linux MCP sidecar for LittleJohn | `8000/tcp` | none | `littlejohn-kali-net`, `littlejohn-kali-egress-net` |
 
 ## openviking-infisical-agent
 
@@ -52,15 +53,15 @@ FastAPI app at `gateway/app/main.py`. Endpoints:
 
 Auth via `Authorization: Bearer <token>` header. Tokens come from Infisical via `/hermes-platform/gateway → MEMORY_GATEWAY_PROFILE_TOKENS_JSON`.
 
-## hermes-pf-* (7 instances)
+## hermes-pf-* (8 instances)
 
-Each container reuses the existing `platform/hermes-agent:v2026.6.5-patched` image (Hermes Agent v0.16.0, NousResearch tag `v2026.6.5`). **No `entrypoint:` override** — the image's default `/init + main-wrapper.sh` (s6-overlay) handles UID remap and privilege drop; the `with-infisical` wrapper is passed as the first CMD arg and is exec'd under `s6-setuidgid hermes`. Per-container env: `HERMES_PROFILE=<name>`, `MEMORY_GATEWAY_URL=http://memory-gateway:8080`, `MEMORY_GATEWAY_TOKEN=<from Infisical>`. Volume binding: `hermes-platform_data-<profile>:/opt/data`.
+Each container reuses the existing `platform/hermes-agent:v2026.6.19-patched` image (Hermes Agent v0.17.0, NousResearch tag `v2026.6.19`). **No `entrypoint:` override** — the image's default `/init + main-wrapper.sh` (s6-overlay) handles UID remap and privilege drop; the `with-infisical` wrapper is passed as the first CMD arg and is exec'd under `s6-setuidgid hermes`. Per-container env: `HERMES_PROFILE=<name>`, `MEMORY_GATEWAY_URL=http://memory-gateway:8080`, `MEMORY_GATEWAY_TOKEN=<from Infisical>`. Volume binding: `hermes-platform_data-<profile>:/opt/data`.
 
 Every profile also read-only mounts `hermes-plugin/ironnest_gateway` at `/opt/data/plugins/ironnest_gateway`. At startup it enables memory and selects `memory.provider=ironnest_gateway` before running `hermes gateway run`. The provider is in-process code, not a service container: it calls `memory-gateway` for automatic pre-answer recall, post-answer turn persistence, and the exposed memory tools.
 
 Each profile also mounts the **shared artifact-exchange** tree (host bind `./shared`): its own slice read-write at `/opt/shared/mine` and the whole tree read-only at `/opt/shared/all` (write-own / read-all). This is the cross-agent channel for binary/file handoff and is independent of the gateway/OpenViking memory path; it is **not** audited. See `docs/08-SECURITY-MODEL.md §"Shared artifact exchange"`.
 
-Each profile also joins the shared Hermes Kanban board by setting `HERMES_KANBAN_HOME=/opt/kanban` and mounting `hermes-platform_kanban-shared` at `/opt/kanban`. This volume holds `kanban.db`, board/workspace data, and worker logs. It is deliberately cross-profile and must remain secret-free; it is the work-coordination plane, not private memory.
+Each profile also joins the shared Hermes Kanban board by setting `HERMES_KANBAN_HOME=/opt/kanban` and mounting `hermes-platform_kanban-shared` at `/opt/kanban`. This volume holds `kanban.db`, board/workspace data, durable task artifacts, and worker logs. It is deliberately cross-profile and must remain secret-free; it is the work-coordination plane, not private memory.
 
 Every profile also launches the Mission Control **agent-chat bridge** as a background co-process before `hermes gateway run`. The bridge is `agent-bridge/agent-chat-bridge.py`, mounted read-only into the profile at `/opt/ironnest/agent-chat-bridge.py`. It listens on `8011/tcp` inside the profile container, token-gated by `MISSION_CONTROL_BRIDGE_TOKEN`, and drives a persistent warm `hermes acp` session for that profile only.
 
@@ -76,14 +77,36 @@ The bridge supports:
 - lazy LLM-generated role summaries cached by SOUL hash;
 - shared Kanban board reads/writes through a structured `/kanban` bridge action, using whitelisted `hermes kanban` CLI invocations rather than raw shell strings;
 - manual task execution (`run`) routed to the task assignee's own bridge, which claims a ready task and starts a detached `hermes chat -q` worker with `HERMES_KANBAN_TASK`;
-- task decomposition through the configured orchestrator profile;
+- IronNest Task decomposition through the configured orchestrator profile, with child tasks routed by profile role descriptions in `registry/profiles-registry.yaml`;
+- durable task deliverables under `/opt/kanban/artifacts/<task_id>/`, surfaced in Mission Control as Reports and runnable Apps when a folder contains `index.html`;
 - per-profile opt-in auto-dispatch settings, persisted in that profile's `/opt/data/.mc-autodispatch.json`.
 
 Concurrency is intentionally one turn at a time per profile. A second request gets a busy response so the dashboard can retry without duplicating the transcript.
 
+## kali-mcp-littlejohn
+
+Optional on-demand Kali Linux MCP sidecar for LittleJohn. It uses the community
+`k3nn3dy-ai/kali-mcp` SSE server pinned in `kali-mcp/Dockerfile` and exposes
+`http://kali-mcp-littlejohn:8000/sse` only on `littlejohn-kali-net`. It
+publishes no Windows host port and never joins `hermes-platform-mem-net` or
+`platform-net`. Runtime package/tool egress uses the Kali-only
+`littlejohn-kali-egress-net` bridge, not the shared platform egress network.
+
+Mounts:
+
+- `hermes-platform_littlejohn-kali-work:/work` — persistent assessment workspace.
+- `./shared/littlejohn/kali:/reports` — report handoff visible through the shared artifact tree.
+
+Operational posture:
+
+- Off by default; create/start through `docker compose --profile kali`.
+- LittleJohn may pre-approved start, stop, and restart only this exact container.
+- Package installs during a running session are allowed but treated as disposable runtime state.
+- Default target mode is lab-only; IronNest-internal and external targets require an explicit assessment record.
+
 ## mission-control
 
-`hermes-platform-mission-control` is a standalone FastAPI dashboard at `https://mission.ironnest.local/` through Traefik + Authelia. It is deliberately separate from `memory-gateway`: it holds no OpenViking key, profile token, or Infisical credential, and it is on `platform-net` only.
+`hermes-platform-mission-control` is a standalone FastAPI dashboard at `https://mission.ironnest.local/` through Traefik + Authelia. It is the IronNest Task control plane over Hermes Kanban: operators create goals, orchestrate decomposition, route work to specialists, run assigned tasks, inspect logs/artifacts, publish Reports, preview Apps, and keep security/QA work visible. It is deliberately separate from `memory-gateway`: it holds no OpenViking key, profile token, or Infisical credential, and it is on `platform-net` only.
 
 Mounted inputs:
 
@@ -104,6 +127,8 @@ Main API surface:
 - `POST /api/kanban/{task_id}/run` — manual execution, routed to the assignee profile's bridge.
 - `POST /api/kanban/{task_id}/decompose` — orchestrator profile decomposes a triage goal into assigned child tasks.
 - `GET /api/kanban/{task_id}/log` — worker stdout from the shared Kanban log directory.
+- `GET /api/kanban/{task_id}/artifacts`, `/tree`, `/file`, and `/zip` — durable task deliverables from `/opt/kanban/artifacts`.
+- `GET /api/reports` and `GET /api/apps` — indexed task outputs, including sandboxed runnable web apps.
 - `GET/POST /api/kanban/agent/{profile}/autodispatch` — read or set that profile's opt-in dispatcher state.
 - `GET/POST /api/orchestrator` — read or set the profile used for decomposition.
 - `POST /api/agent/{profile}/chat` and `/chat/stream` — proxy to the profile bridge.

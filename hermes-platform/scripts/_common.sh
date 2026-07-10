@@ -11,7 +11,28 @@
 
 set -euo pipefail
 
-export PATH="/c/Program Files/Rancher Desktop/resources/resources/win32/bin:$PATH"
+# Prefer Rancher Desktop's Windows Docker client when scripts are launched from
+# Windows-hosted Bash. In WSL-style shells the Linux docker client may appear
+# earlier on PATH but points at a missing /var/run/docker.sock; docker.exe talks
+# to Rancher Desktop's Windows pipe correctly.
+for _rd_bin in \
+    "/mnt/c/Program Files/Rancher Desktop/resources/resources/win32/bin" \
+    "/c/Program Files/Rancher Desktop/resources/resources/win32/bin"
+do
+    [ -d "$_rd_bin" ] && export PATH="$_rd_bin:$PATH"
+done
+
+for _docker_exe in \
+    "/mnt/c/Program Files/Rancher Desktop/resources/resources/win32/bin/docker.exe" \
+    "/c/Program Files/Rancher Desktop/resources/resources/win32/bin/docker.exe"
+do
+    if [ -x "$_docker_exe" ]; then
+        export _docker_exe
+        docker() { "$_docker_exe" "$@"; }
+        export -f docker
+        break
+    fi
+done
 
 STACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLATFORM_DIR="$(cd "$STACK_DIR/.." && pwd)"

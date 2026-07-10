@@ -1,4 +1,4 @@
-# Read-only Docker socket proxy.
+# Docker socket proxy with a narrow Dozzle control lane.
 # Consumers: Dozzle (containers+events+logs), Wazuh (events+containers), Trivy (images+containers).
 # Nothing else on the platform should ever touch /var/run/docker.sock directly.
 
@@ -22,7 +22,7 @@ services:
     restart: unless-stopped
     logging: *default-logging
     environment:
-      # Read-only endpoints only. Write endpoints (POST/DELETE) remain disabled (0).
+      # Read endpoints for observability consumers.
       CONTAINERS: "1"
       EVENTS: "1"
       LOGS: "1"
@@ -32,9 +32,14 @@ services:
       PING: "1"
       VERSION: "1"
       VOLUMES: "1"
-      # Everything that could mutate state stays 0.
-      EXEC: "0"
+      # Allow only the Dozzle container control actions patched into HAProxy.
+      ALLOW_START: "1"
+      ALLOW_STOP: "1"
+      ALLOW_RESTARTS: "1"
+      # Generic write traffic remains blocked by the local HAProxy template.
       POST: "0"
+      # Everything else that could mutate state stays 0.
+      EXEC: "0"
       BUILD: "0"
       COMMIT: "0"
       CONFIGS: "0"

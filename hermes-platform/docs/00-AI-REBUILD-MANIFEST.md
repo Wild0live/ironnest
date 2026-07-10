@@ -12,9 +12,10 @@
 3. **Memory Gateway** — a FastAPI service that is the ONLY thing allowed to talk to OpenViking. It enforces a deny-first policy from `policies/<profile>.policy.yaml` and audits every request.
 4. **Per-profile Hermes containers** — `hermes-pf-<profile>` — one per profile, each mounting its own named volume so no profile's data is reachable from another profile's container.
 5. **`ironnest_gateway` Hermes memory provider** — an in-process provider mounted into every `hermes-pf-*` container. It performs automatic recall before answers and stores completed turns afterward by calling Memory Gateway only.
-6. **Mission Control** — a standalone FastAPI/browser dashboard at `https://mission.ironnest.local/` for profile health, shared Kanban, schedules, chat, file downloads, SOUL.md edits, model switching, and embedded terminal access. It is not part of the memory policy kernel.
-7. **Per-profile agent-chat bridges** — small Python stdlib co-processes inside each `hermes-pf-*` container. Mission Control talks to these bridges on `8011/tcp` for live chat, shared Kanban board actions, and profile-local actions without Docker socket access.
-8. **Shared Hermes Kanban board** — `hermes-platform_kanban-shared` mounted at `/opt/kanban` in every profile container. It is a deliberate cross-profile coordination plane for tasks, workspaces, and worker logs; keep it secret-free.
+6. **Mission Control** — a standalone FastAPI/browser dashboard at `https://mission.ironnest.local/` for profile health, IronNest Tasks, schedules, chat, file downloads, SOUL.md edits, model switching, and embedded terminal access. It is not part of the memory policy kernel.
+7. **Per-profile agent-chat bridges** — small Python stdlib co-processes inside each `hermes-pf-*` container. Mission Control talks to these bridges on `8011/tcp` for live chat, IronNest Task actions, shared Kanban board actions, and profile-local actions without Docker socket access.
+8. **Shared Hermes Kanban board** — `hermes-platform_kanban-shared` mounted at `/opt/kanban` in every profile container. It is the substrate for IronNest Tasks: a deliberate cross-profile coordination plane for goals, task state, workspaces, artifacts, and worker logs; keep it secret-free.
+9. **IronNest Task workflow** — Mission Control's governed layer over Hermes Kanban. A Task can start as a triage goal, be decomposed by the orchestrator, routed by profile role descriptions, executed by specialist agents such as Steve for code, Little John for security, `qa` for independent verification, and Octo for platform operations, then reviewed through logs, Reports, Apps, and artifacts.
 
 Do not mistake component names: `ironnest_gateway` is the Hermes-side adapter; `memory-gateway` is the policy-enforcing service; OpenViking is the storage/search backend.
 Also do not mistake Mission Control for the gateway: Mission Control is an operator UI/control plane, while `memory-gateway` remains the security boundary for all OpenViking memory access.
@@ -23,7 +24,7 @@ Also do not mistake Mission Control for the gateway: Mission Control is an opera
 
 | File | Purpose |
 |---|---|
-| `spec/system.manifest.yaml` | Canonical machine-readable manifest. Invariants I1-I8. |
+| `spec/system.manifest.yaml` | Canonical machine-readable manifest. Invariants I1-I11. |
 | `spec/services.yaml` | Service list + ports + networks + volumes. |
 | `spec/namespaces.yaml` | Logical → OpenViking URI mapping rules. |
 | `spec/policies.schema.json` | JSON Schema for `policies/*.policy.yaml`. |
@@ -52,6 +53,9 @@ These appear in `spec/system.manifest.yaml` and are non-negotiable:
 - **I6**  Normal Hermes conversational memory uses `ironnest_gateway` to call `memory-gateway`; connectivity alone is not proof of automatic memory use.
 - **I7**  Mission Control stays outside the memory policy kernel: `platform-net` only, no OpenViking/profile bearer tokens, no Infisical machine identity, and no Docker socket.
 - **I8**  Shared Kanban lives on `/opt/kanban` only. It is cross-profile by design, but it must remain separate from private `/opt/data` volumes and must not be used for secrets.
+- **I9**  LittleJohn's Kali MCP is optional, on-demand, has no host port, stays off the memory and shared platform networks, and is reachable only over its dedicated LittleJohn/Kali network. Only its exact start/stop/restart lifecycle is pre-approved.
+- **I10**  `operations-runner` is the only Hermes Platform service with Docker socket access. Mission Control and agents submit exact, persisted, single-use operations; they never receive a standing raw Docker API.
+- **I11**  Windows host work crosses the localhost boundary through the Mission Control queue. The default elevated runner executes only built-in allowlisted remediation IDs; arbitrary submitted PowerShell requires an explicit operator-enabled raw mode.
 
 If a change would violate any invariant, **stop and ask the operator**.
 
@@ -63,7 +67,7 @@ If a change would violate any invariant, **stop and ask the operator**.
 - Add `tools.yaml` MCP entries per profile (gateway is unaffected).
 - Extend `ironnest_gateway` when Hermes lifecycle behavior changes, while keeping all memory operations routed through `memory-gateway`.
 - Extend Mission Control UI/API features when they stay on `platform-net` and do not require OpenViking/profile bearer secrets.
-- Extend the Mission Control Kanban surface through bridge-mediated, structured actions. Manual runs must execute in the assignee profile's own container; auto-dispatch must remain per-profile opt-in.
+- Extend the Mission Control Task/Kanban surface through bridge-mediated, structured actions. Manual runs must execute in the assignee profile's own container; decomposition must route through the configured orchestrator; auto-dispatch must remain per-profile opt-in.
 
 ## What you CANNOT change without an architectural review
 
@@ -73,7 +77,9 @@ If a change would violate any invariant, **stop and ask the operator**.
 - The per-profile volume isolation.
 - The automatic conversation path through `memory-gateway`.
 - Mission Control's separation from the memory gateway policy kernel.
-- The shared Kanban boundary: cross-profile board/workspace/log coordination is allowed only through `/opt/kanban`; private profile data stays under isolated `/opt/data`.
+- The shared Kanban boundary: cross-profile board/workspace/artifact/log coordination is allowed only through `/opt/kanban`; private profile data stays under isolated `/opt/data`.
+- The operations boundary: do not give Mission Control or an agent the Docker socket, and do not expand the runner into a generic command or Docker proxy.
+- The Windows host boundary: do not replace the file-backed approval queue and allowlisted remediation runner with direct agent shell access.
 
 ## Common mistakes to avoid
 
@@ -85,4 +91,6 @@ If a change would violate any invariant, **stop and ask the operator**.
 6. **DO NOT** treat successful gateway connectivity as proof that ordinary chats use memory. Run `scripts/validate-conversational-memory.sh` and inspect gateway audit events for conversation URIs.
 7. **DO NOT** put Mission Control on `hermes-platform-app-net` or `hermes-platform-mem-net` just to make something easier. It should reach profiles through the bridge on `platform-net`, and it should never reach OpenViking directly.
 8. **DO NOT** give Mission Control profile bearer tokens, OpenViking root keys, or Infisical machine identity credentials. It reads registry/policy/audit files and owns only its dashboard state.
-9. **DO NOT** treat `/opt/kanban` as private storage. It is intentionally shared by all profile agents for board coordination and worker logs.
+9. **DO NOT** treat `/opt/kanban` as private storage. It is intentionally shared by all profile agents for Task coordination, artifacts, and worker logs.
+10. **DO NOT** mount the Docker socket into Mission Control or any `hermes-pf-*` container. Only `operations-runner` may hold it, behind the private operations network and exact request validation.
+11. **DO NOT** run agent-submitted PowerShell on Windows by default. The scoped host runner ignores submitted script bodies and executes only locally implemented remediation IDs.

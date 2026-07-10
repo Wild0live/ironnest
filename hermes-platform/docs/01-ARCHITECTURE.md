@@ -53,9 +53,9 @@
        ./shared            → hermes-pf-<profile>:/opt/shared/all  (ro)   (read every agent's output)
        ./shared            → hermes-platform-ttyd:/opt/shared/all        (read-write, operator)
 
-   Shared Kanban coordination plane:
-       hermes-platform_kanban-shared → every hermes-pf-*:/opt/kanban
-       Mission Control reaches it through the profile bridges, not by mounting the DB
+   Shared Task/Kanban coordination plane:
+        hermes-platform_kanban-shared → every hermes-pf-*:/opt/kanban
+        Mission Control reaches it through the profile bridges, not by mounting the DB
 
    OpenViking workspace:
        hermes-platform_openviking-workspace → openviking:/var/lib/openviking
@@ -69,7 +69,7 @@ Three concentric trust tiers.
 
 **Tier A — shared artifact exchange (files, images, binaries).** Separate from the OpenViking memory path, agents hand binary/file output to one another over a host-bind volume rooted at `./shared` (host: `D:\claude-workspace\platform\hermes-platform\shared\`). Each container mounts its own slice read-write at `/opt/shared/mine` and the whole tree read-only at `/opt/shared/all`, giving **write-own / read-all** semantics: an agent writes only its own folder but reads every agent's artifacts (e.g. `/opt/shared/all/mark/report.pdf`). Read-only is kernel-enforced at the mount, so write-isolation holds without relying on file permissions. This channel deliberately **bypasses the policy gateway and the audit log** — it is for working artifacts, not secrets or auditable memory. For an auditable handoff, record a pointer in `viking://shared/approved/<p>/` and keep the blob in `/opt/shared/mine/`. The tree is visible on the Windows host for direct inspection. Private `/opt/data` memory and OpenViking isolation are unaffected. Canonical operational reference: `shared/README.md` (also readable by agents at `/opt/shared/all/README.md`); isolation tradeoff in `docs/08-SECURITY-MODEL.md`.
 
-**Tier A — shared Kanban coordination.** Every profile mounts `hermes-platform_kanban-shared` at `/opt/kanban` with `HERMES_KANBAN_HOME=/opt/kanban`. This is a deliberate shared work board for task state, workspaces, and worker logs. Mission Control does not mount or parse the SQLite DB directly; it calls a profile bridge, which performs structured `hermes kanban` CLI actions. Manual execution is routed to the task assignee's own profile container, and auto-dispatch is per-profile opt-in. This channel is not private memory and must remain secret-free; `/opt/data` isolation is unchanged.
+**Tier A — IronNest Task workflow over shared Hermes Kanban.** Every profile mounts `hermes-platform_kanban-shared` at `/opt/kanban` with `HERMES_KANBAN_HOME=/opt/kanban`. Raw Hermes Kanban is the shared board substrate; IronNest Task is the Mission Control workflow built on top of it. A task can begin as a triage goal, be decomposed by the configured orchestrator, routed to specialists from `registry/profiles-registry.yaml`, run in the assignee's own profile container, and then reviewed through worker logs, artifacts, Reports, Apps, QA, and security gates. Mission Control does not mount or parse the SQLite DB directly; it calls a profile bridge, which performs structured `hermes kanban` CLI actions. Manual execution is routed to the task assignee's own profile container, and auto-dispatch is per-profile opt-in. This channel is not private memory and must remain secret-free; `/opt/data` isolation is unchanged.
 
 **Tier A UI sidecar — management terminal/dashboard.** `hermes-platform-ttyd` exposes the browser terminal and Hermes dashboard on `127.0.0.1:8123` and `127.0.0.1:8124`. It mounts `hermes-platform_data-default:/opt/data` plus the other profile volumes under `/opt/data/profiles/<profile>` so the Hermes UI can list and manage profiles in the layout it expects. This sidecar is a trusted management plane; the actual `hermes-pf-*` agent containers still mount ONLY their own profile volume. The legacy `hermes-ttyd` service may still exist during transition on `127.0.0.1:7682` and `127.0.0.1:9119`; those old ports read the legacy shared volume.
 
@@ -101,7 +101,7 @@ Hermes agent
 - **memory-gateway is the only dual-homed service.** Anything else dual-homed creates a second path to OpenViking, which violates I2.
 - **Hermes provider, not direct database access.** `ironnest_gateway` runs inside each agent process only to connect Hermes' conversation lifecycle to the gateway API. Policy, isolation, and audit enforcement remain centralized in `memory-gateway`.
 - **Per-profile volumes.** Container escape from `hermes-pf-mark` lands in a filesystem where `hermes-pf-steve`'s data is simply not mounted. We pay one-time migration cost for permanent defense in depth.
-- **The shared artifact and Kanban volumes are deliberate, scoped exceptions to per-profile isolation.** The collaboration requirement (one agent's output is the next agent's input) needs cross-agent *reads* of binary files, which OpenViking cannot serve (text-only, ~4 MB/entry, not host-accessible). The work-coordination requirement needs a single board. We confine those exceptions to `/opt/shared` and `/opt/kanban`, keep `/opt/data` and OpenViking fully isolated, and treat both shared paths as secret-free, non-private working state.
+- **The shared artifact and Task/Kanban volumes are deliberate, scoped exceptions to per-profile isolation.** The collaboration requirement (one agent's output is the next agent's input) needs cross-agent *reads* of binary files, which OpenViking cannot serve (text-only, ~4 MB/entry, not host-accessible). The work-coordination requirement needs a single board and durable task artifacts. We confine those exceptions to `/opt/shared` and `/opt/kanban`, keep `/opt/data` and OpenViking fully isolated, and treat both shared paths as secret-free, non-private working state.
 - **Bearer tokens in Infisical, never on disk.** The `with-infisical` wrapper (shared with the Hermes image/tooling lineage) authenticates to Infisical via Universal Auth machine identity, fetches the secrets, and execs the wrapped command with secrets in environment only. Process-tree env vars are wiped on exec.
 
 ## File layout summary
@@ -113,7 +113,7 @@ See `docs/03-DIRECTORY-STRUCTURE.md` for the full tree. Key directories:
 - `registry/profiles-registry.yaml` — registered profiles.
 - `profile-template/` — templates for `scripts/create-profile.sh`.
 - `shared/` — host-bind artifact-exchange tree; one folder per profile (write-own / read-all).
-- `agent-bridge/` and `mission-control/` — Mission Control chat, settings, and shared Kanban control plane.
+- `agent-bridge/` and `mission-control/` — Mission Control chat, settings, and IronNest Task/Kanban control plane.
 - `scripts/` — lifecycle + validation shell scripts.
 - `openviking/` — Dockerfile + sidecar config for OpenViking.
 - `docs/` — this set.

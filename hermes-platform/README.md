@@ -28,7 +28,7 @@ An on-demand IronNest stack at `D:\claude-workspace\platform\hermes-platform\`. 
    hermes-pf-octo ──────┘
 
    Mission Control ──[platform-net]──► agent-chat bridge inside each hermes-pf-*
-                                      (chat, files, SOUL/model edits, Kanban)
+                                      (chat, files, SOUL/model edits, Tasks/Kanban)
 
    all hermes-pf-* ──► /opt/kanban shared board volume
 ```
@@ -38,8 +38,9 @@ An on-demand IronNest stack at `D:\claude-workspace\platform\hermes-platform\`. 
 - **Memory Gateway** enforces deny-first policy from `policies/<profile>.policy.yaml`.
 - **OpenViking** is unreachable from any Hermes container (network-segmented).
 - **Ollama** provides local `mxbai-embed-large` embeddings for OpenViking.
-- **Mission Control** at `https://mission.ironnest.local/` is the browser ops/chat/Kanban control plane. It is separate from `memory-gateway` and talks to profiles through token-gated in-container bridges.
-- **Shared Kanban** lives on `hermes-platform_kanban-shared` at `/opt/kanban` in every profile container. It is a deliberate cross-profile work board, not private memory.
+- **Mission Control** at `https://mission.ironnest.local/` is the browser ops/chat/Task control plane. It is separate from `memory-gateway` and talks to profiles through token-gated in-container bridges.
+- **IronNest Tasks** are the governed workflow layer Mission Control builds on top of Hermes Kanban: triage goals can be decomposed, assigned to specialist profiles, run in the assignee's own container, and reviewed through logs, artifacts, Reports, Apps, QA, and security gates.
+- **Shared Hermes Kanban** lives on `hermes-platform_kanban-shared` at `/opt/kanban` in every profile container. It is the underlying cross-profile work board and must remain secret-free; it is not private memory.
 - **Bearer tokens in Infisical only.** Never in git, never on disk.
 
 Full picture: [`docs/01-ARCHITECTURE.md`](docs/01-ARCHITECTURE.md). Decision rationale: [`docs/16-DECISION-LOG.md`](docs/16-DECISION-LOG.md).
@@ -60,7 +61,7 @@ The old `hermes/` stack shipped 5 Telegram-gateway containers (default, mark, st
 | Memory access audit | None | JSONL log + Wazuh ingestion |
 | Bearer-token management | N/A (no gateway) | Infisical-only, constant-time compare |
 | Automatic conversation recall/save | Not integrated with gateway | `ironnest_gateway` provider calls the audited gateway lifecycle path |
-| Operator control plane | ttyd/dashboard only | Mission Control: chat, shared Kanban, schedules, files, SOUL/model edits |
+| Operator control plane | ttyd/dashboard only | Mission Control: chat, governed Tasks over shared Kanban, schedules, files, SOUL/model edits |
 
 See [`docs/08-SECURITY-MODEL.md`](docs/08-SECURITY-MODEL.md) for the threat model.
 
@@ -75,8 +76,8 @@ See [`docs/08-SECURITY-MODEL.md`](docs/08-SECURITY-MODEL.md) for the threat mode
 | `hermes-platform-openviking` | `platform/hermes-platform-openviking:0.1.0` | Long-term memory backend (volcengine/OpenViking) | none |
 | `hermes-platform-memory-gateway` | `platform/hermes-platform-memory-gateway:0.1.0` | Policy-enforcing front door (FastAPI) | `127.0.0.1:18080` |
 | `hermes-platform-mission-control` | `platform/hermes-platform-mission-control:0.1.0` | Browser ops/chat dashboard | `https://mission.ironnest.local/` |
-| `hermes-platform-ttyd` | `platform/hermes-agent:v2026.6.5-patched` | terminal + Hermes dashboard sidecar | `127.0.0.1:8123`, `127.0.0.1:8124` |
-| `hermes-pf-default` | `platform/hermes-agent:v2026.6.5-patched` | default profile agent + chat bridge | — |
+| `hermes-platform-ttyd` | `platform/hermes-agent:v2026.6.19-patched` | terminal + Hermes dashboard sidecar | `127.0.0.1:8123`, `127.0.0.1:8124` |
+| `hermes-pf-default` | `platform/hermes-agent:v2026.6.19-patched` | default profile agent + chat bridge | — |
 | `hermes-pf-mark` | same | mark profile agent + chat bridge | — |
 | `hermes-pf-steve` | same | steve profile agent + chat bridge | — |
 | `hermes-pf-qa` | same | qa (QA/verification) profile agent + chat bridge | — |
@@ -105,7 +106,7 @@ See [`docs/10-VALIDATION-AND-TESTING.md`](docs/10-VALIDATION-AND-TESTING.md) for
 
 ## Quick start
 
-Assumes `platform/bootstrap.sh` has run (always-on stacks healthy) and the `platform/hermes-agent:v2026.6.5-patched` image exists (`bash platform/hermes/build.sh`).
+Assumes `platform/bootstrap.sh` has run (always-on stacks healthy) and the `platform/hermes-agent:v2026.6.19-patched` image exists (`bash platform/hermes/build.sh`).
 
 ```bash
 cd D:\claude-workspace\platform\hermes-platform

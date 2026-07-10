@@ -49,6 +49,18 @@ networks:
     driver: bridge
     internal: true
     name: hermes-platform-app-net
+  # LittleJohn-only tool channel for the on-demand Kali MCP sidecar.  It is
+  # separate from app-net so Kali never becomes part of the memory path.
+  littlejohn-kali-net:
+    driver: bridge
+    internal: true
+    name: littlejohn-kali-net
+  # Kali-only outbound bridge. This gives the sidecar NAT egress for approved
+  # temporary package installs without sharing its MCP endpoint on platform-net
+  # or the infrastructure platform-egress network.
+  littlejohn-kali-egress-net:
+    driver: bridge
+    name: littlejohn-kali-egress-net
   # Private command channel: only Mission Control and the deliberately narrow
   # operations runner join.  Profile agents never receive this network.
   mission-control-ops-net:
@@ -108,6 +120,11 @@ volumes:
   operations-runner-state:
     name: hermes-platform_operations-runner-state
 
+  # LittleJohn's on-demand Kali workspace.  Package installs belong to the
+  # clean image/runtime layer; assessments, notes, and evidence persist here.
+  littlejohn-kali-work:
+    name: hermes-platform_littlejohn-kali-work
+
   # Infisical sidecar render dir for openviking
   openviking-secrets-runtime:
     name: hermes-platform_openviking-secrets-runtime
@@ -157,7 +174,7 @@ x-hermes-env-common: &hermes-env-common
 
 # ─── Service-level common config for hermes-pf-* ────────────────────────────
 x-hermes-pf-base: &hermes-pf-base
-  image: platform/hermes-agent:v2026.6.5-patched  # REUSE existing image (built by hermes/build.sh)
+  image: platform/hermes-agent:v2026.6.19-patched  # REUSE existing image (built by hermes/build.sh)
   restart: unless-stopped
   # No entrypoint override — image's /init + main-wrapper.sh handles bootstrap
   # (uid remap, chown, config seed) via s6-overlay cont-init.d, then drops to
@@ -454,11 +471,12 @@ services:
       # or the Operations endpoints remain disabled.
       OPERATIONS_RUNNER_URL:          "http://operations-runner:8091"
       OPERATIONS_RUNNER_TOKEN:        "${OPERATIONS_RUNNER_TOKEN:-}"
-      OPERATIONS_ALLOWED_CONTAINERS:  "${OPERATIONS_ALLOWED_CONTAINERS:-hermes-pf-default,hermes-pf-mark,hermes-pf-steve,hermes-pf-qa,hermes-pf-littlejohn,hermes-pf-jaime,hermes-pf-bigbert,hermes-pf-octo}"
+      OPERATIONS_ALLOWED_CONTAINERS:  "${OPERATIONS_ALLOWED_CONTAINERS:-hermes-pf-default,hermes-pf-mark,hermes-pf-steve,hermes-pf-qa,hermes-pf-littlejohn,hermes-pf-jaime,hermes-pf-bigbert,hermes-pf-octo,kali-mcp-littlejohn}"
       OPERATIONS_ALLOW_ALL_CONTAINERS: "${OPERATIONS_ALLOW_ALL_CONTAINERS:-0}"
       OPERATIONS_APPROVAL_TTL_SECONDS: "${OPERATIONS_APPROVAL_TTL_SECONDS:-600}"
       OCTO_OPERATIONS_SUBMIT_TOKEN:   "${OCTO_OPERATIONS_SUBMIT_TOKEN:-}"
       LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN: "${LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN:-}"
+      LITTLEJOHN_PREAPPROVED_LIFECYCLE_TARGETS: "${LITTLEJOHN_PREAPPROVED_LIFECYCLE_TARGETS:-kali-mcp-littlejohn}"
       HOST_OPERATIONS_RUNNER_URL:      "${HOST_OPERATIONS_RUNNER_URL:-http://172.17.80.1:8765}"
       HOST_OPERATIONS_RUNNER_TOKEN:    "${HOST_OPERATIONS_RUNNER_TOKEN:-}"
       HOST_OPERATIONS_QUEUE_DIR:       "/var/lib/mission-control/host-operations"
@@ -508,7 +526,7 @@ services:
       # Exact container names eligible for individually approved lifecycle actions.
       # Keep this an explicit list; this runner must never discover or control
       # arbitrary Docker containers merely because their name shares a prefix.
-      OPERATIONS_ALLOWED_CONTAINERS: "${OPERATIONS_ALLOWED_CONTAINERS:-hermes-pf-default,hermes-pf-mark,hermes-pf-steve,hermes-pf-qa,hermes-pf-littlejohn,hermes-pf-jaime,hermes-pf-bigbert,hermes-pf-octo}"
+      OPERATIONS_ALLOWED_CONTAINERS: "${OPERATIONS_ALLOWED_CONTAINERS:-hermes-pf-default,hermes-pf-mark,hermes-pf-steve,hermes-pf-qa,hermes-pf-littlejohn,hermes-pf-jaime,hermes-pf-bigbert,hermes-pf-octo,kali-mcp-littlejohn}"
       # When enabled, exact start/stop/restart requests may target any valid
       # Rancher Desktop container name, still requiring a separate approval.
       OPERATIONS_ALLOW_ALL_CONTAINERS: "${OPERATIONS_ALLOW_ALL_CONTAINERS:-0}"
@@ -574,6 +592,54 @@ services:
         limits:
           cpus: "0.5"
           memory: 64M
+
+  # ── LittleJohn's on-demand Kali MCP sidecar ──────────────────────────────
+  # Off by default: create/start with `docker compose --profile kali ...`.
+  # LittleJohn can later start/stop/restart this exact container through the
+  # pre-approved Mission Control lifecycle path; Docker/network/mount changes
+  # still require operator approval.
+  kali-mcp-littlejohn:
+    profiles: ["kali"]
+    build:
+      context: ./kali-mcp
+      dockerfile: Dockerfile
+      args:
+        KALI_MCP_REF: "d46b46bd23f9801b63fc3d16253b5af07b653ec9"
+    image: platform/kali-mcp-littlejohn:2026.07.03
+    container_name: kali-mcp-littlejohn
+    restart: "no"
+    environment:
+      TZ: "Asia/Manila"
+      DEBIAN_FRONTEND: "noninteractive"
+      KALI_MCP_DEFAULT_SCOPE: "lab"
+      KALI_MCP_REPORTS_DIR: "/reports"
+      NO_PROXY:    "kali-mcp-littlejohn,localhost,127.0.0.1,0.0.0.0,.local"
+      no_proxy:    "kali-mcp-littlejohn,localhost,127.0.0.1,0.0.0.0,.local"
+    working_dir: /work
+    volumes:
+      - littlejohn-kali-work:/work
+      - ./shared/littlejohn/kali:/reports
+    networks:
+      - littlejohn-kali-net        # LittleJohn-only MCP path
+      - littlejohn-kali-egress-net # Kali-only outbound package/tool egress
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'kali_mcp_server.server' >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
 
   # ════════════════════════════════════════════════════════════════════════
   # Hermes profile containers — one per profile, per-profile isolated volume
@@ -704,7 +770,7 @@ services:
       # Docker auto-create a directory and the container failed to start (exit 127).
       # Removed; the token is now delivered via Infisical as env WIKI_ADMIN_TOKEN.
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null"]
+      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null && pgrep -f 'ttyd --port=7682' >/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -745,7 +811,7 @@ services:
       - ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
       - ./hermes-profile-entrypoint.sh:/opt/ironnest/hermes-profile-entrypoint.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null"]
+      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null && pgrep -f 'ttyd --port=7682' >/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -786,7 +852,7 @@ services:
       - ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
       - ./hermes-profile-entrypoint.sh:/opt/ironnest/hermes-profile-entrypoint.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null"]
+      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null && pgrep -f 'ttyd --port=7682' >/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -827,7 +893,7 @@ services:
       - ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
       - ./hermes-profile-entrypoint.sh:/opt/ironnest/hermes-profile-entrypoint.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null"]
+      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null && pgrep -f 'ttyd --port=7682' >/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -847,8 +913,8 @@ services:
       # The read-only Wazuh broker is an internal platform service. Bypass
       # Squid for this hostname so Littlejohn can query it with the scoped
       # token injected from Infisical; no other profile receives this route.
-      NO_PROXY:    "memory-gateway,mission-control,browser-intent-mcp,infisical,adguard,squid,socket-proxy,wazuh-query,trivy-server,localhost,127.0.0.1,.local"
-      no_proxy:    "memory-gateway,mission-control,browser-intent-mcp,infisical,adguard,squid,socket-proxy,wazuh-query,trivy-server,localhost,127.0.0.1,.local"
+      NO_PROXY:    "memory-gateway,mission-control,kali-mcp-littlejohn,browser-intent-mcp,infisical,adguard,squid,socket-proxy,wazuh-query,trivy-server,localhost,127.0.0.1,.local"
+      no_proxy:    "memory-gateway,mission-control,kali-mcp-littlejohn,browser-intent-mcp,infisical,adguard,squid,socket-proxy,wazuh-query,trivy-server,localhost,127.0.0.1,.local"
     command:
       - with-infisical
       - sh
@@ -861,6 +927,7 @@ services:
         hermes config set memory.memory_enabled true >/dev/null
         hermes config set memory.user_profile_enabled true >/dev/null
         hermes config set memory.provider ironnest_gateway >/dev/null
+        /opt/hermes/.venv/bin/python /opt/ironnest/configure-kali-mcp.py >/dev/null
         /usr/bin/python3 /opt/ironnest/agent-chat-bridge.py &
         ttyd --port=7682 --writable --base-path="/terminal/$${HERMES_PROFILE}" \
           bash -lc 'cd /opt/data/workspace; echo "IronNest Hermes Agent terminal. Profile: $${HERMES_PROFILE:-unknown}"; exec bash' &
@@ -872,12 +939,18 @@ services:
       - ./shared:/opt/shared/all:ro
       - ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
       - ./agent-bridge/request-host-operation.py:/opt/ironnest/request-host-operation.py:ro
+      - ./agent-bridge/request-kali-lifecycle.py:/opt/ironnest/request-kali-lifecycle.py:ro
+      - ./agent-bridge/configure-kali-mcp.py:/opt/ironnest/configure-kali-mcp.py:ro
       - ./secrets/littlejohn-host-operations-submit-token:/run/secrets/littlejohn-host-operations-submit-token:ro
       - kanban-shared:/opt/kanban   # shared Kanban board (HERMES_KANBAN_HOME)
       - ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
       - ./hermes-profile-entrypoint.sh:/opt/ironnest/hermes-profile-entrypoint.sh:ro
+    networks:
+      - platform-net
+      - hermes-platform-app-net
+      - littlejohn-kali-net
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null"]
+      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null && pgrep -f 'ttyd --port=7682' >/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 3

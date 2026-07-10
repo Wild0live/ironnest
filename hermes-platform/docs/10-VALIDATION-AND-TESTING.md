@@ -100,7 +100,7 @@ Test files (all under `gateway/tests/`):
 | File | Coverage |
 |---|---|
 | `test_namespace.py` | `parse_uri()` happy + sad paths (including traversal, control chars, bad scheme); `matches_glob()` for every glob token (`*`, `**`, `?`) |
-| `test_policy.py` | For every seeded profile, end-to-end policy decisions for own-namespace ALLOW + cross-profile DENY pairs (5 profiles × 4 access patterns × 4 other profiles = 80+ cases) |
+| `test_policy.py` | For every registered profile, end-to-end policy decisions for own-namespace ALLOW plus the full cross-profile DENY and approved-sharing matrix (8 profiles; 337 total gateway tests as of 2026-07-11) |
 | `test_openviking_client.py` | Namespace translation round-trips (`viking://shared/X` ↔ `viking://resources/shared/X`); dry-run adapter calls |
 | `test_auth.py` | Bearer-token map loading, missing/malformed/unknown header rejection, admin token rejection, 503 when admin token not configured |
 | `test_integration.py` | FastAPI TestClient end-to-end: `/health`, `/memory/{read,write,publish-approved}`, `/admin/{reload-policies,profiles}`. Confirms 401/403/200 status codes match policy decisions |

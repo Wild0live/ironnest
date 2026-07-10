@@ -27,7 +27,7 @@ fi
 
 # Sanity: hermes-agent image must already exist (built by hermes/build.sh).
 # Without it, the hermes-pf-* containers can't start.
-HERMES_IMG="platform/hermes-agent:v2026.6.5-patched"
+HERMES_IMG="platform/hermes-agent:v2026.6.19-patched"
 if ! docker image inspect "$HERMES_IMG" >/dev/null 2>&1; then
     echo "ERROR: required image $HERMES_IMG not found." >&2
     echo "       Run: bash $PLATFORM/hermes/build.sh" >&2

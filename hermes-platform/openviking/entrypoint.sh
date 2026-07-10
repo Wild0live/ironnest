@@ -68,11 +68,12 @@ config = {
 # port=1933 — match the documented default; also gives the healthcheck
 # a known port (we keep curl http://127.0.0.1:1933/health).
 #
-# root_api_key (when set) — auto-enables auth_mode=API_KEY. Requires
-# `Authorization: Bearer <key>` on every request. Only memory-gateway has
-# the matching key (from Infisical /hermes-platform/gateway).
+# auth_mode=trusted + root_api_key lets the policy gateway assert the pinned
+# tenant identity headers while OpenViking still requires the shared key.
+# api_key mode no longer permits root keys on tenant-scoped content APIs.
 server = {"host": "0.0.0.0", "port": 1933}
 if os.environ.get("ROOT_API_KEY"):
+    server["auth_mode"] = "trusted"
     server["root_api_key"] = os.environ["ROOT_API_KEY"]
 config["server"] = server
 

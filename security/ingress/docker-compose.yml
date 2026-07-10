@@ -147,8 +147,9 @@ services:
       - "--config=/config/configuration.yml"
       - "--config=/oidc-secrets/oidc-snippet.yml"
     networks:
-      - platform-net              # reached by Traefik on this network
-      - platform-egress           # outbound SMTP to Gmail
+      platform-net: {}            # reached by Traefik on this network
+      platform-egress:            # outbound SMTP to Gmail
+        gw_priority: 100          # prefer this non-internal network for egress
     dns:
       - 172.30.0.10               # AdGuard
     depends_on:

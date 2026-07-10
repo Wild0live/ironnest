@@ -4,7 +4,7 @@
 
 ## First-time bring-up
 
-Assumes IronNest's always-on stacks are already up (`bash platform/bootstrap.sh`) and the `platform/hermes-agent:v2026.6.5-patched` image exists (`bash platform/hermes/build.sh`).
+Assumes IronNest's always-on stacks are already up (`bash platform/bootstrap.sh`) and the `platform/hermes-agent:v2026.6.19-patched` image exists (`bash platform/hermes/build.sh`).
 
 ### Step 1 — `.env`
 ```bash
@@ -45,7 +45,7 @@ cp .env.example .env
 ```bash
 bash build.sh
 ```
-This builds `openviking`, `memory-gateway`, and `mission-control` images; the `platform/hermes-agent:v2026.6.5-patched` image is reused unchanged (already built by `hermes/build.sh`).
+This builds `openviking`, `memory-gateway`, and `mission-control` images; the `platform/hermes-agent:v2026.6.19-patched` image is reused unchanged (already built by `hermes/build.sh`).
 
 ### Step 4 — Start the stack
 ```bash

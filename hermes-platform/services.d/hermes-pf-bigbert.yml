@@ -25,7 +25,7 @@ networks:
 
 services:
   hermes-pf-bigbert:
-    image: platform/hermes-agent:v2026.6.5-patched
+    image: platform/hermes-agent:v2026.6.19-patched
     container_name: hermes-pf-bigbert
     restart: unless-stopped
     depends_on:
@@ -107,7 +107,7 @@ services:
         max-size: "10m"
         max-file: "3"
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null"]
+      test: ["CMD-SHELL", "pgrep -f 'hermes gateway run' >/dev/null && pgrep -f 'ttyd --port=7682' >/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 3

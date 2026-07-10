@@ -32,6 +32,19 @@ Requests are persisted in Mission Control and remain pending until an operator
 approves them. Approvals expire after 10 minutes by default. The runner keeps a
 persistent replay ledger, so a request ID can execute only once.
 
+## LittleJohn's pre-approved Kali lifecycle
+
+LittleJohn has one deliberately narrow pre-approved exception: Mission Control
+may immediately execute `start`, `stop`, or `restart` for the exact container
+`kali-mcp-littlejohn` when the request comes through LittleJohn's scoped
+submission token. The request is still persisted in the Mission Control
+operations ledger and still executes through `operations-runner`; it simply does
+not pause for an operator click.
+
+This exception does not allow Docker API calls, host PowerShell, new containers,
+image changes, network changes, mounts, host ports, privileged mode, or lifecycle
+actions for any other container.
+
 ## Enable it
 
 Create a high-entropy token in the uncommitted `hermes-platform/.env` file:
@@ -41,7 +54,7 @@ $token = -join ((1..64) | ForEach-Object { 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJ
 Add-Content .env "`nOPERATIONS_RUNNER_TOKEN=$token"
 Add-Content .env "`nFACTORY_HOST_PATH_ROOTS=D:\claude-workspace\software-factory"
 Add-Content .env "`nFACTORY_ALLOWED_IMAGES=nginx:alpine,nginx:1.27-alpine"
-Add-Content .env "`nOPERATIONS_ALLOWED_CONTAINERS=hermes-pf-default,hermes-pf-mark,hermes-pf-steve,hermes-pf-qa,hermes-pf-littlejohn,hermes-pf-jaime,hermes-pf-bigbert,hermes-pf-octo,openclaw-gateway,openclaw-ttyd,openclaw-infisical-agent"
+Add-Content .env "`nOPERATIONS_ALLOWED_CONTAINERS=hermes-pf-default,hermes-pf-mark,hermes-pf-steve,hermes-pf-qa,hermes-pf-littlejohn,hermes-pf-jaime,hermes-pf-bigbert,hermes-pf-octo,kali-mcp-littlejohn,openclaw-gateway,openclaw-ttyd,openclaw-infisical-agent"
 Add-Content .env "`nOPERATIONS_ALLOW_ALL_CONTAINERS=1"
 ```
 

@@ -13,33 +13,35 @@ import pytest
 
 from app.policy import evaluate
 
+PROFILES = ["default", "mark", "steve", "qa", "littlejohn", "jaime", "bigbert", "octo"]
+
 
 def test_loaded_profiles_match_seeded_set(policies):
-    """The 5 profiles we ship in v0.1.0."""
-    assert set(policies) == {"default", "mark", "steve", "wifey", "littlejohn"}
+    """The current IronNest profile fleet."""
+    assert set(policies) == set(PROFILES)
 
 
 # ─── Own-namespace ACCESS ───────────────────────────────────────────────────
 
-@pytest.mark.parametrize("profile", ["default", "mark", "steve", "wifey", "littlejohn"])
+@pytest.mark.parametrize("profile", PROFILES)
 def test_profile_can_read_own_private(policies, profile):
     v = evaluate(policies[profile], "read", f"viking://profiles/{profile}/notes")
     assert v.decision == "allow", v
 
 
-@pytest.mark.parametrize("profile", ["default", "mark", "steve", "wifey", "littlejohn"])
+@pytest.mark.parametrize("profile", PROFILES)
 def test_profile_can_write_own_private(policies, profile):
     v = evaluate(policies[profile], "write", f"viking://profiles/{profile}/notes/2026/x")
     assert v.decision == "allow", v
 
 
-@pytest.mark.parametrize("profile", ["default", "mark", "steve", "wifey", "littlejohn"])
+@pytest.mark.parametrize("profile", PROFILES)
 def test_profile_can_read_shared(policies, profile):
     v = evaluate(policies[profile], "read", "viking://shared/org/policy")
     assert v.decision == "allow", v
 
 
-@pytest.mark.parametrize("profile", ["default", "mark", "steve", "wifey", "littlejohn"])
+@pytest.mark.parametrize("profile", PROFILES)
 def test_profile_can_write_own_approved_shared(policies, profile):
     v = evaluate(policies[profile], "write", f"viking://shared/approved/{profile}/published")
     assert v.decision == "allow", v
@@ -47,7 +49,6 @@ def test_profile_can_write_own_approved_shared(policies, profile):
 
 # ─── Cross-profile DENIES — this is the security crown jewel ────────────────
 
-PROFILES = ["default", "mark", "steve", "wifey", "littlejohn"]
 CROSS = [(a, b) for a, b in itertools.product(PROFILES, repeat=2) if a != b]
 
 

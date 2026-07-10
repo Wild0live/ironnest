@@ -92,7 +92,7 @@ services:
 
   # ── Wazuh manager ────────────────────────────────────────────────────────────
   wazuh.manager:
-    image: wazuh/wazuh-manager:4.14.5
+    image: wazuh/wazuh-manager:4.14.6
     container_name: wazuh.manager
     hostname: wazuh.manager
     restart: unless-stopped
@@ -154,7 +154,7 @@ services:
 
   # ── Wazuh indexer (OpenSearch) ───────────────────────────────────────────────
   wazuh.indexer:
-    image: wazuh/wazuh-indexer:4.14.5
+    image: wazuh/wazuh-indexer:4.14.6
     container_name: wazuh.indexer
     hostname: wazuh.indexer
     restart: unless-stopped
@@ -212,7 +212,7 @@ services:
 
   # ── Wazuh dashboard ──────────────────────────────────────────────────────────
   wazuh.dashboard:
-    image: wazuh/wazuh-dashboard:4.14.5
+    image: wazuh/wazuh-dashboard:4.14.6
     container_name: wazuh.dashboard
     hostname: wazuh.dashboard
     restart: unless-stopped

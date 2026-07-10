@@ -1,6 +1,7 @@
 # Dozzle — real-time container logs UI.
-# Talks to the read-only socket-proxy at tcp://socket-proxy:2375 — never touches
-# /var/run/docker.sock directly. No ability to start/stop/exec anything.
+# Talks to the socket-proxy at tcp://socket-proxy:2375 — never touches
+# /var/run/docker.sock directly. The proxy only permits container
+# start/stop/restart writes; shell/remove/update remain blocked.
 
 name: dozzle
 
@@ -18,7 +19,7 @@ x-logging: &default-logging
 
 services:
   dozzle:
-    image: amir20/dozzle:v10.6.5
+    image: amir20/dozzle:v10.6.7
     container_name: dozzle
     restart: unless-stopped
     logging: *default-logging
@@ -26,7 +27,8 @@ services:
       DOZZLE_NO_ANALYTICS: "true"
       # Talk to the socket proxy instead of the raw socket.
       DOCKER_HOST: "tcp://socket-proxy:2375"
-      # Read-only mode — UI hides any action that would require write access.
+      DOZZLE_ENABLE_ACTIONS: "true"
+      # Shell access stays disabled; action writes are restricted by socket-proxy.
       DOZZLE_MODE: "server"
     # Host port closed 2026-05-27 — was previously 0.0.0.0:8888 (LAN-reachable).
     # Dozzle is now only reachable via Traefik at https://dozzle.ironnest.local/

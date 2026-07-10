@@ -7,12 +7,13 @@
 manifest_version: 2
 stack_name: hermes-platform
 stack_kind: on-demand
-current_service_count: 14
+current_service_count: 15
 upstream_references:
   hermes:      "https://github.com/NousResearch/hermes-agent"
   openviking:  "https://github.com/volcengine/OpenViking"
   ollama:      "https://ollama.com/"
   infisical:   "https://infisical.com/"
+  kali_mcp:    "https://github.com/k3nn3dy-ai/kali-mcp"
 
 contains:
   - services:       spec/services.yaml
@@ -99,10 +100,42 @@ invariants:
       is per-profile opt-in.
     verified_by: docker-compose.yml kanban-shared mounts; agent-bridge/agent-chat-bridge.py /kanban actions
 
+  - id: I9
+    description: |
+      LittleJohn's Kali MCP sidecar is optional, on-demand, and isolated from
+      the memory tier. It publishes no host ports, does not join
+      hermes-platform-mem-net, and is reachable from LittleJohn through
+      littlejohn-kali-net. It does not join platform-net; runtime package/tool
+      egress uses the Kali-only littlejohn-kali-egress-net. LittleJohn has
+      pre-approved permission to start/stop/restart only the exact
+      kali-mcp-littlejohn container;
+      Docker/network/host boundary changes still require approval.
+    verified_by: docker-compose.yml kali-mcp-littlejohn service; docs/16-DECISION-LOG.md D-016
+
+  - id: I10
+    description: |
+      operations-runner is the only Hermes Platform service allowed to mount
+      the Docker socket. Mission Control and profile agents never receive the
+      socket or a standing raw Docker API proxy. Operations are exact,
+      allowlisted, persisted, and single-use; human approval is required except
+      for LittleJohn's explicit start/stop/restart permission on the exact
+      kali-mcp-littlejohn container.
+    verified_by: docker-compose.yml operations-runner service; docs/19-APPROVAL-GATED-OPERATIONS.md
+
+  - id: I11
+    description: |
+      Windows host operations cross the localhost management boundary through
+      Mission Control's file-backed host-operation queue. The default elevated
+      consumer executes only built-in allowlisted remediation IDs. Agent-
+      submitted PowerShell is review text, not executable input; raw PowerShell
+      execution requires the operator to start the runner with the explicit
+      HOST_OPERATIONS_ALLOW_RAW_POWERSHELL=1 override.
+    verified_by: local-host-runner/scoped-remediation-runner.py; docs/19-APPROVAL-GATED-OPERATIONS.md
+
 dependencies:
   external_networks:    [platform-net, platform-egress]
   external_services:    [infisical, squid, adguard]
-  external_images:      [platform/hermes-agent:v2026.6.5-patched, ollama/ollama:0.4.6, infisical/cli@sha256:dba406b35e5819632412c561bfa46e6185e04c6d76175dc82bf97c4ff53745d7]
+  external_images:      [platform/hermes-agent:v2026.6.19-patched, ollama/ollama:0.4.6, infisical/cli@sha256:dba406b35e5819632412c561bfa46e6185e04c6d76175dc82bf97c4ff53745d7]
   external_volumes_ro:  [hermes_hermes-data]  # ONLY read during migration
 
 seeded_profiles:

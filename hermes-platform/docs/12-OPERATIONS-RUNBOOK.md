@@ -21,11 +21,56 @@ Bump pinned base / dep images carefully:
 |---|---|---|
 | `python:3.13.1-slim-bookworm` | `openviking/Dockerfile`, `gateway/Dockerfile` | CVE in Python runtime |
 | `infisical/cli@sha256:…` | `gateway/Dockerfile`, `docker-compose.yml` (openviking-infisical-agent) | New release of Infisical CLI |
-| `platform/hermes-agent:v2026.6.5-patched` | `docker-compose.yml` + `services.d/*.yml` (every hermes-pf-*) | New Hermes release — rebuild image via `hermes/build.sh`, then `docker compose up -d` both stacks. **Check upstream for init-system changes** (v0.15.0 switched tini→s6-overlay; entrypoint overrides in services.d must be removed on each upgrade if the upstream changes its ENTRYPOINT). |
+| `platform/hermes-agent:v2026.6.19-patched` | `docker-compose.yml` + `services.d/*.yml` (every hermes-pf-*) | New Hermes release — rebuild image via `hermes/build.sh`, then `docker compose up -d` both stacks. **Check upstream for init-system changes** (v0.15.0 switched tini→s6-overlay; entrypoint overrides in services.d must be removed on each upgrade if the upstream changes its ENTRYPOINT). |
 | Python pkgs in `gateway/requirements.txt` | pinned exactly | Security advisory |
 | `openviking` pip pkg | `openviking/Dockerfile` ARG | New OpenViking release |
 
 After any bump: `bash build.sh && bash start.sh && bash scripts/healthcheck.sh`.
+
+## LittleJohn Kali MCP
+
+`kali-mcp-littlejohn` is an optional, on-demand Kali Linux MCP sidecar for the
+LittleJohn profile. It is not part of the core memory path and publishes no host
+ports.
+
+One-time build/create:
+
+```bash
+docker compose --profile kali build kali-mcp-littlejohn
+docker compose --profile kali create kali-mcp-littlejohn
+docker compose up -d --no-build hermes-pf-littlejohn
+```
+
+LittleJohn can then use the pre-approved power switch mounted at
+`/opt/ironnest/request-kali-lifecycle.py`:
+
+```bash
+/usr/bin/python3 /opt/ironnest/request-kali-lifecycle.py start
+/usr/bin/python3 /opt/ironnest/request-kali-lifecycle.py stop
+/usr/bin/python3 /opt/ironnest/request-kali-lifecycle.py restart
+```
+
+Hermes must register the endpoint with `transport: sse`; otherwise
+`hermes mcp test kali-mcp-littlejohn` will try the streamable-HTTP path and
+fail against `/sse` with `405 Method Not Allowed`.
+
+Only those three actions for the exact container name `kali-mcp-littlejohn` are
+pre-approved. Image changes, network changes, host binds, ports, privileged
+mode, Docker API calls, and host PowerShell still require the normal approval
+lane.
+
+Persistence model:
+
+- `/work` is a named volume (`hermes-platform_littlejohn-kali-work`) and
+  persists across restarts.
+- `/reports` maps to `./shared/littlejohn/kali` so Mission Control and other
+  agents can see completed reports.
+- Temporary package installs are allowed during a running session but should be
+  treated as disposable runtime state. Runtime egress is through the Kali-only
+  `littlejohn-kali-egress-net`; promote useful tools into the image with an
+  explicit reviewed change.
+- Default testing scope is lab-only. IronNest-internal or external targets need
+  a named assessment record before use.
 
 ## Observability hook points
 

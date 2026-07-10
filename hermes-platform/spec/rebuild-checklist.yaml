@@ -22,9 +22,9 @@ steps:
   - id: R-02
     command: |
       bash D:/claude-workspace/platform/hermes/build.sh
-    expects: platform/hermes-agent:v2026.6.5-patched image present
+    expects: platform/hermes-agent:v2026.6.19-patched image present
     validates: |
-      docker image inspect platform/hermes-agent:v2026.6.5-patched >/dev/null
+      docker image inspect platform/hermes-agent:v2026.6.19-patched >/dev/null
 
   - id: R-03
     command: |
@@ -73,7 +73,7 @@ steps:
   - id: R-07
     command: |
       bash D:/claude-workspace/platform/hermes-platform/scripts/migrate-from-shared-volume.sh --dry-run
-    expects: dry-run reports file counts for each of the 5 profiles
+    expects: dry-run reports file counts for each of the 8 profiles
     validates: 'echo OK'
 
   - id: R-08

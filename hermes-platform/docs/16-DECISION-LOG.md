@@ -4,6 +4,77 @@ Architectural choices made during the design of hermes-platform v0.1.0. Each ent
 
 ---
 
+## D-017 — Windows host remediation defaults to local allowlisted implementations
+
+**Date:** 2026-07-11
+**Status:** accepted
+
+**Decision:** Keep the Windows host outside every agent and container trust
+boundary. Mission Control persists reviewed host-operation requests to a
+localhost file queue. The default elevated Windows consumer is
+`local-host-runner/scoped-remediation-runner.py`, which accepts only built-in
+remediation IDs and executes local implementations. The submitted PowerShell is
+retained for operator review but is not executed. Raw PowerShell remains an
+exceptional operator-led mode enabled only by
+`HOST_OPERATIONS_ALLOW_RAW_POWERSHELL=1` when starting the runner.
+
+**Rationale:** The operator needs approved host remediation without turning an
+LLM request into arbitrary administrator code execution. A local allowlist keeps
+the privileged implementation inspectable, versioned, and independent of the
+agent-supplied request body while preserving Mission Control's audit trail.
+
+**Impacts:** `local-host-runner/scoped-remediation-runner.py`,
+`local-host-runner/start-queue-runner.ps1`,
+`agent-bridge/request-host-operation.py`, and
+`docs/19-APPROVAL-GATED-OPERATIONS.md`.
+
+---
+
+## D-016 — LittleJohn gets an on-demand Kali MCP sidecar, not host or Docker control
+
+**Date:** 2026-07-03
+**Status:** accepted
+
+**Decision:** Add `kali-mcp-littlejohn` as an optional on-demand Kali Linux MCP
+sidecar for the LittleJohn profile. The sidecar uses the community
+`k3nn3dy-ai/kali-mcp` SSE MCP server pinned at commit
+`d46b46bd23f9801b63fc3d16253b5af07b653ec9`. It publishes no host ports, does
+not join `hermes-platform-mem-net` or `platform-net`, and is reachable by
+LittleJohn over the dedicated `littlejohn-kali-net` network. It also joins
+`littlejohn-kali-egress-net` for runtime package/tool egress without making its
+MCP port visible to the profile fleet on `platform-net` or the shared
+infrastructure egress network.
+
+LittleJohn may administer Kali inside the container and may start, stop, or
+restart the exact `kali-mcp-littlejohn` container through a pre-approved Mission
+Control operations path. Docker API calls, image changes, mounts, host ports,
+network changes, privileged mode, and host PowerShell remain approval-gated.
+
+**Persistence model:** `/work` is a named volume for assessment artifacts and
+state. `/reports` maps to `./shared/littlejohn/kali` for visible report handoff.
+Package installs during a running session are allowed but treated as disposable
+runtime state; useful tools should be promoted into the image by reviewed
+change. The default assessment posture is lab-only; IronNest-internal or
+external targets require an explicit assessment record.
+
+**Alternatives considered:**
+- A1: Install Kali tools directly in `hermes-pf-littlejohn`. Rejected because it
+  bloats the profile runtime and makes rollback/audit harder.
+- A2: Give LittleJohn raw Docker or host control. Rejected because it violates
+  the existing operations-runner trust boundary.
+- A3: Publish the MCP port on `127.0.0.1`. Rejected as unnecessary host
+  management surface; LittleJohn can reach the sidecar over Docker DNS.
+- A4: Use Kali's official `mcp-kali-server` package first. Deferred because its
+  documented shape is a terminal API server plus local MCP bridge, while the
+  community SSE server directly matches the separate-container MCP requirement.
+
+**Rationale:** The operator wanted LittleJohn to have full control of Kali while
+keeping host, Docker, and network boundary changes approval-gated. A sidecar
+keeps the high-risk tool surface isolated and off by default while preserving
+IronNest's localhost-only posture and OpenViking/memory-gateway invariants.
+
+---
+
 ## D-001 — Build as a sibling stack, not by extending `hermes/`
 
 **Date:** 2026-05-23
@@ -99,7 +170,7 @@ Architectural choices made during the design of hermes-platform v0.1.0. Each ent
 **Date:** 2026-05-23 | **Updated:** 2026-05-31 (v0.15.2 upgrade); 2026-06-13 (v0.16.0 upgrade)
 **Status:** accepted
 
-**Current image:** `platform/hermes-agent:v2026.6.5-patched` (Hermes Agent v0.16.0)
+**Current image:** `platform/hermes-agent:v2026.6.19-patched` (Hermes Agent v0.17.0)
 
 **Decision:** The `hermes-pf-*` services use the existing Hermes image built by `hermes/build.sh`. No new Hermes Dockerfile.
 

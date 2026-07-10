@@ -50,7 +50,30 @@ Recommended: start with Shape A. The gateway's REST surface is simpler to test a
 
 ## Per-profile MCP server scoping
 
-Each profile's `tools.yaml` enumerates the MCP servers it may use. The Memory Gateway sees only that profile's bearer token, so even if a profile "knows" about another profile's MCP endpoint, it can't authenticate to it. Compare with the existing `browser-intent` per-bearer-token-site-scoping pattern (memory note `project_browser_intent_tool_consolidation`).
+Each profile's MCP registration is profile-local (`mcp_servers` in the profile's
+Hermes `config.yaml`; older templates also mention `tools.yaml`). The Memory
+Gateway sees only that profile's bearer token, so even if a profile "knows"
+about another profile's MCP endpoint, it can't authenticate to it. Compare with
+the existing `browser-intent` per-bearer-token-site-scoping pattern (memory note
+`project_browser_intent_tool_consolidation`).
+
+## LittleJohn Kali MCP sidecar
+
+`kali-mcp-littlejohn` is the first profile-specific non-memory MCP sidecar. It
+is intentionally separate from the memory MCP sketches above:
+
+- It serves SSE at `http://kali-mcp-littlejohn:8000/sse`.
+- Only `hermes-pf-littlejohn` joins `littlejohn-kali-net`.
+- It publishes no host ports and never joins `hermes-platform-mem-net`.
+- It is off by default under Compose profile `kali`.
+- LittleJohn may pre-approved start/stop/restart this exact container; all
+  broader Docker, host, network, mount, image, or privileged changes still use
+  the approval lane.
+
+LittleJohn's startup command runs `configure-kali-mcp.py` to idempotently set
+`mcp_servers.kali-mcp-littlejohn.url` and
+`mcp_servers.kali-mcp-littlejohn.transport: sse` in
+`/opt/data/config.yaml`.
 
 ## What MCP does NOT replace
 

@@ -7,6 +7,8 @@ const state = {
 };
 
 const TERMINAL_STORE_KEY = "mc.terminalTarget";
+const CHAT_PROFILE_STORE_KEY = "mc.chatProfile";
+const CHAT_CONV_STORE_KEY = "mc.chatActiveConv";
 const DEFAULT_TERMINAL_TARGET = {
   id: "platform",
   kind: "platform",
@@ -28,10 +30,30 @@ const KANBAN_COLUMNS = [
 // Drag targets that map to a real `hermes kanban` transition command. Other
 // columns (todo/triage/running/review) are lifecycle-managed, not free moves.
 const KANBAN_DROP_TARGETS = new Set(["ready", "blocked", "done", "archived"]);
-const kanban = { tasks: [], loaded: false, showArchived: false, drawerId: null, activeColumn: null };
+const KANBAN_COLLAPSE_STORE_KEY = "mc.kanbanCollapsedGoals";
+function loadKanbanCollapsedGroups() {
+  try { return JSON.parse(localStorage.getItem(KANBAN_COLLAPSE_STORE_KEY) || "{}") || {}; } catch (e) { return {}; }
+}
+function saveKanbanCollapsedGroups() {
+  try { localStorage.setItem(KANBAN_COLLAPSE_STORE_KEY, JSON.stringify(kanban.collapsedGroups || {})); } catch (e) { /* storage unavailable */ }
+}
+const kanban = {
+  tasks: [], loaded: false, showArchived: false, drawerId: null, activeColumn: null,
+  orchPlans: {}, collapsedGroups: loadKanbanCollapsedGroups(), selected: new Set(), health: null,
+};
 const operations = { requests: [], targets: [], enabled: false, selected: null, view: "pending", search: "", requester: "", risk: "", includeArchived: false };
+const cronCatchup = { running: false };
+const freshness = {
+  lastSuccess: null,
+  failures: 0,
+  offline: false,
+  staleMs: 60_000,
+  messageTimer: null,
+};
 
 const $ = (selector) => document.querySelector(selector);
+
+let _drawerLoadSeq = 0;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -51,18 +73,94 @@ function headers() {
   return adminToken ? { Authorization: `Bearer ${adminToken}`, "Content-Type": "application/json" } : { "Content-Type": "application/json" };
 }
 
+function fmtTime(value) {
+  if (!value) return "";
+  const d = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function lastKnownCopy() {
+  return freshness.lastSuccess ? `Showing last known data from ${fmtTime(freshness.lastSuccess)}.` : "Showing last known data.";
+}
+
+function updateFreshnessStatus(mode = "fresh") {
+  const dot = $("#syncDot");
+  const stale = $("#staleStatus");
+  const offline = $("#offlineNotice");
+  const detail = $("#offlineNoticeDetail");
+  const lastTime = fmtTime(freshness.lastSuccess);
+  const tooltip = lastTime ? `Last updated ${lastTime}` : "No successful update yet";
+  const age = freshness.lastSuccess ? Date.now() - freshness.lastSuccess.getTime() : Infinity;
+  const staleNow = mode === "stale" || (!freshness.offline && age > freshness.staleMs);
+
+  if (dot) {
+    dot.className = `sync-dot ${freshness.offline ? "is-offline" : staleNow ? "is-stale" : mode === "loading" ? "is-loading" : "is-fresh"}`;
+    dot.title = freshness.offline ? `${tooltip}; offline` : staleNow ? `${tooltip}; stale` : tooltip;
+    dot.setAttribute("aria-label", dot.title);
+  }
+
+  if (stale) {
+    if (!freshness.offline && staleNow && freshness.lastSuccess) {
+      stale.textContent = `Stale - showing data from ${lastTime}`;
+      stale.hidden = false;
+    } else {
+      stale.hidden = true;
+      stale.textContent = "";
+    }
+  }
+
+  if (detail) detail.textContent = lastKnownCopy();
+  if (offline) offline.hidden = !freshness.offline;
+}
+
+function showSyncMessage(msg, timeoutMs = 4000) {
+  const e = $("#syncStatus");
+  if (!e) return;
+  clearTimeout(freshness.messageTimer);
+  e.textContent = msg;
+  e.hidden = false;
+  freshness.messageTimer = setTimeout(() => {
+    e.hidden = true;
+    e.textContent = "";
+  }, timeoutMs);
+}
+
+function markStateFailure() {
+  freshness.failures += 1;
+  freshness.offline = freshness.failures >= 3;
+  updateFreshnessStatus(freshness.offline ? "offline" : "stale");
+}
+
 async function loadState() {
-  $("#syncStatus").textContent = "Syncing";
-  const response = await fetch("/api/state");
-  if (!response.ok) {
-    $("#syncStatus").textContent = "Offline";
+  updateFreshnessStatus("loading");
+  let response;
+  try {
+    response = await fetch("/api/state");
+  } catch (err) {
+    markStateFailure();
     return;
   }
-  const data = await response.json();
+  if (!response.ok) {
+    markStateFailure();
+    return;
+  }
+  let data;
+  try {
+    data = await response.json();
+  } catch (err) {
+    markStateFailure();
+    return;
+  }
+  freshness.lastSuccess = new Date(data.generated_at);
+  freshness.failures = 0;
+  const wasOffline = freshness.offline;
+  freshness.offline = false;
   Object.assign(state, data);
   render();
+  if ($("#view-team")?.classList.contains("active")) loadTeam();
   loadTerminalTargets();
-  $("#syncStatus").textContent = `Synced ${new Date(data.generated_at).toLocaleTimeString()}`;
+  updateFreshnessStatus("fresh");
+  if (wasOffline) showSyncMessage("Reconnected", 2500);
 }
 
 function render() {
@@ -115,7 +213,7 @@ function renderOperations() {
     if (!operations.includeArchived && item.archived_at) return false;
     if (operations.requester && item.requested_by !== operations.requester) return false;
     if (operations.risk && (item.risk || "medium") !== operations.risk) return false;
-    const haystack = [item.requested_by, item.action, item.target, item.reason, item.status, item.risk].join(" ").toLowerCase();
+    const haystack = [item.requested_by, item.action, item.target, item.reason, item.status, item.risk, item.remediation_id].join(" ").toLowerCase();
     return !operations.search || haystack.includes(operations.search.toLowerCase());
   });
   const card = (item) => {
@@ -123,8 +221,10 @@ function renderOperations() {
       ? `<button type="button" class="approval-execute" data-operation-approve="${escapeHtml(item.id)}">Approve &amp; execute</button>` : "";
     const details = item.docker_request
       ? `<p class="approval-detail"><code>${escapeHtml(item.docker_request.method)} ${escapeHtml(item.docker_request.path)}</code></p>` : "";
+    const remediation = item.remediation_id
+      ? `<p class="approval-detail"><strong>Remediation:</strong> <code>${escapeHtml(item.remediation_id)}</code></p>` : "";
     const script = item.action === "host_powershell"
-      ? `<p class="approval-detail"><strong>Risk: ${escapeHtml(item.risk || "medium")}</strong></p><details class="approval-plan"><summary>Review exact PowerShell plan</summary><pre>${escapeHtml(item.script || "")}</pre></details>` : "";
+      ? `<p class="approval-detail"><strong>Risk: ${escapeHtml(item.risk || "medium")}</strong></p>${remediation}<details class="approval-plan"><summary>Review exact PowerShell plan</summary><pre>${escapeHtml(item.script || "")}</pre></details>` : "";
     return `<article class="approval-card">
       <div class="approval-card-main"><div class="approval-card-title"><span class="approval-requester-avatar">${avatarHtml(item.requested_by || "__you", 34)}</span><div><strong>${escapeHtml(displayName(item.requested_by || "Operator"))} requests ${escapeHtml(operationLabel(item.action))}</strong><p><code>${escapeHtml(item.target)}</code> · ${escapeHtml(operationTime(item.created_at))}</p></div></div>
       <p class="approval-reason">${escapeHtml(item.reason)}</p>${details}${script}</div>
@@ -154,7 +254,7 @@ async function loadOperations() {
     operations.enabled = false;
   }
   renderOperations();
-  if ($("#view-agent")?.classList.contains("active")) renderChat();
+  if ($("#view-agent")?.classList.contains("active")) renderChat({ preserveScroll: true });
 }
 
 function openOperationApproval(id) {
@@ -225,7 +325,7 @@ function renderActivity() {
 // the board from the cached kanban.tasks. loadKanban() refreshes the data.
 function renderTasks() { renderKanban(); }
 
-function setSync(msg) { const e = $("#syncStatus"); if (e) e.textContent = msg; }
+function setSync(msg) { showSyncMessage(msg); }
 
 function fmtEpoch(s) {
   if (!s) return "";
@@ -244,8 +344,11 @@ async function loadKanban() {
   try {
     const data = await api(`/api/kanban${kanban.showArchived ? "?archived=true" : ""}`);
     kanban.tasks = (data && data.data) || [];
+    const liveIds = new Set(kanban.tasks.map((t) => t.id));
+    kanban.selected.forEach((id) => { if (!liveIds.has(id)) kanban.selected.delete(id); });
     kanban.loaded = true;
     renderKanban();
+    loadKanbanHealth();
   } catch (err) {
     if (!kanban.loaded) {
       const b = $("#taskBoard");
@@ -254,9 +357,56 @@ async function loadKanban() {
   }
 }
 
-function kanbanCard(t) {
+async function loadKanbanHealth() {
+  try {
+    const [stats, assignees] = await Promise.all([
+      api("/api/kanban/board/stats").catch(() => ({})),
+      api("/api/kanban/board/assignees").catch(() => ({})),
+    ]);
+    kanban.health = { stats: stats.data || stats, assignees: assignees.data || [] };
+    renderKanbanHealth();
+  } catch (err) {
+    kanban.health = null;
+    renderKanbanHealth();
+  }
+}
+
+function renderKanbanHealth() {
+  const box = $("#kanbanHealth");
+  if (!box) return;
+  const h = kanban.health || {};
+  const stats = h.stats || {};
+  const byStatus = stats.by_status || {};
+  const assignees = Array.isArray(h.assignees) ? h.assignees : [];
+  const total = Object.values(byStatus).reduce((sum, n) => sum + (Number(n) || 0), 0);
+  const blocked = Number(byStatus.blocked || 0);
+  const running = Number(byStatus.running || 0);
+  const ready = Number(byStatus.ready || 0);
+  const triage = Number(byStatus.triage || 0);
+  const busiest = assignees
+    .map((a) => ({ name: a.name || "", total: Object.values(a.counts || {}).reduce((s, n) => s + (Number(n) || 0), 0) }))
+    .filter((a) => a.name)
+    .sort((a, b) => b.total - a.total)[0];
+  const idle = state.profiles.filter((p) => !assignees.some((a) => a.name === p.name && Object.values(a.counts || {}).some((n) => Number(n) > 0))).length;
+  box.innerHTML = `
+    <div class="kan-health-card"><b>${total}</b><span>active tasks</span></div>
+    <div class="kan-health-card${blocked ? " warn" : ""}"><b>${blocked}</b><span>blocked</span></div>
+    <div class="kan-health-card"><b>${running}</b><span>running</span></div>
+    <div class="kan-health-card"><b>${ready}</b><span>ready</span></div>
+    <div class="kan-health-card${triage ? " warn" : ""}"><b>${triage}</b><span>needs clarify</span></div>
+    <div class="kan-health-card"><b>${escapeHtml(busiest?.name ? displayName(busiest.name) : "—")}</b><span>busiest${busiest ? ` · ${busiest.total}` : ""}</span></div>
+    <div class="kan-health-card"><b>${idle}</b><span>idle agents</span></div>`;
+}
+
+function kanbanTaskRole(t) {
+  return t.link_role || (t.is_goal ? "goal" : (t.is_subtask ? "subtask" : ""));
+}
+
+function kanbanCard(t, opts = {}) {
   const pr = Number(t.priority) || 0;
   const body = t.body ? `<p>${escapeHtml(t.body)}</p>` : "";
+  const checked = kanban.selected.has(t.id) ? "checked" : "";
+  const selectTool = `<label class="kan-select" title="Select for bulk actions"><input type="checkbox" data-card-select="1" data-id="${escapeHtml(t.id)}" ${checked} /></label>`;
   // Run button directly on ready cards so multiple agents' tasks can be fired
   // back-to-back without opening (and being trapped in) the modal drawer.
   const runBtn = t.status === "ready"
@@ -269,19 +419,53 @@ function kanbanCard(t) {
     : "";
   // Goal (the parent task of a decomposed effort) vs subtask (one of its
   // pieces). The server annotates each list item from the dependency DAG.
-  const role = t.link_role || (t.is_goal ? "goal" : (t.is_subtask ? "subtask" : ""));
+  const role = kanbanTaskRole(t);
   const roleBadge = role === "goal"
     ? `<span class="kan-role kan-role-goal" title="Goal — the parent task, broken into ${t.subtask_count || 0} subtask${t.subtask_count === 1 ? "" : "s"}">◆ Goal${t.subtask_count ? ` ${t.subtask_count}` : ""}</span>`
     : role === "subtask"
       ? `<span class="kan-role kan-role-subtask" title="Subtask of a larger effort">↳ Subtask</span>`
       : "";
+  const tools = [selectTool, opts.groupToggle || "", pr ? `<span class="tag ${pr >= 3 ? "warn" : ""}">P${pr}</span>` : ""].filter(Boolean).join("");
   return `
     <article class="kan-card${role ? ` kan-${role}` : ""}" draggable="true" data-id="${escapeHtml(t.id)}" data-status="${escapeHtml(t.status)}">
-      <header><strong>${escapeHtml(t.title)}</strong>${pr ? `<span class="tag ${pr >= 3 ? "warn" : ""}">P${pr}</span>` : ""}</header>
+      <header><strong>${escapeHtml(t.title)}</strong>${tools ? `<span class="kan-card-tools">${tools}</span>` : ""}</header>
       ${roleBadge}
       ${body}
       <div class="kan-meta">${avatarHtml(t.assignee || "default", 20)}<span>${escapeHtml(t.assignee ? displayName(t.assignee) : "—")}</span>${runBtn}${stopBtn}</div>
     </article>`;
+}
+
+function kanbanGoalGroup(goal, subtasks) {
+  const collapsed = !!kanban.collapsedGroups[goal.id];
+  const count = subtasks.length;
+  const toggle = `
+    <button type="button" class="kan-group-toggle" data-goal-toggle="${escapeHtml(goal.id)}" aria-expanded="${collapsed ? "false" : "true"}" title="${collapsed ? "Show" : "Hide"} ${count} subtask${count === 1 ? "" : "s"}">
+      <span aria-hidden="true">${collapsed ? "▸" : "▾"}</span>
+      <span>${count}</span>
+    </button>`;
+  return `
+    <div class="kan-task-group${collapsed ? " is-collapsed" : ""}" data-goal-group="${escapeHtml(goal.id)}">
+      ${kanbanCard(goal, { groupToggle: toggle })}
+      <div class="kan-subtask-stack" ${collapsed ? "hidden" : ""}>
+        ${subtasks.map((t) => kanbanCard(t)).join("")}
+      </div>
+    </div>`;
+}
+
+function kanbanColumnMarkup(cards) {
+  const goalsById = new Map(cards.filter((t) => kanbanTaskRole(t) === "goal").map((t) => [t.id, t]));
+  const subtasksByGoal = new Map();
+  cards.forEach((t) => {
+    if (kanbanTaskRole(t) !== "subtask" || !t.goal_id || !goalsById.has(t.goal_id)) return;
+    if (!subtasksByGoal.has(t.goal_id)) subtasksByGoal.set(t.goal_id, []);
+    subtasksByGoal.get(t.goal_id).push(t);
+  });
+  const groupedSubtasks = new Set(Array.from(subtasksByGoal.values()).flat().map((t) => t.id));
+  return cards.map((t) => {
+    if (kanbanTaskRole(t) === "goal" && subtasksByGoal.has(t.id)) return kanbanGoalGroup(t, subtasksByGoal.get(t.id));
+    if (groupedSubtasks.has(t.id)) return "";
+    return kanbanCard(t);
+  }).join("");
 }
 
 function renderKanban() {
@@ -296,13 +480,35 @@ function renderKanban() {
       <section class="column kan-col${active}" data-col="${status}">
         <h3>${label} <span class="kan-count">${cards.length}</span></h3>
         <div class="column-body" data-drop="${status}">
-          ${cards.map(kanbanCard).join("") || `<p class="empty">—</p>`}
+          ${kanbanColumnMarkup(cards) || `<p class="empty">—</p>`}
         </div>
       </section>`;
   }).join("");
   wireKanbanDnd();
+  renderKanbanBulkBar();
+  board.querySelectorAll("[data-goal-toggle]").forEach((btn) =>
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.goalToggle;
+      kanban.collapsedGroups[id] = !kanban.collapsedGroups[id];
+      if (!kanban.collapsedGroups[id]) delete kanban.collapsedGroups[id];
+      saveKanbanCollapsedGroups();
+      renderKanban();
+    }));
+  board.querySelectorAll("[data-card-select]").forEach((box) =>
+    box.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const id = box.dataset.id;
+      if (!id) return;
+      if (box.checked) kanban.selected.add(id);
+      else kanban.selected.delete(id);
+      renderKanbanBulkBar();
+    }));
   board.querySelectorAll(".kan-card").forEach((el) =>
-    el.addEventListener("click", (e) => { if (!el.classList.contains("dragging")) openKanbanDrawer(el.dataset.id); }));
+    el.addEventListener("click", (e) => {
+      if (e.target.closest("button, input, select, textarea, label")) return;
+      if (!el.classList.contains("dragging")) openKanbanDrawer(el.dataset.id);
+    }));
   // Per-card Run: launch the assignee's worker without opening the drawer, so
   // tasks for different agents can be started in parallel.
   board.querySelectorAll(".kan-card-run").forEach((btn) =>
@@ -323,6 +529,46 @@ function renderKanban() {
       kanban.activeColumn = kanban.activeColumn === status ? null : status;
       renderKanban();
     }));
+}
+
+function selectedKanbanTasks(status = "") {
+  const selected = kanban.tasks.filter((t) => kanban.selected.has(t.id));
+  return status ? selected.filter((t) => t.status === status) : selected;
+}
+
+function renderKanbanBulkBar() {
+  const bar = $("#kanBulkBar");
+  const count = $("#kanBulkCount");
+  if (!bar || !count) return;
+  const n = kanban.selected.size;
+  bar.hidden = n === 0;
+  count.textContent = `${n} selected`;
+}
+
+async function kanbanBulkAction(kind) {
+  const selected = selectedKanbanTasks();
+  const triage = selected.filter((t) => t.status === "triage");
+  const skipped = selected.length - triage.length;
+  if (!triage.length) { setSync("Select triage tasks first"); return; }
+  const label = kind === "clarify" ? "Clarify" : "Orchestrate";
+  const extra = skipped ? ` ${skipped} non-triage selection${skipped === 1 ? "" : "s"} will be skipped.` : "";
+  if (!window.confirm(`${label} ${triage.length} selected triage task${triage.length === 1 ? "" : "s"}?${extra}`)) return;
+  setSync(`${label} selected tasks…`);
+  try {
+    const endpoint = kind === "clarify" ? "clarify" : "decompose";
+    const r = await fetch(`/api/kanban/bulk/${endpoint}`, {
+      method: "POST", headers: headers(), body: JSON.stringify({ ids: triage.map((t) => t.id) }),
+    });
+    const d = await r.json().catch(() => ({}));
+    const results = d.results || [];
+    const okCount = results.filter((x) => x.ok).length;
+    const failCount = results.length - okCount;
+    setSync(`${label} complete — ${okCount} ok${failCount ? `, ${failCount} failed` : ""}`);
+    triage.forEach((t) => kanban.selected.delete(t.id));
+    await loadKanban();
+  } catch (err) {
+    setSync(`${label} selected failed`);
+  }
 }
 
 let _kanDrag = { id: null, from: null };
@@ -355,8 +601,9 @@ async function kanbanMove(id, to, from) {
     const r = await fetch(`/api/kanban/${encodeURIComponent(id)}/move`, {
       method: "POST", headers: headers(), body: JSON.stringify({ to, from }),
     });
-    if (!r.ok) { setSync(r.status === 401 ? "Admin token required" : "Move failed"); return; }
-    setSync("Moved");
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.ok === false) { setSync(d.error || (r.status === 401 ? "Admin token required" : "Move failed")); return; }
+    setSync(d.count ? `Archived ${d.count} linked task${d.count === 1 ? "" : "s"}` : "Moved");
     await loadKanban();
     if (kanban.drawerId === id) refreshDrawer(id);
   } catch (err) { setSync("Move failed"); }
@@ -433,6 +680,20 @@ async function kanbanArchiveTree(id) {
   } catch (err) { setSync("Archive failed"); }
 }
 
+async function kanbanDeleteGoal(id) {
+  const typed = window.prompt("Permanently delete this goal and EVERY linked subtask? This removes task history and Kanban-owned artifacts/logs/workspaces. Type DELETE to confirm.");
+  if (typed !== "DELETE") return;
+  setSync("Deleting goal + subtasks permanently…");
+  try {
+    const r = await fetch(`/api/kanban/${encodeURIComponent(id)}/goal`, { method: "DELETE", headers: headers() });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.ok) { setSync(d.error || (r.status === 401 ? "Admin token required" : "Delete failed")); return; }
+    setSync(`Deleted ${d.count} task${d.count === 1 ? "" : "s"} permanently`);
+    const dlg = $("#kanbanDrawer"); if (dlg && dlg.open) dlg.close();
+    await loadKanban();
+  } catch (err) { setSync("Delete failed"); }
+}
+
 // Orchestrate: the orchestrator agent decomposes a triage goal into assigned
 // subtasks on the shared board. Deliberate, admin-gated; the new subtasks do
 // NOT auto-run unless their assignees have auto-run enabled.
@@ -450,6 +711,217 @@ async function kanbanDecompose(id) {
   } catch (err) { setSync("Orchestrate failed (timeout?)"); }
 }
 
+async function kanbanClarify(id) {
+  if (!window.confirm("Clarify this task? The orchestrator will turn the current card into a concrete spec and record the change on the task.")) return;
+  setSync("Clarifying task…");
+  const btn = document.querySelector("[data-clarify]");
+  if (btn) { btn.disabled = true; btn.textContent = "Clarifying…"; }
+  try {
+    const r = await fetch(`/api/kanban/${encodeURIComponent(id)}/clarify`, { method: "POST", headers: headers() });
+    const d = await r.json().catch(() => ({}));
+    setSync((!r.ok || !d.ok) ? (d.error || (r.status === 401 ? "Admin token required" : "Clarify failed")) : "Task clarified");
+    await loadKanban();
+    if (kanban.drawerId === id) refreshDrawer(id);
+  } catch (err) { setSync("Clarify failed"); }
+}
+
+function profileSelectHtml(selected) {
+  return state.profiles.map((p) =>
+    `<option value="${escapeHtml(p.name)}" ${p.name === selected ? "selected" : ""}>${escapeHtml(displayName(p.name))}</option>`).join("");
+}
+
+function planNodeLabel(nodes, key, goalId) {
+  if (key === goalId || key === "goal") return "Parent goal";
+  return (nodes.find((n) => n.key === key)?.key || key || "?");
+}
+
+function planFlowHtml(nodes, edges, goalId) {
+  if (!edges.length) return `<p class="empty">No dependencies set.</p>`;
+  return edges.map((e) =>
+    `<span class="kan-plan-edge-pill">${escapeHtml(planNodeLabel(nodes, e.parent, goalId))}<span>→</span>${escapeHtml(planNodeLabel(nodes, e.child, goalId))}</span>`).join("");
+}
+
+function dependencyEditorHtml(nodes, edges, goalId) {
+  const hasEdge = (parent, child) => edges.some((e) => e.parent === parent && e.child === child);
+  const rows = nodes.map((n) => {
+    const candidates = nodes.filter((p) => p.key !== n.key);
+    return `
+      <div class="kan-dep-row">
+        <b>${escapeHtml(n.key)}</b>
+        <div class="kan-dep-checks">
+          ${candidates.map((p) => `
+            <label><input type="checkbox" data-dep-parent="${escapeHtml(p.key)}" data-dep-child="${escapeHtml(n.key)}" ${hasEdge(p.key, n.key) ? "checked" : ""} /> waits for ${escapeHtml(p.key)}</label>`).join("") || `<span class="empty">No internal prerequisites</span>`}
+        </div>
+      </div>`;
+  }).join("");
+  return `
+    <div class="kan-plan-graph" id="kanPlanFlow">${planFlowHtml(nodes, edges, goalId)}</div>
+    <div class="kan-dep-editor">
+      ${rows}
+      <div class="kan-dep-row">
+        <b>Parent goal</b>
+        <div class="kan-dep-checks">
+          ${nodes.map((n) => `
+            <label><input type="checkbox" data-goal-parent="${escapeHtml(n.key)}" ${hasEdge(n.key, goalId) ? "checked" : ""} /> waits for ${escapeHtml(n.key)}</label>`).join("")}
+        </div>
+      </div>
+    </div>`;
+}
+
+function readPlanEdgesFromDom(id) {
+  const edges = [];
+  document.querySelectorAll("[data-dep-parent]").forEach((box) => {
+    if (box.checked) edges.push({ parent: box.dataset.depParent || "", child: box.dataset.depChild || "" });
+  });
+  document.querySelectorAll("[data-goal-parent]").forEach((box) => {
+    if (box.checked) edges.push({ parent: box.dataset.goalParent || "", child: id });
+  });
+  return edges.filter((e) => e.parent && e.child);
+}
+
+function refreshPlanFlow(id) {
+  const flow = $("#kanPlanFlow");
+  const current = kanban.orchPlans[id] || {};
+  if (!flow) return;
+  flow.innerHTML = planFlowHtml(current.nodes || [], readPlanEdgesFromDom(id), id);
+}
+
+function renderOrchPlan(id, plan) {
+  kanban.orchPlans[id] = plan;
+  const box = $("#kanOrchPlan");
+  if (!box) return;
+  const nodes = plan.nodes || [];
+  const edges = plan.edges || [];
+  box.innerHTML = `
+    <div class="kan-plan-head">
+      <span class="tag">${escapeHtml(plan.playbook || "playbook")}</span>
+      ${plan.playbook_auto ? `<span class="tag">auto</span>` : ""}
+      <span class="kan-id">${nodes.length} task${nodes.length === 1 ? "" : "s"} · ${edges.length} link${edges.length === 1 ? "" : "s"}</span>
+    </div>
+    ${plan.playbook_reason ? `<div class="kan-plan-reason">${escapeHtml(plan.playbook_auto ? `Auto chose ${plan.playbook}: ${plan.playbook_reason}` : plan.playbook_reason)}</div>` : ""}
+    <div class="kan-plan-nodes">
+      ${nodes.map((n) => `
+        <div class="kan-plan-node" data-node-key="${escapeHtml(n.key)}" data-node-priority="${escapeHtml(n.priority ?? "")}">
+          <div class="kan-plan-node-top">
+            <span class="tag">${escapeHtml(n.key)}</span>
+            <select data-node-field="assignee">${profileSelectHtml(n.assignee || "")}</select>
+          </div>
+          <input data-node-field="title" value="${escapeHtml(n.title || "")}" maxlength="200" />
+          <textarea data-node-field="body" rows="3" maxlength="4000">${escapeHtml(n.body || "")}</textarea>
+          <div class="kan-plan-options">
+            <input data-node-field="gate" value="${escapeHtml(n.gate || "")}" maxlength="60" placeholder="Gate, if required" />
+            <label><input type="checkbox" data-node-field="goal" ${n.goal ? "checked" : ""} /> goal loop</label>
+            <input data-node-field="skills" value="${escapeHtml((n.skills || []).join(", "))}" placeholder="skills" />
+            <input data-node-field="max_runtime" value="${escapeHtml(n.max_runtime || "")}" maxlength="32" placeholder="max runtime" />
+          </div>
+        </div>`).join("")}
+    </div>
+    <h4>Dependencies</h4>
+    ${dependencyEditorHtml(nodes, edges, id)}
+    <button type="button" class="kan-run-btn kan-commit-btn" data-commit-plan="1">Commit playbook</button>`;
+  const commit = box.querySelector("[data-commit-plan]");
+  if (commit) commit.addEventListener("click", () => kanbanCommitPlan(id));
+  box.querySelectorAll("[data-dep-parent], [data-goal-parent]").forEach((boxEl) =>
+    boxEl.addEventListener("change", () => refreshPlanFlow(id)));
+}
+
+async function kanbanPreviewPlaybook(id) {
+  const playbook = ($("#kanPlaybookKind")?.value || "auto").trim();
+  const security = !!$("#kanPlaybookSecurity")?.checked;
+  setSync("Building playbook preview…");
+  try {
+    const r = await fetch(`/api/kanban/${encodeURIComponent(id)}/playbook/preview`, {
+      method: "POST", headers: headers(), body: JSON.stringify({ playbook, security }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.ok) { setSync(d.error || (r.status === 401 ? "Admin token required" : "Preview failed")); return; }
+    renderOrchPlan(id, d);
+    setSync(`Playbook preview ready — ${d.playbook || "custom"}`);
+  } catch (err) { setSync("Preview failed"); }
+}
+
+function readOrchPlanFromDom(id) {
+  const current = kanban.orchPlans[id] || {};
+  const nodes = Array.from(document.querySelectorAll(".kan-plan-node")).map((row) => {
+    const get = (name) => row.querySelector(`[data-node-field="${name}"]`);
+    return {
+      key: row.dataset.nodeKey || "",
+      title: get("title")?.value || "",
+      body: get("body")?.value || "",
+      assignee: get("assignee")?.value || "",
+      priority: row.dataset.nodePriority ? Number(row.dataset.nodePriority) : null,
+      gate: get("gate")?.value || "",
+      goal: !!get("goal")?.checked,
+      skills: (get("skills")?.value || "").split(",").map((s) => s.trim()).filter(Boolean),
+      max_runtime: get("max_runtime")?.value || "",
+    };
+  });
+  const edges = readPlanEdgesFromDom(id);
+  if (!edges.length) throw new Error("Add at least one dependency");
+  return { playbook: current.playbook || "custom", nodes, edges };
+}
+
+async function kanbanCommitPlan(id) {
+  let plan;
+  try { plan = readOrchPlanFromDom(id); }
+  catch (err) { setSync(err.message || "Plan is invalid"); return; }
+  if (!plan.nodes.length) { setSync("Plan has no tasks"); return; }
+  if (!window.confirm("Commit this playbook? Mission Control will create blocked subtasks, link the graph, then unblock the root worker tasks.")) return;
+  setSync("Committing playbook…");
+  try {
+    const r = await fetch(`/api/kanban/${encodeURIComponent(id)}/playbook/commit`, {
+      method: "POST", headers: headers(), body: JSON.stringify(plan),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.ok) {
+      setSync(d.error || (d.errors?.[0]?.error) || (r.status === 401 ? "Admin token required" : "Commit failed"));
+      return;
+    }
+    delete kanban.orchPlans[id];
+    setSync(`Playbook committed — created ${d.created?.length || 0} task${(d.created?.length || 0) === 1 ? "" : "s"}`);
+    await loadKanban();
+    if (kanban.drawerId === id) refreshDrawer(id);
+  } catch (err) { setSync("Commit failed"); }
+}
+
+async function kanbanRecordGate(id) {
+  const gate = ($("#kanGateName")?.value || "").trim();
+  const state = $("#kanGateState")?.value || "pass";
+  const evidence = ($("#kanGateEvidence")?.value || "").trim();
+  if (!gate) { setSync("Gate name is required"); return; }
+  try {
+    const r = await fetch(`/api/kanban/${encodeURIComponent(id)}/gate`, {
+      method: "POST", headers: headers(), body: JSON.stringify({ gate, state, evidence }),
+    });
+    const d = await r.json().catch(() => ({}));
+    setSync((!r.ok || !d.ok) ? (d.error || (r.status === 401 ? "Admin token required" : "Gate update failed")) : "Gate recorded");
+    if (r.ok && d.ok) refreshDrawer(id);
+  } catch (err) { setSync("Gate update failed"); }
+}
+
+async function loadKanbanEvidence(id) {
+  const box = $("#kanEvidence");
+  if (!box) return;
+  box.innerHTML = `<p class="empty">Loading…</p>`;
+  try {
+    const [runs, context] = await Promise.all([
+      api(`/api/kanban/${encodeURIComponent(id)}/runs`).catch(() => ({})),
+      api(`/api/kanban/${encodeURIComponent(id)}/context`).catch(() => ({})),
+    ]);
+    const runRows = Array.isArray(runs.data) ? runs.data : (Array.isArray(runs.runs) ? runs.runs : []);
+    const runHtml = runRows.length
+      ? runRows.slice(0, 8).map((r) => `<li><span class="tag">${escapeHtml(r.status || r.outcome || "run")}</span> <small>${escapeHtml(fmtEpoch(r.started_at || r.created_at || r.updated_at))}</small></li>`).join("")
+      : `<li class="empty">No run records yet.</li>`;
+    box.innerHTML = `
+      <div class="kan-evidence-grid">
+        <div><h4>Runs</h4><ul class="kan-events">${runHtml}</ul></div>
+        <div><h4>Context</h4><pre class="kan-context">${escapeHtml(context.context || context.raw || "")}</pre></div>
+      </div>`;
+  } catch (err) {
+    box.innerHTML = `<p class="empty">Could not load evidence.</p>`;
+  }
+}
+
 async function kanbanCreate(form) {
   const fd = Object.fromEntries(new FormData(form).entries());
   const body = {
@@ -465,20 +937,48 @@ async function kanbanCreate(form) {
 }
 
 function openKanbanDrawer(id) {
+  const task = (kanban.tasks || []).find((t) => t.id === id);
+  const seq = ++_drawerLoadSeq;
   kanban.drawerId = id;
-  $("#kanbanDrawerTitle").textContent = id;
-  $("#kanbanDrawerBody").innerHTML = `<p class="empty">Loading…</p>`;
+  if (task) renderDrawerPreview(task);
+  else {
+    $("#kanbanDrawerTitle").textContent = id;
+    $("#kanbanDrawerBody").innerHTML = `<p class="empty">Loading…</p>`;
+  }
   $("#kanbanDrawer").showModal();
-  refreshDrawer(id);
+  refreshDrawer(id, seq);
 }
 
-async function refreshDrawer(id) {
+async function refreshDrawer(id, seq = ++_drawerLoadSeq) {
   try {
     const data = await api(`/api/kanban/${encodeURIComponent(id)}`);
+    if (kanban.drawerId !== id || seq !== _drawerLoadSeq) return;
     renderDrawer(data.data || {});
   } catch (err) {
+    if (kanban.drawerId !== id || seq !== _drawerLoadSeq) return;
     $("#kanbanDrawerBody").innerHTML = `<p class="empty">Could not load this task.</p>`;
   }
+}
+
+function renderDrawerPreview(t) {
+  const role = kanbanTaskRole(t);
+  const roleChip = role === "goal"
+    ? `<span class="kan-role kan-role-goal">◆ Goal${t.subtask_count ? ` ${escapeHtml(t.subtask_count)}` : ""}</span>`
+    : role === "subtask"
+      ? `<span class="kan-role kan-role-subtask">↳ Subtask</span>`
+      : "";
+  $("#kanbanDrawerTitle").textContent = t.title || t.id || "Task";
+  $("#kanbanDrawerBody").innerHTML = `
+    <div class="kan-d-row"><span class="tag">${escapeHtml(t.status || "")}</span>${t.priority ? `<span class="tag">P${escapeHtml(t.priority)}</span>` : ""}${roleChip}<span class="kan-id">${escapeHtml(t.id || "")}</span></div>
+    ${t.body ? `<p class="kan-d-body">${escapeHtml(t.body)}</p>` : ""}
+    <div class="kan-d-meta">${avatarHtml(t.assignee || "default", 20)} ${escapeHtml(t.assignee ? displayName(t.assignee) : "Unassigned")}</div>
+    <p class="empty">Loading full task details…</p>`;
+}
+
+function deferDrawerLoad(id, fn) {
+  setTimeout(() => {
+    if (kanban.drawerId === id) fn();
+  }, 80);
 }
 
 function renderDrawer(d) {
@@ -513,8 +1013,24 @@ function renderDrawer(d) {
     <div class="kan-d-meta">created ${escapeHtml(fmtEpoch(t.created_at))} by ${escapeHtml(t.created_by || "?")} · deps: ${deps} · workspace ${escapeHtml(t.workspace_kind || "scratch")}</div>
     ${t.status === "ready" ? `<button type="button" class="kan-run-btn" data-run="1">▶ Run now — ${escapeHtml(t.assignee ? displayName(t.assignee) : "?")} executes this task</button>` : ""}
     ${t.status === "running" ? `<button type="button" class="kan-run-btn kan-stop-btn" data-stop="1">■ Stop — terminate the running worker</button>` : ""}
+    ${t.status === "triage" ? `<button type="button" class="kan-run-btn kan-clarify-btn" data-clarify="1">Clarify — turn this into a concrete spec</button>` : ""}
     ${t.status === "triage" ? `<button type="button" class="kan-run-btn kan-orch-btn" data-decompose="1">⊹ Orchestrate — break this goal into assigned subtasks</button>` : ""}
-    ${isGoal ? `<button type="button" class="kan-run-btn kan-archive-tree-btn" data-archtree="1">⊟ Archive completed goal + its subtasks</button>` : ""}
+    ${isGoal && t.status !== "archived" ? `<button type="button" class="kan-run-btn kan-archive-tree-btn" data-archtree="1">⊟ Archive goal + subtasks</button>` : ""}
+    ${isGoal && t.status !== "archived" ? `<button type="button" class="kan-run-btn kan-delete-goal-btn" data-delete-goal="1">Delete goal + subtasks permanently</button>` : ""}
+    ${t.status !== "archived" ? `
+      <h4>Orchestration v2</h4>
+      <div class="kan-orch-v2">
+        <div class="kan-orch-controls">
+          <select id="kanPlaybookKind" title="Playbook type">
+            <option value="auto" selected>Auto recommend</option>
+            <option value="code">Code delivery</option>
+            <option value="research">Research</option>
+          </select>
+          <label><input type="checkbox" id="kanPlaybookSecurity" /> security gate</label>
+          <button type="button" class="ghost-btn" data-preview-plan="1">Preview playbook</button>
+        </div>
+        <div id="kanOrchPlan" class="kan-plan"><p class="empty">Preview a playbook to edit tasks and dependencies before committing.</p></div>
+      </div>` : ""}
     <div class="kan-actions">
       <button type="button" data-act="ready" title="promote/unblock → ready">→ Ready</button>
       <button type="button" data-act="blocked">Block</button>
@@ -530,6 +1046,15 @@ function renderDrawer(d) {
       <input id="kanCommentText" placeholder="Add a comment…" maxlength="2000" autocomplete="off" />
       <button type="submit">Post</button>
     </form>
+    <h4>Gates</h4>
+    <form id="kanGateForm" class="kan-gate-form">
+      <input id="kanGateName" placeholder="Gate name" maxlength="60" />
+      <select id="kanGateState"><option value="pass">Pass</option><option value="fail">Fail</option><option value="waived">Waived</option></select>
+      <input id="kanGateEvidence" placeholder="Evidence" maxlength="2000" />
+      <button type="submit">Record</button>
+    </form>
+    <h4>Evidence</h4>
+    <div id="kanEvidence" class="kan-evidence"><p class="empty">Loading…</p></div>
     <h4>Chat with ${escapeHtml(t.assignee ? displayName(t.assignee) : "(no assignee)")}</h4>
     <div id="kanChatThread" class="kan-chat-thread"><p class="empty">Loading…</p></div>
     <form id="kanChatForm" class="kan-chat-form" data-tid="${escapeHtml(t.id || "")}">
@@ -547,19 +1072,31 @@ function renderDrawer(d) {
     <ul class="kan-events">${events}</ul>
     ${hasRun ? `${outcomeHeaderHtml(t.status)}<div class="kan-log-head"><h4>Worker output${t.status === "running" ? ` <span class="kan-live">live</span>` : ""}</h4><button type="button" id="kanLogRefresh" class="ghost-btn">Refresh</button></div><pre id="kanLog" class="kan-log">Loading…</pre>` : ""}`;
   $("#kanbanDrawerBody").querySelectorAll("[data-act]").forEach((b) =>
-    b.addEventListener("click", () => kanbanMove(t.id, b.dataset.act, t.status)));
+    b.addEventListener("click", () => {
+      if (b.dataset.act === "archived" && isGoal) kanbanArchiveTree(t.id);
+      else kanbanMove(t.id, b.dataset.act, t.status);
+    }));
   const runBtn = $("#kanbanDrawerBody").querySelector("[data-run]");
   if (runBtn) runBtn.addEventListener("click", () => kanbanRun(t.id, t.assignee));
   const stopBtn = $("#kanbanDrawerBody").querySelector("[data-stop]");
   if (stopBtn) stopBtn.addEventListener("click", () => kanbanStop(t.id, t.assignee));
+  const clarifyBtn = $("#kanbanDrawerBody").querySelector("[data-clarify]");
+  if (clarifyBtn) clarifyBtn.addEventListener("click", () => kanbanClarify(t.id));
   const decBtn = $("#kanbanDrawerBody").querySelector("[data-decompose]");
   if (decBtn) decBtn.addEventListener("click", () => kanbanDecompose(t.id));
+  const previewBtn = $("#kanbanDrawerBody").querySelector("[data-preview-plan]");
+  if (previewBtn) previewBtn.addEventListener("click", () => kanbanPreviewPlaybook(t.id));
+  if (kanban.orchPlans[t.id]) renderOrchPlan(t.id, kanban.orchPlans[t.id]);
   const archTreeBtn = $("#kanbanDrawerBody").querySelector("[data-archtree]");
   if (archTreeBtn) archTreeBtn.addEventListener("click", () => kanbanArchiveTree(t.id));
+  const deleteGoalBtn = $("#kanbanDrawerBody").querySelector("[data-delete-goal]");
+  if (deleteGoalBtn) deleteGoalBtn.addEventListener("click", () => kanbanDeleteGoal(t.id));
   const sel = $("#kanReassign");
   if (sel) sel.addEventListener("change", () => kanbanAssign(t.id, sel.value));
   const cf = $("#kanCommentForm");
   if (cf) cf.addEventListener("submit", (e) => { e.preventDefault(); kanbanComment(t.id, $("#kanCommentText").value); });
+  const gf = $("#kanGateForm");
+  if (gf) gf.addEventListener("submit", (e) => { e.preventDefault(); kanbanRecordGate(t.id); });
   const chf = $("#kanChatForm");
   if (chf) {
     chf.addEventListener("submit", (e) => { e.preventDefault(); kanbanChatSend(t.id); });
@@ -567,14 +1104,15 @@ function renderDrawer(d) {
     if (ta) ta.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey && !ta.disabled) { e.preventDefault(); kanbanChatSend(t.id); }
     });
-    kanbanChatLoad(t.id);
+    deferDrawerLoad(t.id, () => kanbanChatLoad(t.id));
   }
   if (hasRun) {
-    loadWorkerLog(t.id);
+    deferDrawerLoad(t.id, () => loadWorkerLog(t.id));
     const rl = $("#kanLogRefresh");
     if (rl) rl.addEventListener("click", () => loadWorkerLog(t.id));
   }
-  loadArtifacts(t.id);  // durable deliverables (Layer 2); async — survive the run
+  deferDrawerLoad(t.id, () => loadArtifacts(t.id));  // durable deliverables (Layer 2); async — survive the run
+  deferDrawerLoad(t.id, () => loadKanbanEvidence(t.id));
   // Live-poll the drawer (status + log) while the task is running.
   clearTimeout(_drawerTimer);
   if (t.status === "running" && kanban.drawerId === t.id) {
@@ -1447,6 +1985,7 @@ let _appSearchTimer = null;
 })();
 
 function renderSchedules() {
+  renderCronCatchup();
   $("#scheduleList").innerHTML = state.schedules.map((schedule) => `
     <article class="schedule-card">
       <header>
@@ -1462,6 +2001,67 @@ function renderSchedules() {
       </div>
     </article>
   `).join("") || `<p class="empty">No schedules yet.</p>`;
+}
+
+function missedCronJobs() {
+  return (state.cronJobs || [])
+    .filter((j) => j.enabled && j.state !== "paused" && j.missed && j.missed_due_at)
+    .sort((a, b) => String(a.missed_due_at).localeCompare(String(b.missed_due_at)));
+}
+
+function renderCronCatchup() {
+  const panel = $("#cronCatchupPanel");
+  const btn = $("#cronCatchupBtn");
+  if (!panel || !btn) return;
+  const missed = missedCronJobs();
+  btn.disabled = cronCatchup.running || missed.length === 0;
+  btn.textContent = cronCatchup.running ? "Catching up..." : "Catch up missed";
+  panel.hidden = missed.length === 0 && !cronCatchup.running;
+  if (panel.hidden) {
+    panel.innerHTML = "";
+    return;
+  }
+  const rows = missed.slice(0, 6).map((j) => `
+    <div class="cron-missed-item">
+      <span>${escapeHtml(displayName(j.owner || ""))}${j.owner ? " / " : ""}${escapeHtml(j.name || j.id || "job")}</span>
+      <time>${escapeHtml(formatTime(j.missed_due_at))}</time>
+    </div>
+  `).join("");
+  const more = missed.length > 6 ? `<span class="tag">+${missed.length - 6} more</span>` : "";
+  panel.innerHTML = `
+    <div class="cron-catchup-head">
+      <strong>${missed.length} missed ${missed.length === 1 ? "schedule" : "schedules"}</strong>
+      ${more}
+    </div>
+    <div class="cron-missed-list">${rows || `<p class="empty">Checking schedules...</p>`}</div>
+  `;
+}
+
+async function catchUpMissedCron() {
+  if (cronCatchup.running) return;
+  const missed = missedCronJobs();
+  if (!missed.length) {
+    setSync("No missed schedules");
+    return;
+  }
+  cronCatchup.running = true;
+  renderCronCatchup();
+  try {
+    const result = await api("/api/schedules/cron/catch-up", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({}),
+    });
+    const ran = (result && result.ran && result.ran.length) || 0;
+    const skipped = (result && result.skipped && result.skipped.length) || 0;
+    setSync(ran ? `Caught up ${ran} missed ${ran === 1 ? "schedule" : "schedules"}` : (skipped ? "Nothing ran" : "No missed schedules"));
+    await loadCron();
+  } catch (err) {
+    setSync("Catch-up failed");
+  } finally {
+    cronCatchup.running = false;
+    renderCronCatchup();
+  }
 }
 
 // ── 7-day calendar view ──────────────────────────────────────────────────────
@@ -1801,17 +2401,64 @@ function teamSkillCounts() {
   return count;
 }
 
+function mcpFallbackServers(m) {
+  return (((m.tools || {}).mcp) || []).map((name) => ({
+    name, status: "unknown", transport: "", lifecycle: "unknown",
+    scope: "Agent tool surface", gated: false,
+  }));
+}
+
+function mcpDataFor(name, m) {
+  const live = chat.mcpHealth[name];
+  const fallback = mcpFallbackServers(m || {});
+  const servers = (live && Array.isArray(live.servers) && live.servers.length) ? live.servers : fallback;
+  const summary = live && live.summary ? live.summary : {
+    configured: servers.length,
+    online: servers.filter((s) => s.status === "online").length,
+    standby: servers.filter((s) => s.status === "standby").length,
+    disabled: servers.filter((s) => s.status === "disabled").length,
+    offline: servers.filter((s) => s.status === "offline").length,
+    unknown: servers.filter((s) => !s.status || s.status === "unknown").length,
+    gated: servers.filter((s) => s.gated).length,
+    on_demand: servers.filter((s) => s.lifecycle === "on-demand").length,
+  };
+  return { servers, summary, error: live && live.error, cached: live && live.cached };
+}
+
+function mcpSummaryHtml(name, m) {
+  const data = mcpDataFor(name, m);
+  const configured = Number(data.summary.configured || data.servers.length || 0);
+  if (!configured) return "";
+  const online = Number(data.summary.online || 0);
+  const parts = [
+    `<button type="button" class="tc-mcp-summary" data-mcp="${escapeHtml(name)}" title="View MCP servers">MCP ${online}/${configured}</button>`,
+  ];
+  if (data.summary.gated) parts.push(`<span class="tc-chip mcp-state">Gated</span>`);
+  if (data.summary.on_demand) parts.push(`<span class="tc-chip mcp-state">On-demand</span>`);
+  if (data.summary.standby) parts.push(`<span class="tc-chip mcp-standby">${data.summary.standby} standby</span>`);
+  if (data.summary.offline) parts.push(`<span class="tc-chip mcp-offline">${data.summary.offline} offline</span>`);
+  if (data.summary.unknown && !online) parts.push(`<span class="tc-chip more">checking</span>`);
+  return `<div class="tc-row-label">MCP</div><div class="tc-chips tc-mcp-line">${parts.join("")}</div>`;
+}
+
+let _teamLoading = false;
 async function loadTeam() {
+  if (_teamLoading) return;
+  _teamLoading = true;
   const grid = $("#teamGrid");
-  if (grid && !grid.children.length) renderTeam();
-  const jobs = state.profiles.map(async (p) => {
-    const cached = chat.agentInfo[p.name];
-    if (cached && cached.loaded && cached.online !== false) return;
-    await loadAgentInfo(p.name);
-    if ($("#view-team")?.classList.contains("active")) renderTeam();
-  });
-  await Promise.allSettled(jobs);
-  renderTeam();
+  if (grid) renderTeam();
+  try {
+    const jobs = state.profiles.map(async (p) => {
+      const cached = chat.agentInfo[p.name];
+      if (cached && cached.loaded && cached.online !== false) return;
+      await loadAgentInfo(p.name);
+      if ($("#view-team")?.classList.contains("active")) renderTeam();
+    });
+    await Promise.allSettled(jobs);
+  } finally {
+    _teamLoading = false;
+    renderTeam();
+  }
 }
 
 function renderTeam() {
@@ -1826,12 +2473,10 @@ function teamCard(p, counts) {
   const m = chat.agentInfo[name] || {};
   const tools = m.tools || { toolsets: [], mcp: [] };
   const skills = m.skills || { count: 0, by_category: {} };
-  const mcp = tools.mcp || [];
   const nonGeneric = (tools.toolsets || []).filter((t) => !TEAM_GENERIC_TOOLSETS.has(t));
   const shownTools = nonGeneric.slice(0, 4);
   const moreCaps = nonGeneric.length - shownTools.length;
   const capChips = [
-    ...mcp.map((n) => `<span class="tc-chip mcp" title="MCP server">${escapeHtml(n)}</span>`),
     ...shownTools.map((t) => `<span class="tc-chip">${escapeHtml(TEAM_TOOL_LABEL[t] || t)}</span>`),
     ...(moreCaps > 0 ? [`<span class="tc-chip more">+${moreCaps}</span>`] : []),
   ].join("");
@@ -1849,7 +2494,7 @@ function teamCard(p, counts) {
   const model = m.model
     ? `${escapeHtml(m.model)}${m.provider ? ` <span class="tc-prov">${escapeHtml(m.provider)}</span>` : ""}`
     : `<span class="muted">model unknown</span>`;
-  const bio = m.bio || m.description || (m.loaded ? "No description." : "Loading…");
+  const bio = m.bio || m.description || p.description || (m.loaded ? "No description." : "Loading…");
   const title = m.role_title ? `<div class="tc-role">${escapeHtml(m.role_title)}</div>` : "";
   const dotCls = m.online === false ? "offline" : (m.loaded ? "online" : "");
 
@@ -1866,6 +2511,7 @@ function teamCard(p, counts) {
       <p class="tc-bio">${escapeHtml(bio)}</p>
       <div class="tc-row-label">Capabilities</div>
       <div class="tc-chips">${capChips || '<span class="muted">—</span>'}</div>
+      ${mcpSummaryHtml(name, m)}
       <div class="tc-row-label">Skills</div>
       <div class="tc-chips">${specChips}${skillsBtn}</div>
       <div class="tc-foot">
@@ -1895,6 +2541,91 @@ function openSkillsDialog(name) {
   $("#skillsDialog").showModal();
 }
 
+function mcpStatusClass(status) {
+  if (status === "online") return "online";
+  if (status === "standby" || status === "disabled") return "standby";
+  if (status === "offline") return "offline";
+  return "unknown";
+}
+
+function mcpActionButtons(name, server) {
+  const safeProfile = escapeHtml(name);
+  const safeServer = escapeHtml(server.name || "");
+  const refresh = `<button type="button" class="art-btn" data-mcp-refresh="${safeProfile}">Test</button>`;
+  const config = `<button type="button" class="art-btn" data-mcp-config="${safeServer}">View Config</button>`;
+  const lifecycle = server.lifecycle === "on-demand"
+    ? `<button type="button" class="art-btn" data-mcp-lifecycle="start" data-profile="${safeProfile}" data-server="${safeServer}">Request Start</button>
+       <button type="button" class="art-btn" data-mcp-lifecycle="restart" data-profile="${safeProfile}" data-server="${safeServer}">Request Restart</button>`
+    : "";
+  return `${refresh}${config}${lifecycle}`;
+}
+
+function openMcpDialog(name) {
+  const m = chat.agentInfo[name] || {};
+  const data = mcpDataFor(name, m);
+  const summary = data.summary || {};
+  const configured = Number(summary.configured || data.servers.length || 0);
+  const title = `${displayName(name)} · MCP ${Number(summary.online || 0)}/${configured}`;
+  $("#mcpDialogTitle").textContent = title;
+  const breakdown = configured
+    ? `<div class="mcp-breakdown">
+        <span>Online: ${Number(summary.online || 0)}</span>
+        <span>Standby: ${Number(summary.standby || 0)}</span>
+        <span>Disabled: ${Number(summary.disabled || 0)}</span>
+        <span>Offline: ${Number(summary.offline || 0)}</span>
+        <span>Unknown: ${Number(summary.unknown || 0)}</span>
+      </div>`
+    : `<p class="empty">No configured MCP servers.</p>`;
+  const rows = data.servers.map((server) => {
+    const status = server.status || "unknown";
+    const detail = [
+      server.transport ? `Transport: ${server.transport}` : "",
+      server.lifecycle ? `Lifecycle: ${server.lifecycle}` : "",
+      server.scope ? `Scope: ${server.scope}` : "",
+      server.duration_ms != null ? `Last test: ${server.duration_ms}ms` : "",
+      server.message || "",
+    ].filter(Boolean).join(" · ");
+    return `<article class="mcp-row">
+      <div class="mcp-row-main">
+        <div>
+          <strong>${escapeHtml(server.name || "unknown")}</strong>
+          <p>${escapeHtml(detail || "No detail available.")}</p>
+        </div>
+        <span class="mcp-status ${mcpStatusClass(status)}">${escapeHtml(status)}</span>
+      </div>
+      <div class="mcp-row-tags">
+        ${server.gated ? `<span class="tc-chip mcp-state">Gated</span>` : ""}
+        ${server.lifecycle === "on-demand" ? `<span class="tc-chip mcp-state">On-demand</span>` : ""}
+        ${server.enabled === false ? `<span class="tc-chip mcp-standby">Disabled</span>` : ""}
+      </div>
+      <div class="mcp-row-actions">${mcpActionButtons(name, server)}</div>
+    </article>`;
+  }).join("");
+  $("#mcpDialogBody").innerHTML = `${breakdown}${rows || ""}<p id="mcpDialogStatus" class="settings-status" aria-live="polite">${data.error ? escapeHtml(data.error) : ""}</p>`;
+  $("#mcpDialog").showModal();
+}
+
+async function requestMcpLifecycle(profile, server, action) {
+  const status = $("#mcpDialogStatus");
+  if (status) status.textContent = `Requesting ${action} for ${server}...`;
+  try {
+    await api("/api/operations/requests", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({
+        action,
+        target: server,
+        requested_by: "operator",
+        reason: `MCP lifecycle request from Team drawer for ${displayName(profile)}.`,
+      }),
+    });
+    if (status) status.textContent = `${action} request created.`;
+    loadOperations();
+  } catch (err) {
+    if (status) status.textContent = "Request failed. Check admin token and approved targets.";
+  }
+}
+
 function gotoChat(name) {
   activateView("agent");
   selectProfile(name);
@@ -1904,6 +2635,8 @@ function gotoChat(name) {
 (function wireTeam() {
   const grid = $("#teamGrid");
   if (grid) grid.addEventListener("click", (e) => {
+    const mcp = e.target.closest("[data-mcp]");
+    if (mcp) { openMcpDialog(mcp.dataset.mcp); return; }
     const sk = e.target.closest("[data-skills]");
     if (sk) { openSkillsDialog(sk.dataset.skills); return; }
     const ch = e.target.closest("[data-team-chat]");
@@ -1922,6 +2655,28 @@ function gotoChat(name) {
     $("#orgMap").hidden = !isOrg;
   });
 })();
+
+const _mcpDialogBody = $("#mcpDialogBody");
+if (_mcpDialogBody) _mcpDialogBody.addEventListener("click", async (e) => {
+  const refresh = e.target.closest("[data-mcp-refresh]");
+  if (refresh) {
+    const status = $("#mcpDialogStatus");
+    if (status) status.textContent = "Testing MCP servers...";
+    await loadAgentsHealth();
+    openMcpDialog(refresh.dataset.mcpRefresh);
+    return;
+  }
+  const lifecycle = e.target.closest("[data-mcp-lifecycle]");
+  if (lifecycle) {
+    await requestMcpLifecycle(lifecycle.dataset.profile, lifecycle.dataset.server, lifecycle.dataset.mcpLifecycle);
+    return;
+  }
+  const config = e.target.closest("[data-mcp-config]");
+  if (config) {
+    const status = $("#mcpDialogStatus");
+    if (status) status.textContent = `Config details for ${config.dataset.mcpConfig} are shown in its row.`;
+  }
+});
 
 function renderOffice() {
   $("#officeMap").innerHTML = state.profiles.map((profile) => {
@@ -1961,7 +2716,7 @@ async function createSchedule(form) {
     headers: headers(),
     body: JSON.stringify(data),
   });
-  $("#syncStatus").textContent = response.ok ? "Schedule created" : (response.status === 401 ? "Admin token required" : "Create failed");
+  setSync(response.ok ? "Schedule created" : (response.status === 401 ? "Admin token required" : "Create failed"));
   await loadState();
 }
 
@@ -2129,7 +2884,9 @@ if (_wikiReload) _wikiReload.addEventListener("click", () => {
 });
 
 $("#refreshBtn").addEventListener("click", () => { loadState(); loadKanban(); loadOperations(); });
+$("#offlineRetryBtn").addEventListener("click", () => { loadState(); loadKanban(); loadOperations(); });
 $("#addScheduleBtn").addEventListener("click", () => $("#scheduleDialog").showModal());
+$("#cronCatchupBtn").addEventListener("click", catchUpMissedCron);
 
 // Generic top-right ✕ for any dialog carrying a .dialog-close button — just
 // closes its parent <dialog> without submitting the form.
@@ -2205,6 +2962,12 @@ $("#kanbanForm").addEventListener("submit", async (event) => {
 });
 const _kanArch = $("#kanbanArchivedToggle");
 if (_kanArch) _kanArch.addEventListener("change", () => { kanban.showArchived = _kanArch.checked; loadKanban(); });
+const _kanBulkClarify = $("#kanBulkClarify");
+if (_kanBulkClarify) _kanBulkClarify.addEventListener("click", () => kanbanBulkAction("clarify"));
+const _kanBulkDecompose = $("#kanBulkDecompose");
+if (_kanBulkDecompose) _kanBulkDecompose.addEventListener("click", () => kanbanBulkAction("decompose"));
+const _kanBulkClear = $("#kanBulkClear");
+if (_kanBulkClear) _kanBulkClear.addEventListener("click", () => { kanban.selected.clear(); renderKanban(); });
 const _kanClose = $("#kanbanDrawerClose");
 if (_kanClose) _kanClose.addEventListener("click", () => { kanban.drawerId = null; clearTimeout(_drawerTimer); $("#kanbanDrawer").close(); });
 
@@ -2296,6 +3059,7 @@ const chat = {
   agentMeta: {},     // profile -> {emoji?|image?} custom avatar
   agentInfo: {},     // profile -> {model, soul_summary} from the bridge
   health: {},        // profile -> bool (bridge reachable); undefined = unknown
+  mcpHealth: {},     // profile -> {summary, servers[]} from live MCP health polling
 };
 
 function agentColor(name) {
@@ -2384,6 +3148,27 @@ const CHAT_HINT = `<p class="chat-hint">Pick an agent and start chatting. Turns 
 function currentProfile() { return chat.profile || null; }
 function currentConv() { return chat.activeConv[currentProfile()] || null; }
 function convKey(profile, convId) { return `${profile || ""}::${convId || ""}`; }
+function savedChatProfile() {
+  try { return localStorage.getItem(CHAT_PROFILE_STORE_KEY) || ""; } catch (e) { return ""; }
+}
+function saveChatProfile(profile) {
+  if (!profile) return;
+  try { localStorage.setItem(CHAT_PROFILE_STORE_KEY, profile); } catch (e) { /* storage unavailable */ }
+}
+function savedChatConvs() {
+  try { return JSON.parse(localStorage.getItem(CHAT_CONV_STORE_KEY) || "{}") || {}; } catch (e) { return {}; }
+}
+function savedChatConv(profile) {
+  return savedChatConvs()[profile] || "";
+}
+function saveChatConv(profile, convId) {
+  if (!profile || !convId) return;
+  try {
+    const saved = savedChatConvs();
+    saved[profile] = convId;
+    localStorage.setItem(CHAT_CONV_STORE_KEY, JSON.stringify(saved));
+  } catch (e) { /* storage unavailable */ }
+}
 
 async function loadAgentMeta() {
   try {
@@ -2398,13 +3183,22 @@ async function loadAgentMeta() {
 }
 
 async function loadAgentsHealth() {
-  try {
-    const data = await api(`/api/agents/health`);
+  const [agentResult, mcpResult] = await Promise.allSettled([
+    api(`/api/agents/health`),
+    api(`/api/agents/mcp-health`),
+  ]);
+  if (agentResult.status === "fulfilled") {
+    const data = agentResult.value;
     chat.health = (data && data.health) || {};
-    renderAgentPicker();
-    renderTerminalTargets();
-    renderKpis();
-  } catch (err) { /* ignore — dot stays at last-known/online */ }
+  }
+  if (mcpResult.status === "fulfilled") {
+    const data = mcpResult.value;
+    chat.mcpHealth = (data && data.health) || {};
+  }
+  renderAgentPicker();
+  renderTerminalTargets();
+  renderKpis();
+  if ($("#view-team")?.classList.contains("active")) renderTeam();
 }
 
 // ── Token-usage card (Card 1) ───────────────────────────────────────────────
@@ -2508,6 +3302,7 @@ async function loadCron() {
   } catch (err) {
     state.cronJobs = [];
   }
+  renderCronCatchup();
   renderCalendar();
 }
 
@@ -2519,7 +3314,11 @@ async function api(path, opts) {
 
 function populateAgentProfiles() {
   const names = state.profiles.map((p) => p.name);
-  if (!chat.profile || !names.includes(chat.profile)) chat.profile = names[0] || null;
+  if (!chat.profile || !names.includes(chat.profile)) {
+    const saved = savedChatProfile();
+    chat.profile = saved && names.includes(saved) ? saved : names[0] || null;
+  }
+  if (chat.profile) saveChatProfile(chat.profile);
   renderAgentPicker();
   renderAgentCard();
   loadAgentInfo(currentProfile());
@@ -2578,7 +3377,7 @@ function renderAgentCard() {
   const model = info.model
     ? `<span class="ac-model-ic" aria-hidden="true">⚙</span>${escapeHtml(info.model)}${prov}`
     : `<span class="ac-model-ic" aria-hidden="true">⚙</span><span class="muted">model unknown</span>`;
-  const text = info.description || info.soul_summary || "";
+  const text = info.description || info.soul_summary || p.description || "";
   const refining = info.description_kind && info.description_kind !== "role"
     ? `<span class="ac-desc-tag" title="The agent is summarising its role from SOUL.md">refining…</span>` : "";
   const desc = text && text.trim()
@@ -2640,6 +3439,7 @@ function updateSendButton() {
 function selectProfile(name) {
   if (!name) return;
   chat.profile = name;
+  saveChatProfile(name);
   clearSearch();
   renderAgentPicker();
   renderAgentCard();
@@ -2666,9 +3466,11 @@ async function loadConversations(profile, force) {
     }
     chat.convs[profile] = convs;
     if (!chat.activeConv[profile] || !convs.some((c) => c.id === chat.activeConv[profile])) {
-      const firstActive = convs.find((c) => !c.archived) || convs[0];
+      const savedConv = savedChatConv(profile);
+      const firstActive = (savedConv && convs.find((c) => c.id === savedConv)) || convs.find((c) => !c.archived) || convs[0];
       chat.activeConv[profile] = firstActive.id;
     }
+    if (chat.activeConv[profile]) saveChatConv(profile, chat.activeConv[profile]);
     if (profile === currentProfile()) {
       renderConvList();
       updateConvTitle();
@@ -2835,7 +3637,9 @@ function clearSearch() {
 }
 
 function selectConv(convId) {
-  chat.activeConv[currentProfile()] = convId;
+  const profile = currentProfile();
+  chat.activeConv[profile] = convId;
+  saveChatConv(profile, convId);
   renderConvList();
   updateConvTitle();
   loadConvHistory(convId);
@@ -2946,8 +3750,12 @@ function dlLink(profile, name, label) {
   return `<a class="dl-link" href="${href}" download="${escapeHtml(name)}">${escapeHtml(label || name)} ↓</a>`;
 }
 
-function renderChat() {
+function renderChat(options = {}) {
   const log = $("#chatLog");
+  const oldScrollTop = log ? log.scrollTop : 0;
+  const distanceFromBottom = log ? (log.scrollHeight - log.clientHeight - log.scrollTop) : 0;
+  const wasNearBottom = distanceFromBottom < 48;
+  const preserveScroll = !!options.preserveScroll && !wasNearBottom;
   const convId = currentConv();
   const profile = currentProfile();
   const msgs = (convId && chat.transcripts[convKey(profile, convId)]) || [];
@@ -2993,7 +3801,8 @@ function renderChat() {
     ${pendingApprovals.map((item) => `<div class="chat-approval-row"><div><strong>${escapeHtml(operationLabel(item.action))}</strong><p>${escapeHtml(item.target)} · ${escapeHtml(item.reason)}</p></div><button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(item.id)}">Approve &amp; execute</button></div>`).join("")}
   </section>` : "";
   log.innerHTML = messagesHtml + approvalPanel;
-  log.scrollTop = log.scrollHeight;
+  if (preserveScroll) log.scrollTop = oldScrollTop;
+  else log.scrollTop = log.scrollHeight;
 }
 
 function pushMsg(convId, msg) {
@@ -3660,6 +4469,7 @@ loadCron();
 loadKanban();
 loadOperations();
 setInterval(loadState, 15000);
+setInterval(() => updateFreshnessStatus(), 15000);
 setInterval(loadAgentsHealth, 15000);
 setInterval(loadUsage, 30000);
 setInterval(() => { if ($("#view-tasks").classList.contains("active")) loadKanban(); }, 15000);

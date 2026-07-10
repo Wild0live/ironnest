@@ -302,7 +302,7 @@ volumes:
 
 services:
   hermes-pf-${NAME}:
-    image: platform/hermes-agent:v2026.6.5-patched
+    image: platform/hermes-agent:v2026.6.19-patched
     container_name: hermes-pf-${NAME}
     restart: unless-stopped
     # No entrypoint override — the shared Hermes image uses s6-overlay

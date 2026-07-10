@@ -2,11 +2,25 @@
 
 All notable changes to hermes-platform. Format follows Keep a Changelog 1.1.0.
 
-## [Unreleased] - 2026-06-14
+## [Unreleased] - 2026-07-11
+
+### Added
+- **LittleJohn Kali MCP sidecar** added as optional on-demand service `kali-mcp-littlejohn` (`--profile kali`). It uses the community `k3nn3dy-ai/kali-mcp` SSE server pinned at commit `d46b46bd23f9801b63fc3d16253b5af07b653ec9`, publishes no host ports, mounts persistent `/work`, maps `/reports` to `./shared/littlejohn/kali`, and is reachable only from LittleJohn over `littlejohn-kali-net`.
+- **Pre-approved LittleJohn lifecycle lane** for the exact actions `start`, `stop`, and `restart` on `kali-mcp-littlejohn`. Other Docker, host, network, mount, image, and privileged changes remain approval-gated.
+- **LittleJohn Kali tool baseline** now includes Nmap, Masscan, Amass, theHarvester, ffuf, OWASP ZAP, sqlmap, Nikto, XSStrike, Metasploit Framework, Hydra, John the Ripper, Nuclei, GVM/OpenVAS packages, Lynis, YARA, Volatility 3, and Autopsy. GVM/OpenVAS is installed but still requires runtime scanner/feed initialization before full scanner use.
+- **Scoped Windows remediation runner** added as the default local host-operation consumer. It accepts only built-in remediation IDs (currently `cis-windows-top5-v1`), ignores agent-submitted script bodies during execution, and keeps raw PowerShell behind the explicit `HOST_OPERATIONS_ALLOW_RAW_POWERSHELL=1` operator override.
+- **Mission Control task artifacts** now include browsable trees, individual downloads, ZIP export, Reports, and sandboxed Apps served from the separate `artifact-apps` origin.
+- **Missed-cron catch-up** added through `scripts/catch-up-missed-cron.sh` and Mission Control's cron catch-up endpoint so overdue schedules can run once after the stack returns.
 
 ### Changed
 - **Profile `wifey` renamed to `qa`** (QA/verification specialist; repurposed from the former home/household persona). Container `hermes-pf-wifey` → `hermes-pf-qa`, named volume `hermes-platform_data-wifey` → `hermes-platform_data-qa` (data migrated), policy `wifey.policy.yaml` → `qa.policy.yaml`, Infisical path `/hermes-platform/wifey` → `/hermes-platform/qa`. Registry `description` rewritten for QA routing.
+- **Hermes Agent upgraded to v0.17.0** (NousResearch tag `v2026.6.19`), with all profile and ttyd consumers pinned to `platform/hermes-agent:v2026.6.19-patched`.
 - Kanban decompose routing now reads declarative `description` fields from `registry/profiles-registry.yaml` (schema-validated) and materializes them into the orchestrator roster via the idempotent `scripts/sync-orchestrator-roster.sh` (wired into `start.sh`).
+- Kanban decompose bridge now surfaces structured `ok:false` decomposer results as Mission Control errors instead of wrapping them as a successful bridge response.
+- Mission Control goal archiving now cascades across the full linked effort, and goal drawers include a safe "Delete goal from active board" action that archives the goal plus linked subtasks while preserving task history.
+- `scripts/_common.sh` now resolves Rancher Desktop's Windows `docker.exe` from both Git Bash and WSL-style shells, so validation scripts do not fall back to an unusable Unix Docker socket.
+- `security/egress-proxy` now initializes Squid's UFS cache on startup and uses a foreground-process healthcheck, restoring proxy health after cache/entrypoint restarts.
+- Approval-gated operations now preserve exact Docker request shapes, replay protection, and a private `mission-control-ops-net`; LittleJohn's only automatic exception remains lifecycle control of `kali-mcp-littlejohn`.
 
 ### Notes
 - `hermes-pf-octo` (platform-ops, added 2026-06-12) post-provisioning gaps — kanban volume/env wiring and in-gateway dispatch — and gateway auth are now resolved (the "octo auth still pending" note in the 2026-06-13 entry is superseded). Live profile lineup is now **8**: `default`, `mark`, `steve`, `qa`, `littlejohn`, `jaime`, `bigbert`, `octo`.

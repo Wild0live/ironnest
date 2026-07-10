@@ -5,13 +5,13 @@
 #   - external monitoring/observability tools
 #   - AI rebuild agents (spec/rebuild-checklist.yaml references this)
 #
-# Current as of 2026-06-14.
+# Current as of 2026-07-11.
 
 stack_name: hermes-platform
 stack_kind: on-demand
 description: Multi-profile Hermes runtime + OpenViking long-term memory + Mission Control.
-service_count: 14
-hermes_agent_image: platform/hermes-agent:v2026.6.5-patched
+service_count: 15
+hermes_agent_image: platform/hermes-agent:v2026.6.19-patched
 profile_startup_model: s6-overlay image entrypoint; no Compose entrypoint override.
 
 networks:
@@ -34,7 +34,7 @@ networks:
   - name: platform-egress
     external: true
     members: [openviking-infisical-agent]
-    notes: Used by the OpenViking Infisical sidecar to reach Infisical Universal Auth.
+    notes: Used by the OpenViking Infisical sidecar.
   - name: hermes-platform-mem-net
     internal: true
     members: [ollama, openviking, memory-gateway]
@@ -43,6 +43,14 @@ networks:
     internal: true
     members: [memory-gateway, hermes-pf-default, hermes-pf-mark, hermes-pf-steve, hermes-pf-qa, hermes-pf-littlejohn, hermes-pf-jaime, hermes-pf-bigbert, hermes-pf-octo]
     notes: The only profile-agent path to memory-gateway.
+  - name: littlejohn-kali-net
+    internal: true
+    members: [hermes-pf-littlejohn, kali-mcp-littlejohn]
+    notes: LittleJohn-only MCP channel to the on-demand Kali sidecar; not part of the memory path.
+  - name: littlejohn-kali-egress-net
+    internal: false
+    members: [kali-mcp-littlejohn]
+    notes: Kali-only outbound bridge for approved temporary package/tool egress; no profile agents join it.
   - name: ingress
     internal: false
     members: [memory-gateway, hermes-platform-ttyd]
@@ -69,6 +77,10 @@ volumes:
     mount: /opt/kanban
     services: [hermes-platform-ttyd, hermes-pf-default, hermes-pf-mark, hermes-pf-steve, hermes-pf-qa, hermes-pf-littlejohn, hermes-pf-jaime, hermes-pf-bigbert, hermes-pf-octo]
     notes: Shared Hermes Kanban board root (kanban.db, boards, workspaces, logs). Deliberately cross-profile and secret-free.
+  - name: hermes-platform_littlejohn-kali-work
+    mount: /work
+    services: [kali-mcp-littlejohn]
+    notes: Persistent Kali assessment workspace; package installs are treated as disposable runtime/image state.
   - name: hermes-platform_data-default
     mount: /opt/data
     services: [hermes-pf-default, hermes-platform-ttyd]
@@ -113,6 +125,10 @@ host_binds:
   - path: ./agent-bridge/agent-chat-bridge.py
     role: Mission Control profile chat bridge
     services: [hermes-pf-default, hermes-pf-mark, hermes-pf-steve, hermes-pf-qa, hermes-pf-littlejohn, hermes-pf-jaime, hermes-pf-bigbert, hermes-pf-octo]
+  - path: ./shared/littlejohn/kali
+    role: LittleJohn Kali report handoff
+    services: [kali-mcp-littlejohn]
+    notes: Mounted as /reports and visible through the shared artifact tree.
 
 services:
   - name: openviking-infisical-agent
@@ -198,7 +214,7 @@ services:
 
   - name: hermes-platform-ttyd
     container_name: hermes-platform-ttyd
-    image: platform/hermes-agent:v2026.6.5-patched
+    image: platform/hermes-agent:v2026.6.19-patched
     role: browser terminal and Hermes dashboard management sidecar
     profile: default
     listens: ["7682/tcp", "9119/tcp"]
@@ -225,7 +241,7 @@ services:
 
   - name: hermes-pf-default
     container_name: hermes-pf-default
-    image: platform/hermes-agent:v2026.6.5-patched
+    image: platform/hermes-agent:v2026.6.19-patched
     role: profile agent
     profile: default
     listens: ["8011/tcp"]
@@ -248,7 +264,7 @@ services:
 
   - name: hermes-pf-mark
     container_name: hermes-pf-mark
-    image: platform/hermes-agent:v2026.6.5-patched
+    image: platform/hermes-agent:v2026.6.19-patched
     role: profile agent
     profile: mark
     listens: ["8011/tcp"]
@@ -271,7 +287,7 @@ services:
 
   - name: hermes-pf-steve
     container_name: hermes-pf-steve
-    image: platform/hermes-agent:v2026.6.5-patched
+    image: platform/hermes-agent:v2026.6.19-patched
     role: profile agent
     profile: steve
     listens: ["8011/tcp"]
@@ -294,7 +310,7 @@ services:
 
   - name: hermes-pf-qa
     container_name: hermes-pf-qa
-    image: platform/hermes-agent:v2026.6.5-patched
+    image: platform/hermes-agent:v2026.6.19-patched
     role: profile agent
     profile: qa
     listens: ["8011/tcp"]
@@ -317,12 +333,12 @@ services:
 
   - name: hermes-pf-littlejohn
     container_name: hermes-pf-littlejohn
-    image: platform/hermes-agent:v2026.6.5-patched
+    image: platform/hermes-agent:v2026.6.19-patched
     role: profile agent
     profile: littlejohn
     listens: ["8011/tcp"]
     publishes: []
-    networks: [platform-net, hermes-platform-app-net]
+    networks: [platform-net, hermes-platform-app-net, littlejohn-kali-net]
     memory_provider: ironnest_gateway
     memory_provider_mount: ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
     kanban:
@@ -338,9 +354,32 @@ services:
       cpus: "2.0"
       memory: 768M
 
+  - name: kali-mcp-littlejohn
+    container_name: kali-mcp-littlejohn
+    image: platform/kali-mcp-littlejohn:2026.07.03
+    upstream: https://github.com/k3nn3dy-ai/kali-mcp
+    upstream_ref: d46b46bd23f9801b63fc3d16253b5af07b653ec9
+    role: optional on-demand Kali Linux MCP sidecar for LittleJohn
+    profile: kali
+    listens: ["8000/tcp"]
+    publishes: []
+    networks: [littlejohn-kali-net, littlejohn-kali-egress-net]
+    endpoint: http://kali-mcp-littlejohn:8000/sse
+    mounts:
+      - hermes-platform_littlejohn-kali-work:/work
+      - ./shared/littlejohn/kali:/reports
+    default_scope: lab-only
+    lifecycle:
+      preapproved_for_littlejohn: [start, stop, restart]
+      approval_required_for: [image_changes, network_changes, host_ports, mounts, privileged_mode, docker_api, host_powershell]
+    healthcheck: "pgrep -f 'kali_mcp_server.server'"
+    resources:
+      cpus: "2.0"
+      memory: 2G
+
   - name: hermes-pf-jaime
     container_name: hermes-pf-jaime
-    image: platform/hermes-agent:v2026.6.5-patched
+    image: platform/hermes-agent:v2026.6.19-patched
     role: profile agent
     profile: jaime
     listens: ["8011/tcp"]
@@ -364,7 +403,7 @@ services:
 
   - name: hermes-pf-bigbert
     container_name: hermes-pf-bigbert
-    image: platform/hermes-agent:v2026.6.5-patched
+    image: platform/hermes-agent:v2026.6.19-patched
     role: profile agent
     profile: bigbert
     listens: ["8011/tcp"]
@@ -388,7 +427,7 @@ services:
 
   - name: hermes-pf-octo
     container_name: hermes-pf-octo
-    image: platform/hermes-agent:v2026.6.5-patched
+    image: platform/hermes-agent:v2026.6.19-patched
     role: profile agent
     profile: octo
     listens: ["8011/tcp"]

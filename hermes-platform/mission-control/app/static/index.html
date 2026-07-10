@@ -79,10 +79,25 @@
             <h1>Mission Control</h1>
           </div>
           <div class="top-actions">
-            <span id="syncStatus" class="status-pill">Syncing</span>
-            <button id="refreshBtn" class="icon-btn" title="Refresh state" aria-label="Refresh state">R</button>
+            <span id="syncStatus" class="status-pill" hidden aria-live="polite"></span>
+            <span id="staleStatus" class="status-pill status-pill-warn" hidden aria-live="polite"></span>
+            <span id="syncDot" class="sync-dot" title="Checking status" aria-label="Checking status"></span>
+            <button id="refreshBtn" class="icon-btn refresh-btn" title="Refresh state" aria-label="Refresh state">
+              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                <path d="M21 3v6h-6" />
+              </svg>
+            </button>
           </div>
         </header>
+
+        <div id="offlineNotice" class="offline-notice" hidden role="status" aria-live="polite">
+          <div class="offline-card">
+            <strong>Mission Control is offline</strong>
+            <span id="offlineNoticeDetail">Showing last known data.</span>
+            <button id="offlineRetryBtn" type="button">Retry now</button>
+          </div>
+        </div>
 
         <section class="view active" id="view-overview">
           <section class="metrics" aria-label="Platform metrics">
@@ -234,6 +249,13 @@
                 <button id="addTaskBtn">Add task</button>
               </div>
             </div>
+            <div id="kanbanHealth" class="kan-health"><p class="empty">Loading board health…</p></div>
+            <div id="kanBulkBar" class="kan-bulk-bar" hidden>
+              <span id="kanBulkCount">0 selected</span>
+              <button type="button" id="kanBulkClarify">Clarify selected</button>
+              <button type="button" id="kanBulkDecompose">Orchestrate selected</button>
+              <button type="button" id="kanBulkClear" class="ghost-btn">Clear</button>
+            </div>
             <div id="taskBoard" class="board"></div>
           </div>
         </section>
@@ -266,8 +288,12 @@
           <div class="panel">
             <div class="panel-head">
               <h2>This Week</h2>
-              <button id="addScheduleBtn">Add schedule</button>
+              <div class="panel-actions">
+                <button id="cronCatchupBtn" type="button">Catch up missed</button>
+                <button id="addScheduleBtn" type="button">Add schedule</button>
+              </div>
             </div>
+            <div id="cronCatchupPanel" class="cron-catchup" hidden></div>
             <div id="weekGrid" class="week-grid"></div>
           </div>
           <div class="panel">
@@ -484,6 +510,14 @@
         <button type="button" class="dialog-close" aria-label="Close">✕</button>
       </div>
       <div id="skillsDialogBody" class="sk-body"><p class="empty">Loading…</p></div>
+    </dialog>
+
+    <dialog id="mcpDialog" class="skills-dialog mcp-dialog">
+      <div class="ar-head">
+        <h2 id="mcpDialogTitle">MCP</h2>
+        <button type="button" class="dialog-close" aria-label="Close">✕</button>
+      </div>
+      <div id="mcpDialogBody" class="sk-body mcp-body"><p class="empty">Loading…</p></div>
     </dialog>
 
     <dialog id="appPreview" class="app-preview">

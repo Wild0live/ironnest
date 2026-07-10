@@ -52,6 +52,7 @@ ADMIN_TOKEN = os.environ.get("MISSION_CONTROL_ADMIN_TOKEN", "").strip()
 BRIDGE_TOKEN = os.environ.get("MISSION_CONTROL_BRIDGE_TOKEN", "").strip()
 BRIDGE_PORT = int(os.environ.get("AGENT_BRIDGE_PORT", "8011"))
 BRIDGE_TIMEOUT = int(os.environ.get("AGENT_BRIDGE_PROXY_TIMEOUT", "270"))
+MCP_HEALTH_TIMEOUT = float(os.environ.get("MISSION_CONTROL_MCP_HEALTH_TIMEOUT", "12"))
 
 # Optional, deliberately narrow lifecycle authority.  When either value is
 # absent, the Operations API remains disabled.  The token is shared only with
@@ -72,6 +73,8 @@ OCTO_OPERATIONS_SUBMIT_TOKEN = os.environ.get("OCTO_OPERATIONS_SUBMIT_TOKEN", ""
 # Little John may submit a reviewed Windows-host remediation proposal only.
 # This credential never authorizes approval or execution.
 LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN = os.environ.get("LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN", "").strip()
+LITTLEJOHN_PREAPPROVED_LIFECYCLE_TARGETS = frozenset(item.strip() for item in os.environ.get(
+    "LITTLEJOHN_PREAPPROVED_LIFECYCLE_TARGETS", "").split(",") if item.strip())
 HOST_OPERATIONS_RUNNER_URL = os.environ.get("HOST_OPERATIONS_RUNNER_URL", "").rstrip("/")
 HOST_OPERATIONS_RUNNER_TOKEN = os.environ.get("HOST_OPERATIONS_RUNNER_TOKEN", "").strip()
 HOST_OPERATIONS_QUEUE_DIR = Path(os.environ.get("HOST_OPERATIONS_QUEUE_DIR", "").strip())
@@ -123,6 +126,11 @@ class ScheduleCreate(BaseModel):
     detail: str = Field(default="", max_length=1000)
 
 
+class CronCatchUp(BaseModel):
+    owner: str | None = Field(default=None, max_length=64)
+    job_id: str | None = Field(default=None, max_length=80)
+
+
 class Attachment(BaseModel):
     name: str = Field(default="file", max_length=120)
     mime: str = Field(default="application/octet-stream", max_length=120)
@@ -152,6 +160,9 @@ class OperationRequestCreate(BaseModel):
     # Only used for host_powershell. The operator reviews this exact text in
     # the Approvals sidebar before it can reach the Windows-host runner.
     script: str | None = Field(default=None, max_length=60_000)
+    # Optional narrow-runner selector. A scoped host runner may ignore script
+    # text and execute only its local implementation for this ID.
+    remediation_id: str | None = Field(default=None, max_length=80)
     risk: Literal["low", "medium", "high", "critical"] = "medium"
 
 
@@ -291,6 +302,7 @@ def _profiles() -> list[dict[str, Any]]:
             "status": p.get("status", "unknown"),
             "tags": list(p.get("tags", []) or []),
             "notes": p.get("notes", "") or "",
+            "description": p.get("description", "") or "",
             "created_at": p.get("created_at", "") or "",
             "policy_loaded": policy_loaded,
         })
@@ -1025,6 +1037,31 @@ def _fetch_agent_cron(p: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
         return p["name"], None
 
 
+def _post_agent_cron_catchup(p: dict[str, Any], job_id: str | None = None) -> tuple[str, dict[str, Any]]:
+    host = p.get("container_name") or f"hermes-pf-{p['name']}"
+    payload = json.dumps({"job_id": job_id} if job_id else {}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if BRIDGE_TOKEN:
+        headers["Authorization"] = f"Bearer {BRIDGE_TOKEN}"
+    req = urllib.request.Request(
+        f"http://{host}:{BRIDGE_PORT}/cron/catch-up",
+        data=payload,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=BRIDGE_TIMEOUT) as r:
+            return p["name"], json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            detail = {"ok": False, "error": f"HTTP {exc.code}"}
+        return p["name"], detail
+    except Exception as exc:  # noqa: BLE001
+        return p["name"], {"ok": False, "error": str(exc), "ran": [], "skipped": []}
+
+
 @router.get("/api/schedules/cron")
 def schedules_cron() -> JSONResponse:
     """Every profile's Hermes cron jobs, each tagged with its owner. Cached ~30s;
@@ -1057,6 +1094,37 @@ def schedules_cron() -> JSONResponse:
     with _cron_lock:
         _cron_cache.update(ts=now, data=out)
     return JSONResponse(content=out)
+
+
+@router.post("/api/schedules/cron/catch-up")
+def schedules_cron_catchup(req: CronCatchUp, _: None = Depends(require_admin)) -> JSONResponse:
+    """Run each missed Hermes cron job once, scoped by profile/job when requested."""
+    profiles = _profiles()
+    if req.owner:
+        profiles = [p for p in profiles if p["name"] == req.owner]
+        if not profiles:
+            raise HTTPException(status_code=404, detail="unknown profile")
+
+    results: list[dict[str, Any]] = []
+    if profiles:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            calls = ((p, req.job_id if req.owner or len(profiles) == 1 else None) for p in profiles)
+            futures = [ex.submit(_post_agent_cron_catchup, p, job_id) for p, job_id in calls]
+            for fut in concurrent.futures.as_completed(futures):
+                prof, payload = fut.result()
+                results.append({"owner": prof, **payload})
+
+    ran = [item for r in results for item in (r.get("ran") or [])]
+    skipped = [item for r in results for item in (r.get("skipped") or [])]
+    with _cron_lock:
+        _cron_cache.update(ts=0.0, data=None)
+    return JSONResponse(content={
+        "ok": all(r.get("ok") for r in results) if results else True,
+        "generated_at": _now(),
+        "results": sorted(results, key=lambda r: r.get("owner", "")),
+        "ran": ran,
+        "skipped": skipped,
+    })
 
 
 @router.get("/api/agent/{profile}/file/{name}")
@@ -1319,6 +1387,30 @@ def agent_meta_view(profile: str) -> JSONResponse:
     return JSONResponse(status_code=code, content=payload)
 
 
+@router.get("/api/agents/mcp-health")
+def agents_mcp_health() -> JSONResponse:
+    """Live-polled MCP server health, gathered through each profile bridge."""
+    profiles = _profiles()
+
+    def probe(p: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        name = str(p.get("name", ""))
+        code, payload = _bridge_json(name, "GET", "/mcp-health", timeout=MCP_HEALTH_TIMEOUT)
+        if code == 200 and isinstance(payload, dict):
+            return name, payload
+        error = payload.get("error", f"bridge HTTP {code}") if isinstance(payload, dict) else f"bridge HTTP {code}"
+        return name, {"ok": False, "profile": name, "servers": [], "summary": {
+            "configured": 0, "online": 0, "standby": 0, "disabled": 0,
+            "offline": 0, "unknown": 0, "gated": 0, "on_demand": 0,
+        }, "error": error}
+
+    health: dict[str, Any] = {}
+    if profiles:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            for name, payload in ex.map(probe, profiles):
+                health[name] = payload
+    return JSONResponse(content={"ok": True, "generated_at": _now(), "health": health})
+
+
 @router.get("/api/agent/{profile}/soul")
 def agent_soul_get(profile: str) -> JSONResponse:
     code, payload = _bridge_json(profile, "GET", "/soul")
@@ -1393,6 +1485,184 @@ class KanbanAssign(BaseModel):
     assignee: str = Field(..., min_length=1, max_length=64)
 
 
+class KanbanLink(BaseModel):
+    parent: str = Field(..., min_length=1, max_length=64)
+    child: str = Field(..., min_length=1, max_length=64)
+
+
+class KanbanGateRecord(BaseModel):
+    gate: str = Field(..., min_length=1, max_length=60)
+    state: Literal["pass", "fail", "waived"] = "pass"
+    evidence: str = Field(default="", max_length=2000)
+
+
+class KanbanPlaybookPreview(BaseModel):
+    playbook: str = Field(default="auto", max_length=40)
+    security: bool = False
+
+
+class KanbanPlanNode(BaseModel):
+    key: str = Field(..., min_length=1, max_length=40)
+    title: str = Field(..., min_length=1, max_length=200)
+    body: str = Field(default="", max_length=4000)
+    assignee: str = Field(default="", max_length=64)
+    priority: int | None = None
+    skills: list[str] = Field(default_factory=list)
+    max_runtime: str = Field(default="", max_length=32)
+    goal: bool = False
+    gate: str = Field(default="", max_length=60)
+
+
+class KanbanPlanEdge(BaseModel):
+    parent: str = Field(..., min_length=1, max_length=64)
+    child: str = Field(..., min_length=1, max_length=64)
+
+
+class KanbanPlaybookCommit(BaseModel):
+    playbook: str = Field(default="custom", max_length=40)
+    nodes: list[KanbanPlanNode] = Field(default_factory=list, max_length=12)
+    edges: list[KanbanPlanEdge] = Field(default_factory=list, max_length=32)
+
+
+class KanbanBulkTasks(BaseModel):
+    ids: list[str] = Field(default_factory=list, min_length=1, max_length=12)
+
+
+def _profile_names() -> set[str]:
+    return {str(p.get("name") or "") for p in _profiles()}
+
+
+def _pick_profile(*needles: str, fallback: str = "") -> str:
+    profiles = _profiles()
+    if not profiles:
+        return fallback
+    names = [str(p.get("name") or "") for p in profiles]
+    haystacks = {
+        str(p.get("name") or ""): " ".join([
+            str(p.get("name") or ""),
+            " ".join(str(t) for t in p.get("tags") or []),
+            str(p.get("notes") or ""),
+        ]).lower()
+        for p in profiles
+    }
+    for needle in needles:
+        n = needle.lower()
+        for name in names:
+            if n and n in haystacks.get(name, ""):
+                return name
+    if fallback in names:
+        return fallback
+    return _orchestrator() if _orchestrator() in names else names[0]
+
+
+def _node_body(goal: dict[str, Any], role: str, gate: str = "") -> str:
+    title = str(goal.get("title") or "Goal")
+    body = str(goal.get("body") or "").strip()
+    base = [
+        f"Parent goal: {title}",
+        "",
+        "Work from the parent task context and save durable evidence to the task artifacts directory.",
+    ]
+    if body:
+        base.extend(["", "Original request:", body[:1200]])
+    if role == "build":
+        base.extend(["", "Deliver implementation changes plus a short implementation note."])
+    elif role == "qa":
+        base.extend(["", "Verify behavior, run the relevant checks, and record pass/fail evidence."])
+    elif role == "security":
+        base.extend(["", "Review the change for security impact, secrets, auth boundaries, and unsafe exposure."])
+    elif role == "synthesis":
+        base.extend(["", "Synthesize the specialist outputs into a concise operator-facing handoff."])
+    if gate:
+        base.extend(["", f"Gate: {gate}"])
+    return "\n".join(base)[:4000]
+
+
+def _recommend_playbook(goal: dict[str, Any], requested: str) -> tuple[str, str]:
+    requested = (requested or "auto").strip().lower()
+    if requested in {"code", "research", "analysis"}:
+        return ("research" if requested == "analysis" else requested), "operator override"
+    text = " ".join([
+        str(goal.get("title") or ""),
+        str(goal.get("body") or ""),
+    ]).lower()
+    code_terms = {
+        "implement", "build", "fix", "bug", "code", "ui", "api", "endpoint",
+        "deploy", "refactor", "test", "security", "qa", "feature", "app",
+        "component", "database", "docker", "compose", "mission control",
+    }
+    research_terms = {
+        "compare", "contrast", "explain", "research", "analyze", "analysis",
+        "summarize", "recommend", "investigate", "what is", "why", "which",
+        "pros", "cons", "options", "document",
+    }
+    code_hits = sorted(term for term in code_terms if term in text)
+    research_hits = sorted(term for term in research_terms if term in text)
+    if research_hits and len(research_hits) > len(code_hits):
+        return "research", f"matched research terms: {', '.join(research_hits[:4])}"
+    if code_hits:
+        return "code", f"matched delivery terms: {', '.join(code_hits[:4])}"
+    return "code", "defaulted to code delivery"
+
+
+def _playbook_preview_payload(task_id: str, req: KanbanPlaybookPreview) -> dict[str, Any]:
+    data = _show_task(task_id, {})
+    goal = data.get("task") or {}
+    if not goal:
+        raise ValueError("task not found")
+    goal_title = str(goal.get("title") or task_id)
+    requested_playbook = (req.playbook or "auto").strip().lower()
+    playbook, playbook_reason = _recommend_playbook(goal, requested_playbook)
+    code_owner = _pick_profile("steve", "code", "developer", fallback=_board_profile())
+    qa_owner = _pick_profile("qa", "quality", "test", fallback=code_owner)
+    security_owner = _pick_profile("little", "security", "wazuh", "octo", fallback=qa_owner)
+    synthesizer = _pick_profile("jaime", "smith", "architect", "synthesis", fallback=_orchestrator())
+    priority = goal.get("priority")
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, str]]
+    if playbook in {"research", "analysis"}:
+        researcher = _pick_profile("research", "analyst", "default", fallback=_board_profile())
+        nodes = [
+            {"key": "research", "title": f"Research: {goal_title}", "assignee": researcher,
+             "priority": priority, "body": _node_body(goal, "research")},
+            {"key": "verify", "title": f"Verify findings: {goal_title}", "assignee": qa_owner,
+             "priority": priority, "body": _node_body(goal, "qa", "verification pass")},
+            {"key": "synthesis", "title": f"Synthesize answer: {goal_title}", "assignee": synthesizer,
+             "priority": priority, "body": _node_body(goal, "synthesis", "final synthesis")},
+        ]
+        edges = [{"parent": "research", "child": "verify"},
+                 {"parent": "verify", "child": "synthesis"},
+                 {"parent": "synthesis", "child": task_id}]
+    else:
+        nodes = [
+            {"key": "build", "title": f"Implement: {goal_title}", "assignee": code_owner,
+             "priority": priority, "body": _node_body(goal, "build"), "goal": True},
+            {"key": "qa", "title": f"QA verify: {goal_title}", "assignee": qa_owner,
+             "priority": priority, "body": _node_body(goal, "qa", "QA pass"), "gate": "QA pass"},
+            {"key": "synthesis", "title": f"Synthesize delivery: {goal_title}", "assignee": synthesizer,
+             "priority": priority, "body": _node_body(goal, "synthesis", "final synthesis"),
+             "gate": "final synthesis"},
+        ]
+        edges = [{"parent": "build", "child": "qa"},
+                 {"parent": "qa", "child": "synthesis"},
+                 {"parent": "synthesis", "child": task_id}]
+        if req.security:
+            nodes.insert(2, {"key": "security", "title": f"Security review: {goal_title}",
+                             "assignee": security_owner, "priority": priority,
+                             "body": _node_body(goal, "security", "security pass"),
+                             "gate": "security pass"})
+            edges = [{"parent": "build", "child": "qa"},
+                     {"parent": "build", "child": "security"},
+                     {"parent": "qa", "child": "synthesis"},
+                     {"parent": "security", "child": "synthesis"},
+                     {"parent": "synthesis", "child": task_id}]
+    return {"ok": True, "task_id": task_id, "playbook": playbook,
+            "requested_playbook": requested_playbook,
+            "playbook_auto": requested_playbook == "auto",
+            "playbook_reason": playbook_reason, "nodes": nodes,
+            "edges": edges, "profiles": sorted(_profile_names())}
+
+
 def _annotate_links(tasks: list[Any]) -> None:
     """Tag each board task as the GOAL of a decomposed effort or one of its
     SUBTASKS, so the board can show the hierarchy. One cheap `links` read from the
@@ -1411,6 +1681,7 @@ def _annotate_links(tasks: list[Any]) -> None:
     is_prereq: set[str] = set()        # appears as parent_id -> prerequisite of something
     has_prereqs: set[str] = set()      # appears as child_id  -> depends on something
     prereq_count: dict[str, int] = {}  # task id -> how many prerequisites it has
+    children: dict[str, list[str]] = {}
     for edge in payload.get("links") or []:
         p, c = edge.get("parent"), edge.get("child")
         if p:
@@ -1418,6 +1689,24 @@ def _annotate_links(tasks: list[Any]) -> None:
         if c:
             has_prereqs.add(c)
             prereq_count[c] = prereq_count.get(c, 0) + 1
+        if p and c:
+            children.setdefault(p, []).append(c)
+    goal_ids = {tid for tid in has_prereqs if tid not in is_prereq}
+
+    def goal_for(tid: str) -> str:
+        """Return the terminal goal for a linked task, if one is discoverable."""
+        seen: set[str] = set()
+        queue = list(children.get(tid, []))
+        while queue:
+            cur = queue.pop(0)
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if cur in goal_ids:
+                return cur
+            queue.extend(children.get(cur, []))
+        return ""
+
     for t in tasks:
         if not isinstance(t, dict):
             continue
@@ -1428,6 +1717,7 @@ def _annotate_links(tasks: list[Any]) -> None:
         t["is_subtask"] = linked and not is_goal
         t["subtask_count"] = prereq_count.get(tid, 0) if is_goal else 0
         t["link_role"] = "goal" if is_goal else ("subtask" if linked else "")
+        t["goal_id"] = "" if is_goal else (goal_for(tid) if linked else "")
 
 
 @router.get("/api/kanban")
@@ -1501,6 +1791,8 @@ def kanban_comment(task_id: str, req: KanbanComment, _: None = Depends(require_a
 
 @router.post("/api/kanban/{task_id}/move")
 def kanban_move(task_id: str, req: KanbanMove, _: None = Depends(require_admin)) -> JSONResponse:
+    if req.to == "archived" and _is_goal_task(task_id):
+        return JSONResponse(content=_archive_task_component(task_id))
     code, payload = _kanban_bridge({"action": "move", "id": task_id,
                                     "to": req.to, "from": req.from_, "result": req.result})
     return JSONResponse(status_code=code, content=payload)
@@ -1512,21 +1804,202 @@ def kanban_assign(task_id: str, req: KanbanAssign, _: None = Depends(require_adm
     return JSONResponse(status_code=code, content=payload)
 
 
+@router.post("/api/kanban/{task_id}/clarify")
+def kanban_clarify(task_id: str, _: None = Depends(require_admin)) -> JSONResponse:
+    """Clarify a vague triage card into a concrete spec through the configured
+    orchestrator profile. This is a bounded LLM turn and records its own audit
+    comment on the Kanban task."""
+    code, payload = _bridge_json(_orchestrator(), "POST", "/kanban",
+                                 {"action": "specify", "id": task_id}, timeout=250)
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.get("/api/kanban/board/stats")
+def kanban_stats() -> JSONResponse:
+    code, payload = _kanban_bridge({"action": "stats"})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.get("/api/kanban/board/assignees")
+def kanban_assignees() -> JSONResponse:
+    code, payload = _kanban_bridge({"action": "assignees"})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/kanban/bulk/clarify")
+def kanban_bulk_clarify(req: KanbanBulkTasks, _: None = Depends(require_admin)) -> JSONResponse:
+    results: list[dict[str, Any]] = []
+    for task_id in dict.fromkeys(req.ids):
+        code, payload = _bridge_json(_orchestrator(), "POST", "/kanban",
+                                     {"action": "specify", "id": task_id}, timeout=250)
+        results.append({"id": task_id, "ok": code == 200 and bool(payload.get("ok")),
+                        "status": code, "error": payload.get("error", "")})
+    return JSONResponse(content={"ok": all(r["ok"] for r in results), "results": results})
+
+
+@router.post("/api/kanban/bulk/decompose")
+def kanban_bulk_decompose(req: KanbanBulkTasks, _: None = Depends(require_admin)) -> JSONResponse:
+    results: list[dict[str, Any]] = []
+    for task_id in dict.fromkeys(req.ids):
+        code, payload = _bridge_json(_orchestrator(), "POST", "/kanban",
+                                     {"action": "decompose", "id": task_id}, timeout=250)
+        results.append({"id": task_id, "ok": code == 200 and bool(payload.get("ok")),
+                        "status": code, "error": payload.get("error", "")})
+    return JSONResponse(content={"ok": all(r["ok"] for r in results), "results": results})
+
+
+@router.get("/api/kanban/{task_id}/runs")
+def kanban_runs(task_id: str) -> JSONResponse:
+    code, payload = _kanban_bridge({"action": "runs", "id": task_id})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.get("/api/kanban/{task_id}/context")
+def kanban_context(task_id: str) -> JSONResponse:
+    code, payload = _kanban_bridge({"action": "context", "id": task_id})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/kanban/{task_id}/link")
+def kanban_link(task_id: str, req: KanbanLink, _: None = Depends(require_admin)) -> JSONResponse:
+    code, payload = _kanban_bridge({"action": "link", "parent": req.parent, "child": req.child})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/kanban/{task_id}/unlink")
+def kanban_unlink(task_id: str, req: KanbanLink, _: None = Depends(require_admin)) -> JSONResponse:
+    code, payload = _kanban_bridge({"action": "unlink", "parent": req.parent, "child": req.child})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/kanban/{task_id}/gate")
+def kanban_gate(task_id: str, req: KanbanGateRecord, _: None = Depends(require_admin)) -> JSONResponse:
+    text = json.dumps({
+        "kind": "ironnest_gate_v1",
+        "gate": req.gate,
+        "state": req.state,
+        "evidence": req.evidence,
+        "recorded_at": int(time.time()),
+    }, ensure_ascii=False, sort_keys=True)
+    code, payload = _kanban_bridge({"action": "comment", "id": task_id, "text": text,
+                                    "author": "mission-control-gate"})
+    return JSONResponse(status_code=code, content=payload)
+
+
+@router.post("/api/kanban/{task_id}/playbook/preview")
+def kanban_playbook_preview(task_id: str, req: KanbanPlaybookPreview,
+                            _: None = Depends(require_admin)) -> JSONResponse:
+    try:
+        payload = _playbook_preview_payload(task_id, req)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=502, content={"ok": False, "error": f"preview failed: {exc}"})
+    return JSONResponse(content=payload)
+
+
+@router.post("/api/kanban/{task_id}/playbook/commit")
+def kanban_playbook_commit(task_id: str, req: KanbanPlaybookCommit,
+                           _: None = Depends(require_admin)) -> JSONResponse:
+    if not req.nodes:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "plan has no nodes"})
+    profile_names = _profile_names()
+    key_to_id: dict[str, str] = {task_id: task_id, "goal": task_id}
+    created: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for node in req.nodes:
+        if node.assignee and node.assignee not in profile_names:
+            return JSONResponse(status_code=400, content={"ok": False,
+                                "error": f"unknown assignee '{node.assignee}'"})
+        body = node.body
+        if node.gate:
+            body = f"{body}\n\nRequired gate: {node.gate}".strip()
+        code, payload = _kanban_bridge({
+            "action": "create",
+            "title": node.title,
+            "body": body,
+            "assignee": node.assignee,
+            "priority": node.priority,
+            "skills": node.skills,
+            "max_runtime": node.max_runtime,
+            "goal": node.goal,
+            "created_by": "mission-control-orchestration-v2",
+            "initial_status": "blocked",
+            "idempotency_key": f"o2:{task_id}:{node.key}",
+        })
+        if code != 200 or not payload.get("ok"):
+            errors.append({"key": node.key, "error": payload.get("error", f"HTTP {code}")})
+            continue
+        item = payload.get("data") or {}
+        new_id = str(item.get("id") or item.get("task_id") or "").strip()
+        if not new_id:
+            errors.append({"key": node.key, "error": "create returned no task id"})
+            continue
+        key_to_id[node.key] = new_id
+        created.append({"key": node.key, "id": new_id, "title": node.title,
+                        "assignee": node.assignee, "gate": node.gate})
+    if errors:
+        return JSONResponse(status_code=502, content={"ok": False, "created": created, "errors": errors})
+
+    linked: list[dict[str, str]] = []
+    for edge in req.edges:
+        parent = key_to_id.get(edge.parent, edge.parent)
+        child = key_to_id.get(edge.child, edge.child)
+        code, payload = _kanban_bridge({"action": "link", "parent": parent, "child": child})
+        if code == 200 and payload.get("ok"):
+            linked.append({"parent": parent, "child": child})
+        else:
+            errors.append({"parent": parent, "child": child, "error": payload.get("error", f"HTTP {code}")})
+    incoming = {edge.child for edge in req.edges}
+    roots = [n for n in req.nodes if n.key not in incoming]
+    promoted: list[str] = []
+    for node in roots:
+        nid = key_to_id.get(node.key)
+        if not nid:
+            continue
+        code, payload = _kanban_bridge({"action": "move", "id": nid, "to": "ready",
+                                        "from": "blocked",
+                                        "reason": "Orchestration v2 graph committed"})
+        if code == 200 and payload.get("ok"):
+            promoted.append(nid)
+    comment = json.dumps({
+        "kind": "ironnest_orchestration_v2",
+        "playbook": req.playbook,
+        "created": created,
+        "links": linked,
+        "gates": [c for c in created if c.get("gate")],
+        "root_tasks": promoted,
+        "committed_at": int(time.time()),
+    }, ensure_ascii=False, sort_keys=True)
+    _kanban_bridge({"action": "comment", "id": task_id, "text": comment,
+                    "author": "mission-control-orchestration-v2"})
+    return JSONResponse(status_code=200 if not errors else 207,
+                        content={"ok": not errors, "created": created, "links": linked,
+                                 "promoted": promoted, "errors": errors})
+
+
 @router.post("/api/kanban/{task_id}/archive")
 def kanban_archive(task_id: str, _: None = Depends(require_admin)) -> JSONResponse:
+    if _is_goal_task(task_id):
+        return JSONResponse(content=_archive_task_component(task_id))
     code, payload = _kanban_bridge({"action": "archive", "id": task_id})
     return JSONResponse(status_code=code, content=payload)
 
 
-@router.post("/api/kanban/{task_id}/archive-tree")
-def kanban_archive_tree(task_id: str, _: None = Depends(require_admin)) -> JSONResponse:
-    """Archive a whole effort: the goal + every task connected to it (parents +
-    children, transitively). Keeps the Done column lean without grouping the
-    board. Idempotent-ish: already-archived tasks just re-archive harmlessly."""
+def _is_goal_task(task_id: str) -> bool:
+    data = _show_task(task_id, {})
+    return bool(data.get("parents")) and not bool(data.get("children"))
+
+
+def _archive_task_component(task_id: str) -> dict[str, Any]:
+    """Archive the whole linked effort containing task_id.
+
+    The Kanban DAG stores subtasks as prerequisites (`parents`) of the terminal
+    goal. Walking both parents and children handles ordinary goal trees and any
+    deeper dependency chain without direct DB mutation.
+    """
     cache: dict[str, dict] = {}
     seen: set[str] = set()
     queue = [task_id]
-    while queue:                                   # BFS the connected component
+    while queue:
         cur = queue.pop()
         if cur in seen:
             continue
@@ -1543,9 +2016,25 @@ def kanban_archive_tree(task_id: str, _: None = Depends(require_admin)) -> JSONR
             archived.append(tid)
         else:
             errors.append({"id": tid, "error": p.get("error", f"HTTP {c}")})
-    return JSONResponse(content={"ok": bool(archived) and not errors,
-                                 "archived": archived, "count": len(archived),
-                                 "errors": errors})
+    return {"ok": bool(archived) and not errors, "archived": archived,
+            "count": len(archived), "errors": errors}
+
+
+@router.post("/api/kanban/{task_id}/archive-tree")
+def kanban_archive_tree(task_id: str, _: None = Depends(require_admin)) -> JSONResponse:
+    """Archive a whole effort: the goal + every task connected to it (parents +
+    children, transitively). Keeps the Done column lean without grouping the
+    board. Idempotent-ish: already-archived tasks just re-archive harmlessly."""
+    return JSONResponse(content=_archive_task_component(task_id))
+
+
+@router.delete("/api/kanban/{task_id}/goal")
+def kanban_goal_delete(task_id: str, _: None = Depends(require_admin)) -> JSONResponse:
+    """Permanently delete a goal and every linked subtask."""
+    if not _is_goal_task(task_id):
+        return JSONResponse(status_code=409, content={"ok": False, "error": "task is not a goal"})
+    code, payload = _kanban_bridge({"action": "delete_tree", "id": task_id})
+    return JSONResponse(status_code=code, content=payload)
 
 
 @router.post("/api/kanban/{task_id}/run")
@@ -2285,10 +2774,77 @@ def _create_operation_request(req: OperationRequestCreate, requested_by: str | N
                                   "body": req.body or {}}
     if req.action == "host_powershell":
         item["script"] = req.script
+        item["remediation_id"] = req.remediation_id.strip() if req.remediation_id else ""
         item["risk"] = req.risk
     store = _read_store()
     store.setdefault("operations", []).append(item)
     _notify_operation_thread(item, "requested")
+    _write_store(store)
+    return item
+
+
+def _execute_preapproved_lifecycle(req: OperationRequestCreate, requested_by: str) -> dict[str, Any]:
+    """Execute one exact pre-approved lifecycle request without operator review.
+
+    This is deliberately narrower than the normal approvals lane: no Docker API,
+    no host script, no arbitrary target, and no broad action set.
+    """
+    if not _operations_enabled():
+        raise HTTPException(status_code=503, detail="operations runner is not configured")
+    if req.action not in ("start", "stop", "restart"):
+        raise HTTPException(status_code=403, detail="action is not pre-approved")
+    if req.target not in LITTLEJOHN_PREAPPROVED_LIFECYCLE_TARGETS:
+        raise HTTPException(status_code=403, detail="target is not pre-approved")
+    if not _operation_target_allowed(req.target):
+        raise HTTPException(status_code=400, detail="target is not approved for lifecycle operations")
+    if req.method or req.path or req.body or req.script:
+        raise HTTPException(status_code=400, detail="pre-approved lifecycle requests cannot include payloads")
+
+    item = {
+        "id": f"op-{uuid.uuid4().hex}",
+        "action": req.action,
+        "target": req.target,
+        "reason": req.reason.strip(),
+        "requested_by": requested_by,
+        "status": "executing",
+        "created_at": _now(),
+        "approved_at": _now(),
+        "approved_by": f"preapproved:{requested_by}",
+        "approval_note": "Exact LittleJohn Kali MCP lifecycle allowance.",
+        "result": None,
+        "preapproved": True,
+    }
+    store = _read_store()
+    store.setdefault("operations", []).append(item)
+    _notify_operation_thread(item, "executing")
+    _write_store(store)
+
+    if not OPERATIONS_RUNNER_URL or not OPERATIONS_RUNNER_TOKEN:
+        item["status"] = "failed"
+        item["result"] = {"error": "required operation runner is not configured"}
+        _notify_operation_thread(item, "failed")
+        _write_store(store)
+        raise HTTPException(status_code=503, detail="required operation runner is not configured")
+
+    runner_payload = {"request_id": item["id"], "action": item["action"], "target": item["target"]}
+    body = json.dumps(runner_payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{OPERATIONS_RUNNER_URL}/v1/execute", data=body, method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {OPERATIONS_RUNNER_TOKEN}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        item["status"] = "executed"
+        item["result"] = payload.get("result", payload)
+    except urllib.error.HTTPError as exc:
+        item["status"] = "failed"
+        item["result"] = {"error": f"runner rejected request ({exc.code})"}
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        item["status"] = "unknown"
+        item["result"] = {"error": f"runner response unavailable: {exc}"}
+    _notify_operation_thread(item, "executed" if item["status"] == "executed" else "failed")
     _write_store(store)
     return item
 
@@ -2310,9 +2866,18 @@ def octo_operations_request(req: OperationRequestCreate,
 @router.post("/api/operations/requests/littlejohn")
 def littlejohn_operations_request(req: OperationRequestCreate,
                                   _: None = Depends(require_littlejohn_operations_submit)) -> JSONResponse:
-    """Little John's proposal ingress. It cannot approve or execute requests."""
+    """Little John's scoped operations ingress.
+
+    Host changes are still proposals. The only auto-executed actions are the
+    exact pre-approved Kali MCP lifecycle operations configured by env.
+    """
+    if req.action in ("start", "stop", "restart"):
+        item = _execute_preapproved_lifecycle(req, requested_by="littlejohn")
+        return JSONResponse(status_code=200 if item["status"] == "executed" else 502,
+                            content={"ok": item["status"] == "executed",
+                                     "request": _operation_view(item)})
     if req.action != "host_powershell":
-        raise HTTPException(status_code=403, detail="Little John may request Windows host changes only")
+        raise HTTPException(status_code=403, detail="Little John may only request host changes or pre-approved Kali lifecycle operations")
     item = _create_operation_request(req, requested_by="littlejohn")
     return JSONResponse(status_code=201, content={"ok": True, "request": _operation_view(item)})
 
@@ -2358,7 +2923,8 @@ def operations_approve(operation_id: str, approval: OperationApproval,
         HOST_OPERATIONS_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
         jobs = HOST_OPERATIONS_QUEUE_DIR / "jobs"; jobs.mkdir(exist_ok=True)
         job = {"request_id": item["id"], "action": item["action"], "target": item["target"],
-               "script": item["script"], "risk": item.get("risk", "medium")}
+               "script": item["script"], "risk": item.get("risk", "medium"),
+               "remediation_id": item.get("remediation_id", "")}
         temp = jobs / f"{item['id']}.tmp"; final = jobs / f"{item['id']}.json"
         temp.write_text(json.dumps(job), encoding="utf-8"); os.replace(temp, final)
         return JSONResponse(status_code=202, content={"ok": True, "request": _operation_view(item)})

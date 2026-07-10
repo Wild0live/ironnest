@@ -61,7 +61,7 @@ for IMG in "${IMAGES[@]}"; do
 done
 
 # Hermes-agent image must exist (reused, not rebuilt by us)
-HERMES_IMG="platform/hermes-agent:v2026.6.5-patched"
+HERMES_IMG="platform/hermes-agent:v2026.6.19-patched"
 if ! docker image inspect "$HERMES_IMG" >/dev/null 2>&1; then
     echo "FATAL: required image $HERMES_IMG not found." >&2
     echo "       Run: bash $PLATFORM/hermes/build.sh" >&2
@@ -125,6 +125,12 @@ if [ -x "$STACK/scripts/sync-orchestrator-roster.sh" ]; then
     echo "--- syncing orchestrator decompose roster from registry ---"
     "$STACK/scripts/sync-orchestrator-roster.sh" || \
         echo "WARN: orchestrator roster sync failed — decompose routing may be degraded" >&2
+fi
+
+if [ -x "$STACK/scripts/catch-up-missed-cron.sh" ]; then
+    echo "--- catching up missed scheduled scripts once ---"
+    "$STACK/scripts/catch-up-missed-cron.sh" || \
+        echo "WARN: missed cron catch-up failed — use Mission Control Schedules to retry" >&2
 fi
 
 echo

@@ -40,6 +40,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -97,6 +98,7 @@ _TID_RE = re.compile(r"^t_[0-9a-f]+$")  # kanban task id shape, for artifact pat
 _MODEL_VALUE = re.compile(r"[^A-Za-z0-9._:\-/]")
 _PROVIDER_VALUE = re.compile(r"[^A-Za-z0-9._-]")
 _BUSY = threading.Lock()  # one turn at a time per profile (handler level)
+_CRON_CATCHUP_BUSY = threading.Lock()
 _ROLE_LOCK = threading.Lock()       # guards the in-flight flag below
 _role_inflight = {"running": False}  # at most one role-summary generation at a time
 
@@ -208,9 +210,14 @@ def _role_description(soul_text: str) -> tuple[str, str]:
 # than import hermes_cli; COLUMNS is forced wide so the skills table never
 # truncates names, and ANSI colour is stripped.
 CAPS_TTL = int(os.environ.get("AGENT_BRIDGE_CAPS_TTL", "300"))
+MCP_HEALTH_TTL = int(os.environ.get("AGENT_BRIDGE_MCP_HEALTH_TTL", "20"))
+MCP_TEST_TIMEOUT = int(os.environ.get("AGENT_BRIDGE_MCP_TEST_TIMEOUT", "9"))
 _caps_cache: dict = {"data": None, "at": 0.0}
 _caps_lock = threading.Lock()
+_mcp_health_cache: dict = {"data": None, "at": 0.0}
+_mcp_health_lock = threading.Lock()
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_MCP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _ROLE_TITLE_RE = re.compile(r"Harddy[’']s\s+(.+?)\s+AI\s+Agent", re.IGNORECASE)
 
 
@@ -222,6 +229,20 @@ def _run_hermes(args: list[str], timeout: int = 20) -> str:
     except Exception:  # noqa: BLE001 — degrade to empty; /meta still returns model+bio
         return ""
     return _ANSI_RE.sub("", out.stdout or "")
+
+
+def _run_hermes_status(args: list[str], timeout: int = 20) -> tuple[int, str]:
+    try:
+        out = subprocess.run([HERMES_BIN, *args], capture_output=True, text=True,
+                             timeout=timeout,
+                             env={**os.environ, "COLUMNS": "160", "NO_COLOR": "1",
+                                  "HERMES_ACCEPT_HOOKS": "1"})
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {timeout}s"
+    except Exception as exc:  # noqa: BLE001
+        return 1, str(exc)
+    text = "\n".join([out.stdout or "", out.stderr or ""]).strip()
+    return out.returncode, _ANSI_RE.sub("", text)
 
 
 def _parse_tools(text: str) -> dict:
@@ -251,6 +272,112 @@ def _parse_tools(text: str) -> dict:
             if name and name[0].isalnum():        # skip "(none)" / decorative lines
                 mcp.append(name)
     return {"toolsets": toolsets, "mcp": mcp}
+
+
+def _parse_mcp_list(text: str) -> list[dict]:
+    servers: list[dict] = []
+    in_table = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or "─" in line:
+            continue
+        low = line.lower()
+        if low.startswith("name ") and "transport" in low and "status" in low:
+            in_table = True
+            continue
+        if low.startswith("mcp server"):
+            continue
+        if not in_table:
+            continue
+        parts = line.split()
+        if len(parts) < 2 or not _MCP_NAME_RE.match(parts[0]):
+            continue
+        status = "enabled" if "enabled" in low and "disabled" not in low else "disabled"
+        servers.append({"name": parts[0], "transport": parts[1], "enabled": status == "enabled"})
+    return servers
+
+
+def _mcp_traits(name: str) -> dict:
+    on_demand = {
+        item.strip() for item in os.environ.get("AGENT_BRIDGE_ON_DEMAND_MCP", "kali-mcp-littlejohn").split(",")
+        if item.strip()
+    }
+    gated = {
+        item.strip() for item in os.environ.get("AGENT_BRIDGE_GATED_MCP", "kali-mcp-littlejohn").split(",")
+        if item.strip()
+    }
+    if name.startswith("kali-mcp-"):
+        return {"lifecycle": "on-demand", "gated": True, "scope": "Lab/report workspace"}
+    if name in on_demand:
+        return {"lifecycle": "on-demand", "gated": name in gated or name in on_demand, "scope": "Agent tool surface"}
+    return {"lifecycle": "always-on", "gated": name in gated, "scope": "Agent tool surface"}
+
+
+def _mcp_test_ok(code: int, text: str) -> bool:
+    low = (text or "").lower()
+    if "✗" in text or "connection failed" in low or "failed initial connection" in low:
+        return False
+    if "error" in low or "traceback" in low:
+        return False
+    if "✓" in text or "connection succeeded" in low or "connected" in low:
+        return True
+    return code == 0
+
+
+def _mcp_health() -> dict:
+    now = time.monotonic()
+    with _mcp_health_lock:
+        cached = _mcp_health_cache["data"]
+        if cached is not None and (now - _mcp_health_cache["at"]) < MCP_HEALTH_TTL:
+            return {**cached, "cached": True}
+
+    list_code, list_text = _run_hermes_status(["mcp", "list"], timeout=10)
+    servers = _parse_mcp_list(list_text)
+    if not servers and list_code != 0:
+        servers = [{"name": n, "transport": "", "enabled": True}
+                   for n in _capabilities().get("tools", {}).get("mcp", [])]
+
+    rows: list[dict] = []
+    for srv in servers:
+        name = srv["name"]
+        traits = _mcp_traits(name)
+        status = "disabled" if not srv.get("enabled", True) else "unknown"
+        message = ""
+        duration_ms = None
+        if srv.get("enabled", True):
+            started = time.monotonic()
+            code, text = _run_hermes_status(["mcp", "test", name], timeout=MCP_TEST_TIMEOUT)
+            duration_ms = int((time.monotonic() - started) * 1000)
+            message = " ".join(text.split())[:500]
+            if _mcp_test_ok(code, text):
+                status = "online"
+            elif traits["lifecycle"] == "on-demand":
+                status = "standby"
+            else:
+                status = "offline"
+        rows.append({
+            **srv,
+            **traits,
+            "status": status,
+            "message": message,
+            "duration_ms": duration_ms,
+        })
+
+    summary = {
+        "configured": len(rows),
+        "online": len([s for s in rows if s["status"] == "online"]),
+        "standby": len([s for s in rows if s["status"] == "standby"]),
+        "disabled": len([s for s in rows if s["status"] == "disabled"]),
+        "offline": len([s for s in rows if s["status"] == "offline"]),
+        "unknown": len([s for s in rows if s["status"] == "unknown"]),
+        "gated": len([s for s in rows if s.get("gated")]),
+        "on_demand": len([s for s in rows if s.get("lifecycle") == "on-demand"]),
+    }
+    data = {"ok": list_code == 0 or bool(rows), "profile": PROFILE, "servers": rows, "summary": summary}
+    with _mcp_health_lock:
+        _mcp_health_cache["data"] = data
+        _mcp_health_cache["at"] = time.monotonic()
+    return data
 
 
 def _parse_skills(text: str) -> dict:
@@ -387,6 +514,7 @@ def _read_cron_jobs() -> list[dict]:
             continue
         sched = j.get("schedule") if isinstance(j.get("schedule"), dict) else {}
         repeat = j.get("repeat") if isinstance(j.get("repeat"), dict) else {}
+        missed_due_at = _cron_missed_due_at(j)
         out.append({
             "id": j.get("id", ""),
             "name": j.get("name", "") or j.get("id", "") or "job",
@@ -403,8 +531,130 @@ def _read_cron_jobs() -> list[dict]:
             "script": j.get("script"),
             "no_agent": bool(j.get("no_agent", False)),
             "repeat": {"times": repeat.get("times"), "completed": repeat.get("completed")},
+            "missed": bool(missed_due_at),
+            "missed_due_at": missed_due_at,
         })
     return out
+
+
+def _cron_parse_dt(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        text = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    return dt.astimezone(datetime.now().astimezone().tzinfo)
+
+
+def _cron_latest_expr_due(expr: str, now: datetime) -> datetime | None:
+    try:
+        from croniter import croniter
+
+        return croniter(expr, now).get_prev(datetime)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _cron_missed_due_at(job: dict) -> str | None:
+    """Return the latest missed scheduled fire time for a job, or None.
+
+    Hermes' built-in scheduler intentionally fast-forwards stale jobs after a
+    short grace window. Mission Control catch-up uses this read-only detector
+    so a job that was missed while the PC was off can still be fired once.
+    """
+    if not job.get("enabled", True) or job.get("state") in {"paused", "completed"}:
+        return None
+
+    now = datetime.now().astimezone()
+    schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
+    kind = schedule.get("kind")
+    next_dt = _cron_parse_dt(job.get("next_run_at"))
+    last_dt = _cron_parse_dt(job.get("last_run_at"))
+    due_dt: datetime | None = None
+
+    if next_dt and next_dt <= now:
+        due_dt = next_dt
+    elif kind == "cron":
+        expr = str(schedule.get("expr") or "").strip()
+        due_dt = _cron_latest_expr_due(expr, now) if expr else None
+    elif kind == "interval" and last_dt:
+        try:
+            minutes = int(schedule.get("minutes") or 0)
+        except (TypeError, ValueError):
+            minutes = 0
+        if minutes > 0:
+            period = timedelta(minutes=minutes)
+            steps = int((now - last_dt).total_seconds() // period.total_seconds())
+            if steps > 0:
+                due_dt = last_dt + (period * steps)
+    elif kind == "once":
+        due_dt = _cron_parse_dt(schedule.get("run_at"))
+
+    if not due_dt or due_dt > now:
+        return None
+    if last_dt and last_dt >= due_dt:
+        return None
+    return due_dt.isoformat()
+
+
+def _load_raw_cron_jobs() -> list[dict]:
+    try:
+        with open(CRON_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return []
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    return [j for j in (jobs or []) if isinstance(j, dict)]
+
+
+def _cron_job_summary(job: dict, missed_due_at: str | None = None) -> dict:
+    return {
+        "id": job.get("id", ""),
+        "name": job.get("name", "") or job.get("id", "") or "job",
+        "missed_due_at": missed_due_at or _cron_missed_due_at(job),
+        "last_run_at": job.get("last_run_at"),
+        "last_status": job.get("last_status"),
+        "next_run_at": job.get("next_run_at"),
+    }
+
+
+def _run_cron_catchup(job_ref: str | None = None) -> dict:
+    if not _CRON_CATCHUP_BUSY.acquire(blocking=False):
+        return {"ok": False, "error": "cron catch-up already running", "ran": [], "skipped": []}
+    try:
+        candidates = []
+        for job in _load_raw_cron_jobs():
+            if job_ref and job_ref not in {str(job.get("id") or ""), str(job.get("name") or "")}:
+                continue
+            missed_due_at = _cron_missed_due_at(job)
+            summary = _cron_job_summary(job, missed_due_at)
+            if missed_due_at:
+                candidates.append((job, summary))
+            elif job_ref:
+                return {"ok": True, "profile": PROFILE, "ran": [], "skipped": [{**summary, "reason": "not missed"}]}
+
+        ran = []
+        skipped = []
+        for job, summary in candidates:
+            try:
+                from cron.jobs import claim_job_for_fire
+                from cron.scheduler import run_one_job
+
+                if not claim_job_for_fire(str(job.get("id") or "")):
+                    skipped.append({**summary, "reason": "already claimed, disabled, or paused"})
+                    continue
+                processed = run_one_job(job, verbose=False)
+                fresh = next((j for j in _load_raw_cron_jobs() if j.get("id") == job.get("id")), job)
+                ran.append({**_cron_job_summary(fresh, summary.get("missed_due_at")), "processed": bool(processed)})
+            except Exception as exc:  # noqa: BLE001
+                skipped.append({**summary, "reason": f"run failed: {exc}"})
+        return {"ok": True, "profile": PROFILE, "ran": ran, "skipped": skipped}
+    finally:
+        _CRON_CATCHUP_BUSY.release()
 
 
 def _model_info() -> dict[str, str]:
@@ -1382,6 +1632,69 @@ def _read_links() -> list[tuple[str, str]]:
     return [(p, c) for p, c in rows]
 
 
+def _task_component_ids(tid: str) -> list[str]:
+    """Return every task connected to tid through task_links."""
+    if not _TID_RE.match(tid or ""):
+        return []
+    graph: dict[str, set[str]] = {}
+    for p, c in _read_links():
+        if not p or not c:
+            continue
+        graph.setdefault(p, set()).add(c)
+        graph.setdefault(c, set()).add(p)
+    seen: set[str] = set()
+    queue = [tid]
+    while queue:
+        cur = queue.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        queue.extend(sorted(graph.get(cur, set()) - seen))
+    return sorted(seen)
+
+
+def _remove_direct_child(parent: str, name: str) -> bool:
+    """Remove one direct child under parent, refusing traversal/symlink escapes."""
+    safe_name = _SAFE_NAME.sub("_", name)
+    parent_real = os.path.realpath(parent)
+    path_real = os.path.realpath(os.path.join(parent_real, safe_name))
+    if os.path.dirname(path_real) != parent_real:
+        raise OSError(f"refusing to remove path outside {parent_real}")
+    if os.path.isdir(path_real):
+        shutil.rmtree(path_real)
+        return True
+    if os.path.isfile(path_real):
+        os.remove(path_real)
+        return True
+    return False
+
+
+def _delete_task_owned_files(tid: str) -> list[str]:
+    """Delete Kanban-owned filesystem state for a task id."""
+    removed: list[str] = []
+    roots = [
+        (ARTIFACTS_DIR, tid),
+        (os.path.join(KANBAN_HOME, "kanban", "workspaces"), tid),
+    ]
+    for parent, name in roots:
+        try:
+            if _remove_direct_child(parent, name):
+                removed.append(os.path.join(parent, _SAFE_NAME.sub("_", name)))
+        except OSError:
+            raise
+    log_roots = [
+        (os.path.join(KANBAN_HOME, "logs"), f"mc-run-{tid}.log"),
+        (os.path.join(KANBAN_HOME, "kanban", "logs"), f"{tid}.log"),
+    ]
+    for parent, name in log_roots:
+        try:
+            if _remove_direct_child(parent, name):
+                removed.append(os.path.join(parent, _SAFE_NAME.sub("_", name)))
+        except OSError:
+            raise
+    return removed
+
+
 def _compute_groups(by_id: dict[str, dict], tids: list[str]) -> dict[str, tuple[str, str]]:
     """For each task id in `tids`, return its (group_id, group_title) — the
     terminal goal node of the decompose DAG. Single DAG read; O(depth) walk per
@@ -1527,9 +1840,53 @@ def _kanban_action(data: dict):
         ws = str(data.get("workspace") or "").strip()
         if ws == "scratch" or ws == "worktree" or ws.startswith(("dir:", "worktree:")):
             argv += ["--workspace", ws]
+        branch = str(data.get("branch") or "").strip()
+        if branch:
+            argv += ["--branch", branch[:160]]
         if data.get("triage"):
             argv += ["--triage"]
+        idem = str(data.get("idempotency_key") or "").strip()
+        if idem:
+            argv += ["--idempotency-key", idem[:200]]
+        max_runtime = str(data.get("max_runtime") or "").strip()
+        if max_runtime:
+            argv += ["--max-runtime", max_runtime[:32]]
+        created_by = str(data.get("created_by") or "").strip()
+        if created_by:
+            argv += ["--created-by", created_by[:64]]
+        skills = data.get("skills") or []
+        if isinstance(skills, str):
+            skills = [skills]
+        if isinstance(skills, list):
+            for skill in skills[:8]:
+                skill_s = str(skill or "").strip()
+                if skill_s:
+                    argv += ["--skill", skill_s[:80]]
+        try:
+            max_retries = int(data.get("max_retries"))
+        except (TypeError, ValueError):
+            max_retries = 0
+        if max_retries > 0:
+            argv += ["--max-retries", str(min(max_retries, 10))]
+        if data.get("goal"):
+            argv += ["--goal"]
+            try:
+                goal_turns = int(data.get("goal_max_turns"))
+            except (TypeError, ValueError):
+                goal_turns = 0
+            if goal_turns > 0:
+                argv += ["--goal-max-turns", str(min(goal_turns, 50))]
+        initial_status = str(data.get("initial_status") or "").strip()
+        if initial_status in {"blocked", "running"}:
+            argv += ["--initial-status", initial_status]
         return _kanban_run(argv, parse_json=True)
+
+    if action == "specify":
+        if not tid:
+            return 400, {"ok": False, "error": "missing id"}
+        author = str(data.get("author") or "mission-control")[:40]
+        return _kanban_run(["specify", tid, "--author", author, "--json"],
+                           parse_json=True, timeout=240)
 
     if action == "comment":
         text = str(data.get("text") or "").strip()
@@ -1548,6 +1905,13 @@ def _kanban_action(data: dict):
         if not tid:
             return 400, {"ok": False, "error": "missing id"}
         return _kanban_run(["archive", tid])
+
+    if action in ("link", "unlink"):
+        parent = str(data.get("parent") or "").strip()
+        child = str(data.get("child") or "").strip()
+        if not parent or not child:
+            return 400, {"ok": False, "error": "missing parent or child"}
+        return _kanban_run([action, parent[:64], child[:64]])
 
     if action in ("artifacts_hide", "artifacts_unhide"):
         # Soft-delete (hide) / restore (unhide) one report. A `.hidden` marker in
@@ -1616,6 +1980,62 @@ def _kanban_action(data: dict):
         _proj_update_task(tid)
         return 200, {"ok": True, "id": tid, "name": name, "deleted": True}
 
+    if action == "delete_tree":
+        # PERMANENT task delete: remove the linked task component from the Kanban
+        # DB and delete the Kanban-owned artifact/workspace/log paths for each id.
+        # Mission Control uses this only for goal + subtasks deletion.
+        if not _TID_RE.match(tid):
+            return 400, {"ok": False, "error": "bad id"}
+        ids = _task_component_ids(tid)
+        if not ids:
+            return 404, {"ok": False, "error": "task not found"}
+        marks = ",".join("?" for _ in ids)
+        db = os.path.join(KANBAN_HOME, "kanban.db")
+        try:
+            con = sqlite3.connect(db, timeout=10)
+            con.row_factory = sqlite3.Row
+            try:
+                tasks = con.execute(f"SELECT id, status FROM tasks WHERE id IN ({marks})", ids).fetchall()
+                found = [str(row["id"]) for row in tasks]
+                if tid not in found:
+                    return 404, {"ok": False, "error": "task not found"}
+                running = [str(row["id"]) for row in tasks if str(row["status"] or "") == "running"]
+                run_rows = con.execute(
+                    f"SELECT DISTINCT task_id FROM task_runs WHERE task_id IN ({marks}) AND status = 'running'",
+                    ids,
+                ).fetchall()
+                running.extend(str(row["task_id"]) for row in run_rows)
+                running = sorted(set(running))
+                if running:
+                    return 409, {"ok": False, "error": "cannot delete running task tree",
+                                 "running": running}
+                con.execute("BEGIN IMMEDIATE")
+                con.execute(f"DELETE FROM task_links WHERE parent_id IN ({marks}) OR child_id IN ({marks})",
+                            ids + ids)
+                for table in ("task_comments", "task_events", "task_runs", "task_attachments",
+                              "kanban_notify_subs"):
+                    con.execute(f"DELETE FROM {table} WHERE task_id IN ({marks})", ids)
+                con.execute(f"DELETE FROM tasks WHERE id IN ({marks})", ids)
+                con.commit()
+            except Exception:
+                con.rollback()
+                raise
+            finally:
+                con.close()
+        except sqlite3.Error as exc:
+            return 502, {"ok": False, "error": f"delete failed: {exc}"}
+
+        removed_files: list[str] = []
+        file_errors: list[dict[str, str]] = []
+        for item in ids:
+            try:
+                removed_files.extend(_delete_task_owned_files(item))
+            except OSError as exc:
+                file_errors.append({"id": item, "error": str(exc)})
+            _proj_update_task(item, drop=True)
+        return 200, {"ok": not file_errors, "deleted": ids, "count": len(ids),
+                     "removed_files": removed_files, "file_errors": file_errors}
+
     if action == "move":
         to = str(data.get("to") or "").strip()
         src = str(data.get("from") or "").strip()
@@ -1653,7 +2073,14 @@ def _kanban_action(data: dict):
         # shared board. It's an LLM turn, so allow a generous timeout.
         if not tid:
             return 400, {"ok": False, "error": "missing id"}
-        return _kanban_run(["decompose", tid, "--json"], parse_json=True, timeout=240)
+        code, payload = _kanban_run(["decompose", tid, "--json"], parse_json=True, timeout=240)
+        if code != 200 or not payload.get("ok"):
+            return code, payload
+        result = payload.get("data")
+        if isinstance(result, dict) and result.get("ok") is False:
+            reason = str(result.get("reason") or "decompose failed")
+            return 502, {"ok": False, "error": reason, "data": result}
+        return code, payload
 
     if action == "log":
         if not tid:
@@ -1677,6 +2104,30 @@ def _kanban_action(data: dict):
             return 200, {"ok": True, "log": "", "bytes": 0, "truncated": False}
         except OSError as exc:
             return 502, {"ok": False, "error": str(exc)}
+
+    if action == "runs":
+        if not tid:
+            return 400, {"ok": False, "error": "missing id"}
+        argv = ["runs", tid, "--json"]
+        state_type = str(data.get("state_type") or "").strip()
+        state_name = str(data.get("state_name") or "").strip()
+        if state_type in {"status", "outcome"} and state_name:
+            argv += ["--state-type", state_type, "--state-name", state_name[:64]]
+        return _kanban_run(argv, parse_json=True)
+
+    if action == "context":
+        if not tid:
+            return 400, {"ok": False, "error": "missing id"}
+        code, payload = _kanban_run(["context", tid])
+        if code == 200 and payload.get("ok"):
+            payload["context"] = payload.get("raw", "")
+        return code, payload
+
+    if action == "stats":
+        return _kanban_run(["stats", "--json"], parse_json=True)
+
+    if action == "assignees":
+        return _kanban_run(["assignees", "--json"], parse_json=True)
 
     if action == "artifacts":
         # List durable deliverables for a task. Files live on the SHARED kanban
@@ -2174,6 +2625,12 @@ class Handler(BaseHTTPRequestHandler):
                              "bio": _soul_bio(soul),
                              "tools": caps["tools"], "skills": caps["skills"]})
             return
+        if self.path == "/mcp-health":
+            if not self._authed():
+                self._json(401, {"ok": False, "error": "unauthorized"})
+                return
+            self._json(200, _mcp_health())
+            return
         if self.path == "/soul":
             if not self._authed():
                 self._json(401, {"ok": False, "error": "unauthorized"})
@@ -2444,6 +2901,25 @@ class Handler(BaseHTTPRequestHandler):
                 return
             code, payload = _kanban_action(data)
             self._json(code, payload)
+            return
+        if self.path == "/cron/catch-up":
+            if not self._authed():
+                self._json(401, {"ok": False, "error": "unauthorized"})
+                return
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            data = {}
+            if 0 < length <= MAX_BODY:
+                try:
+                    data = json.loads(self.rfile.read(length).decode("utf-8")) or {}
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    self._json(400, {"ok": False, "error": "invalid json"})
+                    return
+            elif length > MAX_BODY:
+                self._json(413, {"ok": False, "error": "bad or oversized body"})
+                return
+            job_id = str(data.get("job_id") or "").strip() or None
+            result = _run_cron_catchup(job_id)
+            self._json(200 if result.get("ok") else 409, result)
             return
         if self.path not in ("/chat", "/chat/stream"):
             self._json(404, {"ok": False, "error": "not found"})

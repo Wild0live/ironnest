@@ -148,13 +148,17 @@ def _manager_get(path: str, params: dict[str, Any] | None = None) -> dict[str, A
 def health() -> JSONResponse:
     """Liveness + indexer reachability. No auth (no data returned)."""
     status = {"broker": "ok", "indexer": "unknown", "tokens_configured": bool(_TOKENS)}
+    http_status = 200
     try:
         body = {"size": 0, "query": {"match_all": {}}}
         _indexer_search(body)
         status["indexer"] = "reachable"
     except HTTPException as e:
         status["indexer"] = f"error: {e.detail}"
-    return JSONResponse(status)
+        http_status = 503
+    if not _TOKENS:
+        http_status = 503
+    return JSONResponse(status, status_code=http_status)
 
 
 @app.get("/alerts")

@@ -68,11 +68,14 @@ This section is the threat/tradeoff analysis only. The canonical operational
 reference (layout, in-container paths, agent convention, verification) is
 `shared/README.md`; the decision record is D-013.
 
-## Shared Kanban — a scoped work-board exception to L4
+## IronNest Tasks / Shared Kanban — a scoped work-board exception to L4
 
 Every profile mounts `hermes-platform_kanban-shared` at `/opt/kanban` and sets
 `HERMES_KANBAN_HOME=/opt/kanban`. This creates one shared Hermes Kanban board
-for tasks, workspaces, and worker logs across all profile agents.
+for tasks, workspaces, durable task artifacts, and worker logs across all
+profile agents. Hermes Kanban is the board substrate; IronNest Tasks are the
+Mission Control workflow layer that adds decomposition, specialist routing,
+manual/auto execution controls, Reports, Apps, and operator review.
 
 What is intentionally allowed:
 
@@ -84,10 +87,15 @@ What is intentionally allowed:
    profile container, so the worker uses that profile's identity and secrets.
 4. **Opt-in dispatch.** Auto-dispatch is persisted per profile and is off until
    explicitly enabled.
+5. **Specialist routing.** Decomposition may assign code work to Steve,
+   security work to Little John, QA/verification to `qa`, platform operations to
+   Octo, and review/research to the appropriate profile based on registry
+   descriptions.
 
 What remains forbidden:
 
-1. **No secrets in `/opt/kanban`.** It is shared coordination state.
+1. **No secrets in `/opt/kanban`.** It is shared coordination and artifact
+   state.
 2. **No Mission Control DB mount.** Mission Control must use bridges instead of
    reading or writing the Kanban SQLite file directly.
 3. **No weakening `/opt/data`.** SOUL.md, auth files, sessions, and private

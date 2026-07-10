@@ -7,6 +7,7 @@ p = argparse.ArgumentParser()
 p.add_argument("title")
 p.add_argument("--script-file", required=True)
 p.add_argument("--reason", required=True)
+p.add_argument("--remediation-id", default="")
 p.add_argument("--risk", choices=("low", "medium", "high", "critical"), default="medium")
 a = p.parse_args()
 try:
@@ -22,7 +23,8 @@ if not token:
 if not url or not token or not script.strip() or len(script) > 60_000:
     raise SystemExit("host operation is not configured or plan is invalid")
 body = json.dumps({"action":"host_powershell", "target":a.title, "reason":a.reason,
-                   "script":script, "risk":a.risk}).encode()
+                   "script":script, "remediation_id":a.remediation_id.strip(),
+                   "risk":a.risk}).encode()
 req = urllib.request.Request(f"{url}/api/operations/requests/littlejohn", data=body, method="POST",
     headers={"Content-Type":"application/json", "X-Operations-Submit-Token":token})
 try:

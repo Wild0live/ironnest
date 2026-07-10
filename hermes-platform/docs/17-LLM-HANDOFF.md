@@ -11,7 +11,7 @@ A multi-profile Hermes runtime fronted by a policy-enforcing memory gateway in f
 ## Read these in this order
 
 1. `docs/00-AI-REBUILD-MANIFEST.md` — the meta-doc.
-2. `spec/system.manifest.yaml` — the canonical machine-readable manifest, including invariants I1-I8 you must preserve.
+2. `spec/system.manifest.yaml` — the canonical machine-readable manifest, including invariants I1-I11 you must preserve.
 3. `docs/01-ARCHITECTURE.md` — the picture.
 4. `docs/08-SECURITY-MODEL.md` — what the design protects against.
 5. `docs/16-DECISION-LOG.md` — why each non-obvious choice was made.
@@ -27,6 +27,9 @@ A multi-profile Hermes runtime fronted by a policy-enforcing memory gateway in f
 6. Automatic Hermes conversation memory goes through `ironnest_gateway` to `memory-gateway`; gateway reachability alone is not proof of integration.
 7. Mission Control stays outside the memory policy kernel: platform-net only, no OpenViking/profile bearer tokens, no Infisical machine identity, and no Docker socket.
 8. Shared Kanban lives only on `/opt/kanban`; it is cross-profile coordination state, not private memory or a secret store.
+9. LittleJohn's Kali MCP is on-demand, has no host port, stays off the memory and shared platform networks, and exposes only its exact lifecycle as pre-approved.
+10. Only `operations-runner` may mount the Docker socket; Mission Control and agents submit exact, persisted, single-use operations instead of receiving raw Docker access.
+11. Windows host operations use the localhost file queue. The default elevated runner executes only built-in remediation IDs; raw PowerShell requires an explicit operator override.
 
 If a proposed change would violate any of these, **stop and ask the operator**. Don't "improve" the architecture out of these constraints — they are the architecture.
 
@@ -54,13 +57,19 @@ Not `/entries`, `/find`, `/grep`, `/ls`. Initial adapter assumptions were wrong.
 
 **Always cross-check with `/openapi.json` after any OpenViking version bump.**
 
-### Q2 — OpenViking ROOT requests need `X-OpenViking-{Account,User,Agent}` headers
+### Q2 — OpenViking tenant APIs need `trusted` mode plus identity headers
 
-If `auth_mode=API_KEY` and you're using the root_api_key, calls to `/api/v1/content/*` and `/api/v1/fs/*` (tenant-scoped APIs) return **HTTP 400** with the message:
+As of OpenViking 0.4.5, `auth_mode=api_key` no longer permits root API keys to
+access `/api/v1/content/*` or `/api/v1/fs/*` tenant-scoped APIs. The error is
+**HTTP 403**:
 
-> `ROOT requests to tenant-scoped APIs must include X-OpenViking-Account and X-OpenViking-User headers. Use a user key for regular data access.`
+> `ROOT API keys cannot access tenant-scoped data APIs in api_key mode.`
 
-The gateway adapter sends all three pinned to `"default"`. If you want per-profile OpenViking-level tenancy later, set them per-caller in the adapter.
+Hermes Platform therefore renders OpenViking with `server.auth_mode="trusted"`
+and keeps `server.root_api_key` set. The gateway adapter sends the bearer key
+and all three `X-OpenViking-{Account,User,Agent}` headers pinned to
+`"default"`. If you want per-profile OpenViking-level tenancy later, set those
+headers per caller in the adapter.
 
 ### Q3 — `POST /api/v1/content/write` requires the file to already exist (default `mode=replace`)
 
@@ -78,7 +87,7 @@ The default config docs showed `[section]` style which suggested INI. The actual
   "storage":   {"workspace": "..."},
   "embedding": {"dense": {"provider", "model", "api_key", "dimension", "api_base"}},
   "vlm":       {...optional...},
-  "server":    {"host": "0.0.0.0", "port": 1933, "root_api_key": "..."}
+  "server":    {"host": "0.0.0.0", "port": 1933, "auth_mode": "trusted", "root_api_key": "..."}
 }
 ```
 
