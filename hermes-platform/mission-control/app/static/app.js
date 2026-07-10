@@ -66,7 +66,7 @@ function escapeHtml(value) {
 }
 
 function token() {
-  return $("#adminToken").value.trim();
+  return $("#adminToken")?.value.trim() || "";
 }
 
 function headers() {
