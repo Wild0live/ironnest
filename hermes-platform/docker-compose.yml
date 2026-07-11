@@ -474,9 +474,11 @@ services:
       OPERATIONS_ALLOWED_CONTAINERS:  "${OPERATIONS_ALLOWED_CONTAINERS:-hermes-pf-default,hermes-pf-mark,hermes-pf-steve,hermes-pf-qa,hermes-pf-littlejohn,hermes-pf-jaime,hermes-pf-bigbert,hermes-pf-octo,kali-mcp-littlejohn}"
       OPERATIONS_ALLOW_ALL_CONTAINERS: "${OPERATIONS_ALLOW_ALL_CONTAINERS:-0}"
       OPERATIONS_APPROVAL_TTL_SECONDS: "${OPERATIONS_APPROVAL_TTL_SECONDS:-600}"
+      DEFAULT_OPERATIONS_SUBMIT_TOKEN: "${DEFAULT_OPERATIONS_SUBMIT_TOKEN:-}"
       OCTO_OPERATIONS_SUBMIT_TOKEN:   "${OCTO_OPERATIONS_SUBMIT_TOKEN:-}"
       LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN: "${LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN:-}"
       LITTLEJOHN_PREAPPROVED_LIFECYCLE_TARGETS: "${LITTLEJOHN_PREAPPROVED_LIFECYCLE_TARGETS:-kali-mcp-littlejohn}"
+      HOST_FILESYSTEM_ALLOWED_PROFILES: "${HOST_FILESYSTEM_ALLOWED_PROFILES:-default,littlejohn,octo}"
       HOST_OPERATIONS_RUNNER_URL:      "${HOST_OPERATIONS_RUNNER_URL:-http://172.17.80.1:8765}"
       HOST_OPERATIONS_RUNNER_TOKEN:    "${HOST_OPERATIONS_RUNNER_TOKEN:-}"
       HOST_OPERATIONS_QUEUE_DIR:       "/var/lib/mission-control/host-operations"
@@ -736,6 +738,9 @@ services:
       INFISICAL_PATH: "/hermes-platform/default"
       HERMES_PROFILE: "default"
       MISSION_CONTROL_REPORTS_ROOT: "/opt/mission-control-reports"
+      MC_HOST_OPERATIONS_URL: "http://mission-control:8080"
+      NO_PROXY:    "memory-gateway,mission-control,browser-intent-mcp,infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
+      no_proxy:    "memory-gateway,mission-control,browser-intent-mcp,infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
     command:
       - with-infisical
       - sh
@@ -763,6 +768,7 @@ services:
       - D:/LLM Wiki/sources/mission-control-reports:/opt/mission-control-reports
       - ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
       - ./hermes-profile-entrypoint.sh:/opt/ironnest/hermes-profile-entrypoint.sh:ro
+      - ./agent-bridge/request-host-filesystem.py:/opt/ironnest/request-host-filesystem.py:ro
       - ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
       # NOTE: Reports "Publish to Wiki" (Layer 3) previously bind-mounted the LLM
       # Wiki admin token from D:\LLM Wiki cross-stack here. That coupled this core
@@ -939,6 +945,7 @@ services:
       - ./shared:/opt/shared/all:ro
       - ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
       - ./agent-bridge/request-host-operation.py:/opt/ironnest/request-host-operation.py:ro
+      - ./agent-bridge/request-host-filesystem.py:/opt/ironnest/request-host-filesystem.py:ro
       - ./agent-bridge/request-kali-lifecycle.py:/opt/ironnest/request-kali-lifecycle.py:ro
       - ./agent-bridge/configure-kali-mcp.py:/opt/ironnest/configure-kali-mcp.py:ro
       - ./secrets/littlejohn-host-operations-submit-token:/run/secrets/littlejohn-host-operations-submit-token:ro

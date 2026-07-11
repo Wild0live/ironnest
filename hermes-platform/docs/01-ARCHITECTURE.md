@@ -38,6 +38,21 @@
    │                                                                                        │
    └────────────────────────────────────────────────────────────────────────────────────────┘
 
+   Operator and governed-operation paths (outside the memory policy kernel):
+
+       Traefik + Authelia
+          ├──► mission-control (platform-net)
+          │       ├──► hermes-pf-* bridge:8011             chat + Task/Kanban actions
+          │       ├──► host-operations-queue (host bind)   approved Windows requests
+          │       │       └──► localhost elevated runner   allowlisted remediation IDs
+          │       └──► operations-runner (mission-control-ops-net, optional)
+          │               └──► Docker socket               exact, persisted operations only
+          └──► artifact-apps (platform-net)                 read-only Apps origin + CSP
+
+       hermes-pf-littlejohn
+          ├──► kali-mcp-littlejohn (littlejohn-kali-net, optional; no host port)
+          └──► wazuh-query (external IronNest service)      internal read-only SIEM broker
+
    Per-profile volumes (Docker-managed, mounted ONLY into the matching container):
        hermes-platform_data-default      → hermes-pf-default:/opt/data
        hermes-platform_data-mark         → hermes-pf-mark:/opt/data
@@ -70,6 +85,10 @@ Three concentric trust tiers.
 **Tier A — shared artifact exchange (files, images, binaries).** Separate from the OpenViking memory path, agents hand binary/file output to one another over a host-bind volume rooted at `./shared` (host: `D:\claude-workspace\platform\hermes-platform\shared\`). Each container mounts its own slice read-write at `/opt/shared/mine` and the whole tree read-only at `/opt/shared/all`, giving **write-own / read-all** semantics: an agent writes only its own folder but reads every agent's artifacts (e.g. `/opt/shared/all/mark/report.pdf`). Read-only is kernel-enforced at the mount, so write-isolation holds without relying on file permissions. This channel deliberately **bypasses the policy gateway and the audit log** — it is for working artifacts, not secrets or auditable memory. For an auditable handoff, record a pointer in `viking://shared/approved/<p>/` and keep the blob in `/opt/shared/mine/`. The tree is visible on the Windows host for direct inspection. Private `/opt/data` memory and OpenViking isolation are unaffected. Canonical operational reference: `shared/README.md` (also readable by agents at `/opt/shared/all/README.md`); isolation tradeoff in `docs/08-SECURITY-MODEL.md`.
 
 **Tier A — IronNest Task workflow over shared Hermes Kanban.** Every profile mounts `hermes-platform_kanban-shared` at `/opt/kanban` with `HERMES_KANBAN_HOME=/opt/kanban`. Raw Hermes Kanban is the shared board substrate; IronNest Task is the Mission Control workflow built on top of it. A task can begin as a triage goal, be decomposed by the configured orchestrator, routed to specialists from `registry/profiles-registry.yaml`, run in the assignee's own profile container, and then reviewed through worker logs, artifacts, Reports, Apps, QA, and security gates. Mission Control does not mount or parse the SQLite DB directly; it calls a profile bridge, which performs structured `hermes kanban` CLI actions. Manual execution is routed to the task assignee's own profile container, and auto-dispatch is per-profile opt-in. This channel is not private memory and must remain secret-free; `/opt/data` isolation is unchanged.
+
+**Tier A control plane — Mission Control, Apps, and governed operations.** Mission Control joins `platform-net` for Traefik and profile-bridge traffic plus the internal `mission-control-ops-net` for exact requests to the optional `operations-runner`. It never joins either memory network and never receives the Docker socket. `operations-runner` is the sole Docker-socket holder and accepts only allowlisted, persisted, single-use actions. Windows work crosses a separate localhost boundary through the host-bind queue; the default elevated host runner executes locally implemented remediation IDs rather than submitted PowerShell. Agent-authored web Apps are served read-only by `artifact-apps` on `apps.ironnest.local` under a restrictive CSP and separate origin.
+
+**Tier A security tooling — LittleJohn.** The optional `kali-mcp-littlejohn` sidecar is reachable only from LittleJohn over `littlejohn-kali-net`, publishes no host port, and stays off the platform and memory networks. Its separate egress bridge is for approved package/tool traffic. Wazuh access is not direct indexer access and not general internet access: LittleJohn queries the existing IronNest `wazuh-query` read-only broker on `platform-net`.
 
 **Tier A UI sidecar — management terminal/dashboard.** `hermes-platform-ttyd` exposes the browser terminal and Hermes dashboard on `127.0.0.1:8123` and `127.0.0.1:8124`. It mounts `hermes-platform_data-default:/opt/data` plus the other profile volumes under `/opt/data/profiles/<profile>` so the Hermes UI can list and manage profiles in the layout it expects. This sidecar is a trusted management plane; the actual `hermes-pf-*` agent containers still mount ONLY their own profile volume. The legacy `hermes-ttyd` service may still exist during transition on `127.0.0.1:7682` and `127.0.0.1:9119`; those old ports read the legacy shared volume.
 

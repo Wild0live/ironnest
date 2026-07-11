@@ -15,9 +15,11 @@ steps:
   - id: R-01
     command: |
       bash D:/claude-workspace/platform/bootstrap.sh
-    expects: all 18 always-on IronNest containers healthy
+    expects: bootstrap-selected IronNest perimeter services healthy; platform-net and platform-egress present
     validates: |
-      docker ps --format '{{.Names}}\t{{.Status}}' | grep -E 'infisical|adguard|squid' | grep -v 'Up.*healthy' && exit 1; exit 0
+      docker network inspect platform-net platform-egress >/dev/null
+      bad="$(docker ps --format '{{.Names}}\t{{.Status}}' | grep -E 'infisical|adguard|squid' | grep -v 'Up.*healthy' || true)"
+      test -z "$bad"
 
   - id: R-02
     command: |
@@ -57,38 +59,43 @@ steps:
   - id: R-05
     command: |
       bash D:/claude-workspace/platform/hermes-platform/build.sh
-    expects: openviking + memory-gateway + mission-control images built
+    expects: openviking + memory-gateway + mission-control + operations-runner images built
     validates: |
       docker image inspect platform/hermes-platform-openviking:0.1.0 >/dev/null \
         && docker image inspect platform/hermes-platform-memory-gateway:0.1.0 >/dev/null \
-        && docker image inspect platform/hermes-platform-mission-control:0.1.0 >/dev/null
+        && docker image inspect platform/hermes-platform-mission-control:0.1.0 >/dev/null \
+        && docker image inspect platform/hermes-platform-operations-runner:0.1.0 >/dev/null
 
   - id: R-06
     command: |
       bash D:/claude-workspace/platform/hermes-platform/start.sh
-    expects: 13 stack containers healthy; openviking unreachable from hermes-pf-mark; Mission Control can reach profile bridges
+    expects: 15 core services healthy; optional operations and kali profiles remain off; OpenViking unreachable from profile agents; Mission Control can reach profile bridges
     validates: |
       bash D:/claude-workspace/platform/hermes-platform/scripts/healthcheck.sh
 
   - id: R-07
+    applies_when: migrating from the retired legacy hermes_hermes-data volume; skip for a clean installation
     command: |
       bash D:/claude-workspace/platform/hermes-platform/scripts/migrate-from-shared-volume.sh --dry-run
     expects: dry-run reports file counts for each of the 8 profiles
     validates: 'echo OK'
 
   - id: R-08
+    applies_when: R-07 found legacy data to migrate; skip for a clean installation
     command: |
       bash D:/claude-workspace/platform/hermes-platform/scripts/migrate-from-shared-volume.sh
     expects: every file SHA-256 matches src → dst
     validates: 'echo OK'
 
   - id: R-09
+    applies_when: migrating existing SOUL.md files; skip when clean profile initialization already created current policy sections
     command: |
       bash D:/claude-workspace/platform/hermes-platform/scripts/patch-souls.sh --dry-run
     expects: diff shows the OpenViking Memory Policy section being appended
     validates: 'echo OK'
 
   - id: R-10
+    applies_when: R-09 shows only the intended policy-section change; skip for a clean installation
     command: |
       bash D:/claude-workspace/platform/hermes-platform/scripts/patch-souls.sh
     expects: each SOUL.md gets a .bak.<epoch> sibling and ends with the policy section
@@ -96,12 +103,38 @@ steps:
 
   - id: R-11
     command: |
-      bash D:/claude-workspace/platform/hermes-platform/scripts/validate-isolation.sh
-    expects: all isolation cases PASS
+      bash D:/claude-workspace/platform/hermes-platform/scripts/validate-conversational-memory.sh
+    expects: automatic provider lifecycle write/read passes for all 8 profiles
     validates: 'echo OK'
 
   - id: R-12
     command: |
+      bash D:/claude-workspace/platform/hermes-platform/scripts/validate-isolation.sh
+    expects: all isolation cases PASS
+    validates: 'echo OK'
+
+  - id: R-13
+    command: |
       bash D:/claude-workspace/platform/hermes-platform/scripts/validate-sharing.sh
     expects: all sharing cases PASS
     validates: 'echo OK'
+
+  - id: R-14
+    applies_when: approval-gated Docker operations are required
+    command: |
+      ENABLE_OPERATIONS_RUNNER=1 bash D:/claude-workspace/platform/hermes-platform/start.sh
+    expects: operations-runner healthy on private mission-control-ops-net; no profile agent has Docker socket access
+    validates: |
+      test "$(docker inspect -f '{{.State.Health.Status}}' hermes-platform-operations-runner)" = healthy \
+        && test -z "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/run/docker.sock"}}{{.Source}}{{end}}{{end}}' hermes-pf-littlejohn)"
+
+  - id: R-15
+    applies_when: LittleJohn's on-demand Kali MCP capability is required
+    command: |
+      cd D:/claude-workspace/platform/hermes-platform
+      docker compose --profile kali build kali-mcp-littlejohn
+      docker compose --profile kali create kali-mcp-littlejohn
+    expects: kali-mcp-littlejohn exists in Created state, publishes no host port, and remains off until an exact lifecycle request starts it
+    validates: |
+      test "$(docker inspect -f '{{.State.Status}}' kali-mcp-littlejohn)" = created \
+        && test -z "$(docker port kali-mcp-littlejohn 2>/dev/null)"

@@ -7,7 +7,10 @@
 manifest_version: 2
 stack_name: hermes-platform
 stack_kind: on-demand
-current_service_count: 15
+core_service_count: 15
+optional_service_count: 2
+declared_service_count: 17
+service_count_definition: 15 core services start without Compose profiles; operations-runner and kali-mcp-littlejohn are opt-in.
 upstream_references:
   hermes:      "https://github.com/NousResearch/hermes-agent"
   openviking:  "https://github.com/volcengine/OpenViking"
@@ -82,11 +85,12 @@ invariants:
   - id: I7
     description: |
       Mission Control is an operator UI/control plane, not the memory policy
-      kernel. It stays on platform-net only, holds no OpenViking key, profile
-      bearer token, or Infisical machine identity credential, and reaches
-      profile agents only through their token-gated in-container chat bridges
-      on port 8011. It must not be added to hermes-platform-app-net or
-      hermes-platform-mem-net.
+      kernel. It stays on platform-net for profile/ingress traffic and may join
+      only the private mission-control-ops-net for exact operations-runner
+      requests. It holds no OpenViking key, profile bearer token, Infisical
+      machine identity credential, or Docker socket, and reaches profile agents
+      only through their token-gated in-container chat bridges on port 8011. It
+      must not be added to hermes-platform-app-net or hermes-platform-mem-net.
     verified_by: docker-compose.yml mission-control service; docs/02-SERVICES.md
 
   - id: I8
@@ -126,7 +130,8 @@ invariants:
     description: |
       Windows host operations cross the localhost management boundary through
       Mission Control's file-backed host-operation queue. The default elevated
-      consumer executes only built-in allowlisted remediation IDs. Agent-
+      consumer executes only built-in allowlisted remediation IDs and structured
+      host_filesystem transactions for explicitly allowlisted profiles. Agent-
       submitted PowerShell is review text, not executable input; raw PowerShell
       execution requires the operator to start the runner with the explicit
       HOST_OPERATIONS_ALLOW_RAW_POWERSHELL=1 override.

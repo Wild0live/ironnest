@@ -25,11 +25,11 @@ A multi-profile Hermes runtime fronted by a policy-enforcing memory gateway in f
 4. Bearer tokens never appear in the repo.
 5. SOUL.md content is preserved (always backed up before mutating).
 6. Automatic Hermes conversation memory goes through `ironnest_gateway` to `memory-gateway`; gateway reachability alone is not proof of integration.
-7. Mission Control stays outside the memory policy kernel: platform-net only, no OpenViking/profile bearer tokens, no Infisical machine identity, and no Docker socket.
+7. Mission Control stays outside the memory policy kernel: platform-net for profile/ingress traffic plus private mission-control-ops-net for exact runner requests; no OpenViking/profile bearer tokens, Infisical machine identity, or Docker socket.
 8. Shared Kanban lives only on `/opt/kanban`; it is cross-profile coordination state, not private memory or a secret store.
 9. LittleJohn's Kali MCP is on-demand, has no host port, stays off the memory and shared platform networks, and exposes only its exact lifecycle as pre-approved.
 10. Only `operations-runner` may mount the Docker socket; Mission Control and agents submit exact, persisted, single-use operations instead of receiving raw Docker access.
-11. Windows host operations use the localhost file queue. The default elevated runner executes only built-in remediation IDs; raw PowerShell requires an explicit operator override.
+11. Windows host operations use the localhost file queue. The default elevated runner executes only built-in remediation IDs and structured filesystem transactions; raw PowerShell requires an explicit operator override.
 
 If a proposed change would violate any of these, **stop and ask the operator**. Don't "improve" the architecture out of these constraints — they are the architecture.
 

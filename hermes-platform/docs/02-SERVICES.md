@@ -2,7 +2,7 @@
 
 Machine-readable mirror at `spec/services.yaml`.
 
-Current stack size: **14 core containers** plus **1 optional on-demand Kali MCP container**.
+Current declared stack size: **15 core containers** plus **2 optional containers**. The `operations` and `kali` Compose profiles add `operations-runner` and `kali-mcp-littlejohn`, respectively, for a maximum of 17 declared services.
 
 | Container | Image | Role | Listens | Publishes | Networks |
 |---|---|---|---|---|---|
@@ -10,7 +10,9 @@ Current stack size: **14 core containers** plus **1 optional on-demand Kali MCP 
 | `hermes-platform-ollama` | `ollama/ollama:0.4.6` | Local embedding inference for OpenViking | `11434/tcp` | none | `hermes-platform-mem-net`, `platform-net` |
 | `hermes-platform-openviking` | `platform/hermes-platform-openviking:0.1.0` | Long-term memory backend (volcengine/OpenViking) | `1933/tcp` | none | `hermes-platform-mem-net` |
 | `hermes-platform-memory-gateway` | `platform/hermes-platform-memory-gateway:0.1.0` | Policy-enforcing front door (FastAPI) | `8080/tcp` | `127.0.0.1:18080:8080` | `platform-net`, `hermes-platform-mem-net`, `hermes-platform-app-net`, `ingress` |
-| `hermes-platform-mission-control` | `platform/hermes-platform-mission-control:0.1.0` | Ops dashboard + browser chat control plane | `8080/tcp` | none | `platform-net` |
+| `hermes-platform-mission-control` | `platform/hermes-platform-mission-control:0.1.0` | Ops dashboard + browser chat control plane | `8080/tcp` | none | `platform-net`, `mission-control-ops-net` |
+| `hermes-platform-artifact-apps` | `nginxinc/nginx-unprivileged:alpine` | Read-only, CSP-isolated task Apps origin | `8080/tcp` | none | `platform-net` |
+| `hermes-platform-operations-runner` | `platform/hermes-platform-operations-runner:0.1.0` | Optional exact approval-gated Docker operation executor | `8091/tcp` | none | `mission-control-ops-net` |
 | `hermes-platform-ttyd` | `platform/hermes-agent:v2026.6.19-patched` | Browser terminal + Hermes dashboard for default profile | `7682/tcp`, `9119/tcp` | `127.0.0.1:8123:7682`, `127.0.0.1:8124:9119` | `platform-net`, `ingress` |
 | `hermes-pf-default` | `platform/hermes-agent:v2026.6.19-patched` | Agent (default profile) + Mission Control bridge | `8011/tcp` | none | `platform-net`, `hermes-platform-app-net` |
 | `hermes-pf-mark` | same | Agent (mark profile) + Mission Control bridge | `8011/tcp` | none | same |
@@ -106,7 +108,7 @@ Operational posture:
 
 ## mission-control
 
-`hermes-platform-mission-control` is a standalone FastAPI dashboard at `https://mission.ironnest.local/` through Traefik + Authelia. It is the IronNest Task control plane over Hermes Kanban: operators create goals, orchestrate decomposition, route work to specialists, run assigned tasks, inspect logs/artifacts, publish Reports, preview Apps, and keep security/QA work visible. It is deliberately separate from `memory-gateway`: it holds no OpenViking key, profile token, or Infisical credential, and it is on `platform-net` only.
+`hermes-platform-mission-control` is a standalone FastAPI dashboard at `https://mission.ironnest.local/` through Traefik + Authelia. It is the IronNest Task control plane over Hermes Kanban: operators create goals, orchestrate decomposition, route work to specialists, run assigned tasks, inspect logs/artifacts, publish Reports, preview Apps, and keep security/QA work visible. It is deliberately separate from `memory-gateway`: it holds no OpenViking key, profile token, Infisical credential, or Docker socket. It joins `platform-net` for ingress/profile bridges and the internal `mission-control-ops-net` only for exact requests to `operations-runner`.
 
 Mounted inputs:
 
@@ -139,6 +141,14 @@ Main API surface:
 - `GET/PUT/DELETE /api/agent/{profile}/avatar` — dashboard avatar metadata.
 
 Writes can be additionally gated by `MISSION_CONTROL_ADMIN_TOKEN`. If unset, the Authelia FIDO gate is the write boundary.
+
+## artifact-apps
+
+`hermes-platform-artifact-apps` is a core, read-only nginx service routed at `https://apps.ironnest.local/`. It mounts the shared Kanban artifacts volume read-only and serves folders containing `index.html` on a separate origin from Mission Control. Its CSP blocks agent-authored Apps from calling Mission Control or external hosts, and the service has no API, secrets, or write path.
+
+## operations-runner
+
+`hermes-platform-operations-runner` is optional under the `operations` Compose profile. It is the only Hermes Platform service with Docker-socket access and communicates with Mission Control only over the internal `mission-control-ops-net`. It validates exact allowlisted requests, records request IDs in `hermes-platform_operations-runner-state`, rejects replay, and exposes no raw Docker API. It does not join `platform-net`, either memory network, or any profile-agent network.
 
 ## hermes-platform-ttyd
 

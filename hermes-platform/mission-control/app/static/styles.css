@@ -99,7 +99,10 @@ button:hover {
 }
 
 nav {
-  display: grid;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
   gap: 4px;
 }
 
@@ -136,6 +139,11 @@ nav {
   color: var(--text);
   background: var(--panel-soft);
   border-color: var(--line);
+}
+
+.nav-item[data-view="settings"] {
+  order: 100;
+  margin-top: auto;
 }
 
 .nav-badge { margin-left: auto; min-width: 20px; height: 20px; padding: 0 6px; display: inline-grid; place-items: center; border-radius: 999px; background: var(--amber); color: var(--ink); font-size: 11px; font-weight: 800; }
@@ -1745,6 +1753,54 @@ menu {
 .settings-status { color: var(--muted); font-size: 12px; min-height: 16px; margin: 8px 0 0; }
 .settings-dialog menu button.primary { color: var(--green); border-color: #244e3a; }
 
+/* ── System Settings ─────────────────────────────────────────────────────── */
+.system-settings-panel { max-width: 980px; }
+.settings-page-head { align-items: flex-start; }
+.settings-page-head p,
+.settings-card p,
+.settings-page-hint { color: var(--muted); font-size: 13px; margin: 7px 0 0; }
+.settings-card {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel-soft);
+}
+.settings-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.settings-card h3 { margin: 0; font-size: 17px; }
+.trusted-fido-list { display: grid; gap: 10px; margin-top: 14px; }
+.trusted-fido-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #111821;
+}
+.trusted-fido-card > div:first-child { min-width: 220px; }
+.trusted-fido-card p { margin-top: 5px; }
+.trusted-fido-card code { color: var(--blue); font-size: 11.5px; }
+.trusted-fido-card dl { display: flex; gap: 18px; margin: 0; color: var(--muted); font-size: 12px; }
+.trusted-fido-card dt { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: #738095; }
+.trusted-fido-card dd { margin: 3px 0 0; color: var(--text); }
+.trusted-fido-actions { display: flex; justify-content: flex-end; }
+.trusted-fido-actions .ghost-btn { min-height: 30px; padding: 0 11px; white-space: nowrap; }
+@media (max-width: 700px) {
+  .settings-card-head,
+  .trusted-fido-card { flex-direction: column; }
+  .settings-card-head .approval-request { margin-left: 0; }
+  .trusted-fido-card dl { flex-direction: column; gap: 8px; }
+  .trusted-fido-card > div:first-child { min-width: 0; }
+  .trusted-fido-actions { justify-content: flex-start; width: 100%; }
+}
+
 /* ── Approval-gated Docker operations ────────────────────────────────────── */
 .approvals-panel { max-width: 980px; }
 .approvals-head { align-items: flex-start; gap: 18px; }
@@ -1969,6 +2025,7 @@ menu {
 .chat-approval-panel { margin: 14px 0 4px; padding: 12px; border: 1px solid #31588d; border-radius: 9px; background: #172333; }
 .chat-approval-panel-title { color: var(--blue); font-weight: 750; margin-bottom: 8px; }
 .chat-approval-panel-title span { display: inline-grid; place-items: center; min-width: 19px; height: 19px; padding: 0 5px; border-radius: 10px; background: var(--amber); color: #211705; font-size: 11px; }
+.chat-approval-hint { margin: -2px 0 8px; color: var(--muted); font-size: 12px; }
 .chat-approval-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-top: 1px solid var(--line); }
 .chat-approval-row p { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
 .chat-approval-row .chat-approval-btn { margin: 0; white-space: nowrap; }

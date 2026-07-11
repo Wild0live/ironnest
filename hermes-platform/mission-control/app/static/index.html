@@ -37,6 +37,10 @@
             <svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
             <span>Approvals</span><span id="approvalBadge" class="nav-badge" hidden>0</span>
           </button>
+          <button class="nav-item" data-view="settings">
+            <svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15.5A3.5 3.5 0 1 0 12 8a3.5 3.5 0 0 0 0 7.5z"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06A2 2 0 1 1 7.04 4.3l.06.06A1.65 1.65 0 0 0 8.92 4a1.65 1.65 0 0 0 1-1.51V2a2 2 0 1 1 4 0v.49a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            <span>System Settings</span>
+          </button>
           <button class="nav-item" data-view="reports">
             <svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="13" y2="16"/></svg>
             <span>Reports</span>
@@ -130,7 +134,7 @@
         <section class="view" id="view-approvals">
           <section class="panel approvals-panel">
             <div class="panel-head approvals-head">
-              <div><h2>Mission Control Approvals</h2><p>Octo’s Docker requests stay pending until an operator approves and executes them.</p></div>
+              <div><h2>Mission Control Approvals</h2><p>Agent operations stay pending until an operator approves them with a registered FIDO key touch.</p></div>
               <button id="requestApprovalBtn" class="approval-request">Request review</button>
             </div>
             <p id="approvalRunnerHint" class="approval-runner"></p>
@@ -142,6 +146,28 @@
               <label class="approval-archive-toggle"><input type="checkbox" id="approvalArchivedToggle" /> Include archived</label>
             </div>
             <div id="approvalList" class="approval-list"><p class="empty">Loading approvals…</p></div>
+          </section>
+        </section>
+
+        <section class="view" id="view-settings">
+          <section class="panel system-settings-panel">
+            <div class="panel-head settings-page-head">
+              <div>
+                <h2>System Settings</h2>
+                <p>Configure Mission Control trust settings that apply across all agent approval threads.</p>
+              </div>
+            </div>
+            <article class="settings-card">
+              <div class="settings-card-head">
+                <div>
+                  <h3>Trusted FIDO approval keys</h3>
+                  <p>Register physical security keys that may approve host operations from Mission Control chat threads.</p>
+                </div>
+                <button id="registerTrustedFidoKeyBtn" class="approval-request" type="button">Add trusted FIDO key</button>
+              </div>
+              <p id="trustedFidoSummary" class="settings-page-hint">Loading trusted keys…</p>
+              <div id="trustedFidoList" class="trusted-fido-list"><p class="empty">Loading trusted keys…</p></div>
+            </article>
           </section>
         </section>
 
@@ -378,7 +404,7 @@
     <dialog id="approvalRequestDialog" class="approval-dialog">
       <button type="button" class="dialog-close" aria-label="Close">✕</button>
       <form method="dialog" id="approvalRequestForm">
-        <h2>Request Docker action review</h2>
+          <h2>Request operation review</h2>
         <p class="dialog-hint">This only creates a request. It cannot run until an operator explicitly approves it.</p>
         <label>Action<select name="action"><option value="restart">Restart container</option><option value="start">Start container</option><option value="stop">Stop container</option></select></label>
         <label>Target<select name="target" id="operationTarget" required></select></label>

@@ -201,7 +201,7 @@ Full tree: [`docs/03-DIRECTORY-STRUCTURE.md`](docs/03-DIRECTORY-STRUCTURE.md).
 | Shared work board | `/opt/kanban` is cross-profile by design; keep it secret-free |
 | Container hardening | `cap_drop: ALL`, `no-new-privileges:true`, non-root users |
 | Audit | JSONL log to `/var/log/gateway/audit.log` + stderr to fluent-bit → Wazuh |
-| Mission Control | Separate from memory-gateway; platform-net only; no OpenViking/profile bearer secrets |
+| Mission Control | Separate from memory-gateway; platform-net plus private operations channel only; no OpenViking/profile bearer secrets or Docker socket |
 
 Full model: [`docs/08-SECURITY-MODEL.md`](docs/08-SECURITY-MODEL.md).
 

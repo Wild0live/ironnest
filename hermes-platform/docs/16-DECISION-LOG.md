@@ -4,6 +4,35 @@ Architectural choices made during the design of hermes-platform v0.1.0. Each ent
 
 ---
 
+## D-018 — Host filesystem access uses two-step transactions, not mounts
+
+**Date:** 2026-07-11
+**Status:** accepted
+
+**Decision:** Allow only `default` (Dr. Smith), `littlejohn`, and `octo` to
+submit Windows host filesystem transaction proposals. Mission Control stores
+each proposal in the existing approvals ledger and writes approved work to the
+localhost queue as `host_filesystem`. The local scoped runner supports
+`prepare` transactions for read/list evidence and staged changes, and separate
+`commit` transactions that apply only a previously prepared request. Containers
+do not receive host bind mounts, raw shell access, or reusable host credentials.
+
+**Rationale:** The operator wants broad local-folder reach gated by a hardware
+key touch, but direct host mounts or raw administrator shell access would
+violate the host boundary. A two-step transaction keeps the privileged action
+local and inspectable: the first approval gathers evidence and stages bytes,
+while the second approval is the moment files are changed. The runner rejects
+UNC/device/ADS paths and Windows reparse points to avoid unexpected escape
+through symlinks, junctions, or mount points.
+
+**Impacts:** `mission-control/app/main.py`,
+`local-host-runner/scoped-remediation-runner.py`,
+`agent-bridge/request-host-filesystem.py`, `docker-compose.yml`,
+`services.d/hermes-pf-octo.yml`, and
+`docs/19-APPROVAL-GATED-OPERATIONS.md`.
+
+---
+
 ## D-017 — Windows host remediation defaults to local allowlisted implementations
 
 **Date:** 2026-07-11
@@ -332,6 +361,8 @@ Invariant I3 (per-profile volume isolation) was designed for the AGENT container
 **Status:** accepted
 
 **Decision:** Keep `hermes-platform-mission-control` as a standalone FastAPI/browser dashboard on `platform-net` only. It reads registry, policies, and gateway audit log read-only; owns only `hermes-platform_mission-control-state`; and talks to profile agents through their in-container `agent-chat-bridge.py` listeners on `8011/tcp`. It is not part of `memory-gateway`, does not join `hermes-platform-app-net` or `hermes-platform-mem-net`, and receives no OpenViking key, profile memory bearer token, Infisical machine identity credential, or Docker socket.
+
+**Subsequent state (2026-07-11):** D-014's “platform-net only” language now means no memory-network membership. Mission Control also joins the private `mission-control-ops-net` solely to submit exact requests to `operations-runner`; it still receives no Docker socket and does not join either memory network.
 
 **What Mission Control can do:**
 - Show profile roster, policy-loaded state, recent memory audit activity, tasks, schedules, docs, team, and office views.

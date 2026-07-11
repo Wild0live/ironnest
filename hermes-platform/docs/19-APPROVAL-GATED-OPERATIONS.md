@@ -147,6 +147,95 @@ Example approval:
 {"approved_by":"Phoenix","note":"Reviewed image, bind path, and command."}
 ```
 
+## FIDO approval passkey
+
+Mission Control approvals require a registered WebAuthn/passkey credential in
+addition to the normal Mission Control session. Use the **Register approval
+key** button in Mission Control while browsing
+`https://mission.ironnest.local`; the browser will ask for a FIDO key touch and
+Mission Control stores only the public credential material.
+
+Every `POST /api/operations/{id}/approve` request must include a fresh WebAuthn
+assertion bound to that exact operation ID. Mission Control verifies the RP ID
+(`mission.ironnest.local` by default), origin, challenge, signature, and user
+presence flag before the request can reach the runner.
+
+## Windows filesystem transactions
+
+`host_filesystem` is the approved broad-folder lane for Dr. Smith (`default`),
+Little John, and Octo. It is intentionally not a host mount, shell, SMB share,
+or raw PowerShell wrapper. The profile submits structured JSON, Mission Control
+records the proposal, and the local Windows runner performs only the supported
+filesystem operations after approval.
+
+Supported `prepare` operations:
+
+- `list` with `path`, optional `recursive`, optional `max_entries`
+- `read` with `path`, optional `max_bytes`
+- `stage_write` with `path`, `content_b64`, optional `overwrite`
+- `stage_mkdir` with `path`
+- `stage_delete` with `path`, optional `recursive`
+- `stage_copy` with `src`, `dst`, optional `overwrite`
+- `stage_move` with `src`, `dst`, optional `overwrite`
+
+`prepare` can read/list immediately and can stage future changes, but it does
+not modify target files. The result returns a `transaction_id`. To apply the
+staged changes, submit a second request:
+
+```json
+{
+  "mode": "commit",
+  "profile": "octo",
+  "prepare_request_id": "op-00000000000000000000000000000000"
+}
+```
+
+That commit request must also be approved before anything is changed. The runner
+rejects UNC paths, device paths, alternate data stream paths, and Windows
+reparse points. Execution of host programs is not part of this lane; use a
+separate reviewed remediation ID for executable behavior.
+
+Example prepare transaction:
+
+```json
+{
+  "mode": "prepare",
+  "profile": "default",
+  "operations": [
+    {"op": "list", "path": "D:\\claude-workspace", "max_entries": 50},
+    {"op": "read", "path": "D:\\claude-workspace\\README.md", "max_bytes": 65536},
+    {
+      "op": "stage_write",
+      "path": "D:\\claude-workspace\\codex-tmp\\host-fs-smoke.txt",
+      "content_b64": "SGVsbG8gZnJvbSBJcm9uTmVzdAo=",
+      "overwrite": true
+    }
+  ]
+}
+```
+
+Submit from an approved profile container:
+
+```bash
+/opt/ironnest/request-host-filesystem.py \
+  "Host filesystem prepare: docs smoke test" \
+  --transaction-file /opt/shared/mine/host-fs-prepare.json \
+  --reason "Read workspace metadata and stage a reviewed write" \
+  --risk high
+```
+
+For the common read-only case, Dr. Smith and Little John can also submit from
+Mission Control chat:
+
+```text
+/hostfs list "D:\path\to\folder" --max 200
+/hostfs list "D:\path\to\folder" --recursive --max 500
+/hostfs read "D:\path\to\folder\file.txt" --max-bytes 65536
+```
+
+The chat command only creates a pending `prepare` approval. The operator still
+approves it in Mission Control before the Windows runner reads the host path.
+
 ## Extending safely
 
 Do not add a generic command endpoint or a standing raw Docker proxy. Add new

@@ -51,7 +51,7 @@ This builds `openviking`, `memory-gateway`, and `mission-control` images; the `p
 ```bash
 bash start.sh
 ```
-Waits for the current 13-container stack to be healthy: OpenViking Infisical sidecar, Ollama, OpenViking, memory-gateway, Mission Control, ttyd, and all registered `hermes-pf-*` agents (currently 7). Verifies OpenViking is unreachable from hermes-pf-mark (proves the network segmentation invariant I1). Brings up the dockerized `ollama` service with `mxbai-embed-large` (auto-pulls on first start; ~670MB, ~30-60s).
+Waits for the **15 core services** to be healthy: OpenViking Infisical sidecar, Ollama, OpenViking, memory-gateway, Mission Control, artifact-apps, ttyd, and all eight registered `hermes-pf-*` agents. The optional `operations` and `kali` Compose profiles are not started by default. The health gate verifies that OpenViking is unreachable from profile agents (invariant I1), Mission Control can reach every profile bridge, and the Apps origin is healthy. The dockerized `ollama` service auto-pulls `mxbai-embed-large` on first start (~670 MB, usually 30-60 seconds).
 
 `hermes-platform-ttyd` comes up as the browser terminal at `127.0.0.1:8123` and Hermes dashboard at `127.0.0.1:8124`; both are also routed through Traefik as `https://hermes-platform.ironnest.local/` and `https://hermes-platform-dashboard.ironnest.local/`. ttyd Basic Auth is disabled behind Authelia because Authelia consumes the `Authorization` header; the FIDO gate is the auth boundary. Mission Control is routed at `https://mission.ironnest.local/`.
 

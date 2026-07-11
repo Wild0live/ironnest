@@ -46,6 +46,7 @@ services:
       no_proxy:    "memory-gateway,mission-control,browser-intent-mcp,infisical,adguard,squid,socket-proxy,localhost,127.0.0.1,.local"
       MEMORY_GATEWAY_URL: "http://memory-gateway:8080"
       MISSION_CONTROL_URL: "http://mission-control:8080"
+      MC_HOST_OPERATIONS_URL: "http://mission-control:8080"
       TELEGRAM_REQUIRE_MENTION: "true"
       HERMES_KANBAN_HOME: "/opt/kanban"   # join the shared Kanban board
     command:
@@ -72,6 +73,7 @@ services:
       - ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
       - ./hermes-profile-entrypoint.sh:/opt/ironnest/hermes-profile-entrypoint.sh:ro
       - ./agent-bridge/agent-chat-bridge.py:/opt/ironnest/agent-chat-bridge.py:ro
+      - ./agent-bridge/request-host-filesystem.py:/opt/ironnest/request-host-filesystem.py:ro
       - kanban-shared:/opt/kanban   # shared Kanban board (HERMES_KANBAN_HOME)
     networks:
       - platform-net

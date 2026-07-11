@@ -17,11 +17,14 @@ gateway, or profile credentials.
 from __future__ import annotations
 
 import concurrent.futures
+import base64
+import hashlib
 import hmac
 import io
 import json
 import os
 import re
+import shlex
 import threading
 import time
 import zipfile
@@ -33,7 +36,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+import cbor2
 import yaml
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.hashes import SHA256
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -70,11 +77,23 @@ OPERATIONS_RETENTION_DAYS = int(os.environ.get("OPERATIONS_RETENTION_DAYS", "180
 # Scoped credential held by Octo and Mission Control only. It authorizes a
 # *proposal*, never Docker execution or approval.
 OCTO_OPERATIONS_SUBMIT_TOKEN = os.environ.get("OCTO_OPERATIONS_SUBMIT_TOKEN", "").strip()
+# Dr. Smith / default may submit Windows filesystem transaction proposals only.
+# This is a proposal credential, not an approval or execution credential.
+DEFAULT_OPERATIONS_SUBMIT_TOKEN = os.environ.get("DEFAULT_OPERATIONS_SUBMIT_TOKEN", "").strip()
 # Little John may submit a reviewed Windows-host remediation proposal only.
 # This credential never authorizes approval or execution.
 LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN = os.environ.get("LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN", "").strip()
 LITTLEJOHN_PREAPPROVED_LIFECYCLE_TARGETS = frozenset(item.strip() for item in os.environ.get(
     "LITTLEJOHN_PREAPPROVED_LIFECYCLE_TARGETS", "").split(",") if item.strip())
+HOST_FILESYSTEM_ALLOWED_PROFILES = frozenset(item.strip() for item in os.environ.get(
+    "HOST_FILESYSTEM_ALLOWED_PROFILES", "default,littlejohn,octo").split(",") if item.strip())
+HOST_FILESYSTEM_CHAT_PROFILES = frozenset(item.strip() for item in os.environ.get(
+    "HOST_FILESYSTEM_CHAT_PROFILES", "default,littlejohn").split(",") if item.strip())
+APPROVAL_WEBAUTHN_RP_ID = os.environ.get("APPROVAL_WEBAUTHN_RP_ID", "mission.ironnest.local").strip()
+APPROVAL_WEBAUTHN_ORIGINS = frozenset(item.strip() for item in os.environ.get(
+    "APPROVAL_WEBAUTHN_ORIGINS", "https://mission.ironnest.local").split(",") if item.strip())
+APPROVAL_WEBAUTHN_TIMEOUT_MS = int(os.environ.get("APPROVAL_WEBAUTHN_TIMEOUT_MS", "60000"))
+APPROVAL_WEBAUTHN_CHALLENGE_TTL = int(os.environ.get("APPROVAL_WEBAUTHN_CHALLENGE_TTL_SECONDS", "120"))
 HOST_OPERATIONS_RUNNER_URL = os.environ.get("HOST_OPERATIONS_RUNNER_URL", "").rstrip("/")
 HOST_OPERATIONS_RUNNER_TOKEN = os.environ.get("HOST_OPERATIONS_RUNNER_TOKEN", "").strip()
 HOST_OPERATIONS_QUEUE_DIR = Path(os.environ.get("HOST_OPERATIONS_QUEUE_DIR", "").strip())
@@ -149,7 +168,7 @@ class AgentChat(BaseModel):
     attachments: list[Attachment] = Field(default_factory=list)
 
 
-OperationAction = Literal["start", "stop", "restart", "docker_api", "host_powershell"]
+OperationAction = Literal["start", "stop", "restart", "docker_api", "host_powershell", "host_filesystem"]
 
 
 class OperationRequestCreate(BaseModel):
@@ -169,12 +188,31 @@ class OperationRequestCreate(BaseModel):
     # Optional narrow-runner selector. A scoped host runner may ignore script
     # text and execute only its local implementation for this ID.
     remediation_id: str | None = Field(default=None, max_length=80)
+    # Only used for host_filesystem. This is structured JSON consumed by the
+    # local Windows runner; it is not script or shell text.
+    filesystem_transaction: dict[str, Any] | None = None
     risk: Literal["low", "medium", "high", "critical"] = "medium"
 
 
 class OperationApproval(BaseModel):
     approved_by: str = Field(..., min_length=1, max_length=80)
     note: str = Field(default="", max_length=500)
+    webauthn: dict[str, Any] | None = None
+
+
+class WebAuthnRegistrationStart(BaseModel):
+    name: str = Field(default="Approval key", min_length=1, max_length=80)
+
+
+class WebAuthnCredentialResponse(BaseModel):
+    id: str = Field(..., min_length=1, max_length=2000)
+    rawId: str = Field(..., min_length=1, max_length=2000)
+    type: str = Field(default="public-key", max_length=40)
+    response: dict[str, Any]
+
+
+class WebAuthnCredentialRename(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
 
 
 class AppReleasePublish(BaseModel):
@@ -224,6 +262,17 @@ def require_octo_operations_submit(
                             detail="operations submission token required")
 
 
+def require_default_operations_submit(
+    x_operations_submit_token: str | None = Header(default=None),
+) -> None:
+    if not DEFAULT_OPERATIONS_SUBMIT_TOKEN:
+        raise HTTPException(status_code=503, detail="Dr. Smith filesystem submission is not configured")
+    if not x_operations_submit_token or not hmac.compare_digest(
+            x_operations_submit_token, DEFAULT_OPERATIONS_SUBMIT_TOKEN):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="operations submission token required")
+
+
 def require_littlejohn_operations_submit(
     x_operations_submit_token: str | None = Header(default=None),
 ) -> None:
@@ -254,6 +303,7 @@ def _default_store() -> dict[str, Any]:
         ],
         "schedules": [],
         "operations": [],
+        "approval_webauthn": {"credentials": [], "challenges": []},
         # Release metadata is Mission Control-owned. It never changes the
         # gateway-owned artifacts that supplied the runnable app.
         "app_releases": [],
@@ -274,6 +324,9 @@ def _read_store() -> dict[str, Any]:
     data.setdefault("tasks", [])
     data.setdefault("schedules", [])
     data.setdefault("operations", [])
+    data.setdefault("approval_webauthn", {"credentials": [], "challenges": []})
+    data["approval_webauthn"].setdefault("credentials", [])
+    data["approval_webauthn"].setdefault("challenges", [])
     data.setdefault("app_releases", [])
     data.setdefault("app_candidates", [])
     return data
@@ -286,6 +339,179 @@ def _write_store(data: dict[str, Any]) -> None:
     with _STORE_LOCK:
         tmp.write_text(body, encoding="utf-8")
         os.replace(tmp, STATE_FILE)
+
+
+def _b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _unb64u(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _webauthn_store(store: dict[str, Any]) -> dict[str, Any]:
+    data = store.setdefault("approval_webauthn", {"credentials": [], "challenges": []})
+    data.setdefault("credentials", [])
+    data.setdefault("challenges", [])
+    return data
+
+
+def _new_webauthn_challenge(store: dict[str, Any], purpose: str,
+                            operation_id: str | None = None,
+                            name: str = "") -> str:
+    data = _webauthn_store(store)
+    now = time.time()
+    data["challenges"] = [
+        c for c in data.get("challenges", [])
+        if float(c.get("expires_at", 0)) > now and not c.get("used")
+    ]
+    challenge = _b64u(os.urandom(32))
+    data["challenges"].append({
+        "challenge": challenge,
+        "purpose": purpose,
+        "operation_id": operation_id or "",
+        "name": name,
+        "expires_at": now + APPROVAL_WEBAUTHN_CHALLENGE_TTL,
+        "created_at": _now(),
+    })
+    return challenge
+
+
+def _consume_webauthn_challenge(store: dict[str, Any], challenge: str,
+                                purpose: str, operation_id: str | None = None) -> dict[str, Any]:
+    data = _webauthn_store(store)
+    now = time.time()
+    for item in data.get("challenges", []):
+        if item.get("challenge") != challenge or item.get("purpose") != purpose:
+            continue
+        if (operation_id or "") != str(item.get("operation_id", "")):
+            continue
+        if item.get("used") or float(item.get("expires_at", 0)) <= now:
+            raise HTTPException(status_code=409, detail="WebAuthn challenge expired")
+        item["used"] = True
+        return item
+    raise HTTPException(status_code=409, detail="WebAuthn challenge not found")
+
+
+def _client_data(response: dict[str, Any], expected_type: str) -> tuple[dict[str, Any], bytes, str]:
+    raw = _unb64u(str(response.get("clientDataJSON", "")))
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="invalid WebAuthn clientDataJSON") from exc
+    if data.get("type") != expected_type:
+        raise HTTPException(status_code=400, detail="unexpected WebAuthn client data type")
+    origin = str(data.get("origin", ""))
+    if origin not in APPROVAL_WEBAUTHN_ORIGINS:
+        raise HTTPException(status_code=403, detail="unexpected WebAuthn origin")
+    challenge = str(data.get("challenge", ""))
+    if not challenge:
+        raise HTTPException(status_code=400, detail="missing WebAuthn challenge")
+    return data, raw, challenge
+
+
+def _parse_authenticator_data(auth_data: bytes) -> dict[str, Any]:
+    if len(auth_data) < 37:
+        raise HTTPException(status_code=400, detail="invalid WebAuthn authenticator data")
+    rp_hash = auth_data[:32]
+    expected_rp_hash = hashlib.sha256(APPROVAL_WEBAUTHN_RP_ID.encode("utf-8")).digest()
+    if rp_hash != expected_rp_hash:
+        raise HTTPException(status_code=403, detail="WebAuthn RP ID mismatch")
+    flags = auth_data[32]
+    if not flags & 0x01:
+        raise HTTPException(status_code=403, detail="FIDO key touch/user presence is required")
+    sign_count = int.from_bytes(auth_data[33:37], "big")
+    out: dict[str, Any] = {"flags": flags, "sign_count": sign_count}
+    if flags & 0x40:
+        pos = 37
+        if len(auth_data) < pos + 18:
+            raise HTTPException(status_code=400, detail="invalid attested credential data")
+        out["aaguid"] = _b64u(auth_data[pos:pos + 16]); pos += 16
+        cred_len = int.from_bytes(auth_data[pos:pos + 2], "big"); pos += 2
+        cred_id = auth_data[pos:pos + cred_len]; pos += cred_len
+        if not cred_id:
+            raise HTTPException(status_code=400, detail="empty WebAuthn credential id")
+        try:
+            cose_key = cbor2.loads(auth_data[pos:])
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail="invalid WebAuthn credential public key") from exc
+        out["credential_id"] = cred_id
+        out["cose_key"] = cose_key
+    return out
+
+
+def _public_key_from_cose(cose_key: dict[Any, Any]) -> ec.EllipticCurvePublicKey:
+    if cose_key.get(1) != 2 or cose_key.get(3) != -7 or cose_key.get(-1) != 1:
+        raise HTTPException(status_code=400, detail="only ES256 approval passkeys are supported")
+    x = cose_key.get(-2)
+    y = cose_key.get(-3)
+    if not isinstance(x, bytes) or not isinstance(y, bytes) or len(x) != 32 or len(y) != 32:
+        raise HTTPException(status_code=400, detail="invalid ES256 public key coordinates")
+    numbers = ec.EllipticCurvePublicNumbers(int.from_bytes(x, "big"),
+                                            int.from_bytes(y, "big"),
+                                            ec.SECP256R1())
+    return numbers.public_key()
+
+
+def _webauthn_credentials(store: dict[str, Any]) -> list[dict[str, Any]]:
+    return list(_webauthn_store(store).get("credentials", []))
+
+
+def _verify_webauthn_registration(payload: WebAuthnCredentialResponse) -> dict[str, Any]:
+    store = _read_store()
+    response = payload.response
+    client, _client_raw, challenge = _client_data(response, "webauthn.create")
+    challenge_item = _consume_webauthn_challenge(store, challenge, "register")
+    attestation_object = cbor2.loads(_unb64u(str(response.get("attestationObject", ""))))
+    auth_data = _parse_authenticator_data(attestation_object.get("authData", b""))
+    credential_id = _b64u(auth_data["credential_id"])
+    if credential_id != payload.rawId:
+        raise HTTPException(status_code=400, detail="credential id mismatch")
+    data = _webauthn_store(store)
+    if any(c.get("id") == credential_id for c in data.get("credentials", [])):
+        raise HTTPException(status_code=409, detail="approval passkey is already registered")
+    cose_bytes = cbor2.dumps(auth_data["cose_key"])
+    credential = {
+        "id": credential_id,
+        "name": str(challenge_item.get("name") or "Approval key")[:80],
+        "public_key_cose": _b64u(cose_bytes),
+        "sign_count": int(auth_data.get("sign_count", 0)),
+        "created_at": _now(),
+        "last_used_at": None,
+        "origin": client.get("origin", ""),
+    }
+    data["credentials"].append(credential)
+    _write_store(store)
+    return credential
+
+
+def _verify_webauthn_assertion(store: dict[str, Any], operation: dict[str, Any],
+                               payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not payload:
+        raise HTTPException(status_code=428, detail="FIDO key touch is required for approval")
+    credentials = _webauthn_credentials(store)
+    if not credentials:
+        raise HTTPException(status_code=409, detail="register an approval passkey first")
+    credential_id = str(payload.get("rawId") or payload.get("id") or "")
+    credential = next((c for c in credentials if c.get("id") == credential_id), None)
+    if not credential:
+        raise HTTPException(status_code=403, detail="unknown approval passkey")
+    response = payload.get("response") or {}
+    _client, client_raw, challenge = _client_data(response, "webauthn.get")
+    _consume_webauthn_challenge(store, challenge, "approve", str(operation.get("id", "")))
+    auth_data_raw = _unb64u(str(response.get("authenticatorData", "")))
+    auth_data = _parse_authenticator_data(auth_data_raw)
+    signature = _unb64u(str(response.get("signature", "")))
+    cose = cbor2.loads(_unb64u(str(credential.get("public_key_cose", ""))))
+    public_key = _public_key_from_cose(cose)
+    signed = auth_data_raw + hashlib.sha256(client_raw).digest()
+    try:
+        public_key.verify(signature, signed, ec.ECDSA(SHA256()))
+    except InvalidSignature as exc:
+        raise HTTPException(status_code=403, detail="invalid FIDO approval signature") from exc
+    credential["sign_count"] = max(int(credential.get("sign_count", 0)), int(auth_data.get("sign_count", 0)))
+    credential["last_used_at"] = _now()
+    return credential
 
 
 # ── Read-only views of gateway-owned files ──────────────────────────────────
@@ -582,6 +808,84 @@ def conv_append(profile: str, conv: str, message: dict[str, Any],
         _write_json(_index_path(profile), {"conversations": convs})
 
 
+def _strip_token_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _parse_hostfs_chat_command(message: str) -> dict[str, Any] | None:
+    raw = (message or "").strip()
+    if not raw.lower().startswith("/hostfs"):
+        return None
+    try:
+        tokens = [_strip_token_quotes(t) for t in shlex.split(raw, posix=False)]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid /hostfs command: {exc}") from exc
+    if not tokens or tokens[0].lower() != "/hostfs":
+        return None
+    if len(tokens) < 3:
+        raise HTTPException(status_code=400, detail='usage: /hostfs list "D:\\Folder" [--recursive] [--max 200] or /hostfs read "D:\\Folder\\file.txt" [--max-bytes 65536]')
+    mode = tokens[1].lower()
+    if mode not in {"list", "read"}:
+        raise HTTPException(status_code=400, detail="hostfs command must be list or read")
+    recursive = False
+    max_entries = 200
+    max_bytes = 65536
+    path_parts: list[str] = []
+    i = 2
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "--recursive":
+            recursive = True
+        elif token == "--max":
+            i += 1
+            if i >= len(tokens):
+                raise HTTPException(status_code=400, detail="--max requires a value")
+            max_entries = max(1, min(int(tokens[i]), 2000))
+        elif token == "--max-bytes":
+            i += 1
+            if i >= len(tokens):
+                raise HTTPException(status_code=400, detail="--max-bytes requires a value")
+            max_bytes = max(1, min(int(tokens[i]), 10 * 1024 * 1024))
+        else:
+            path_parts.append(token)
+        i += 1
+    path = " ".join(path_parts).strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="hostfs command requires a Windows path")
+    if mode == "list":
+        op = {"op": "list", "path": path, "recursive": recursive, "max_entries": max_entries}
+    else:
+        op = {"op": "read", "path": path, "max_bytes": max_bytes}
+    return {"mode": mode, "path": path, "operation": op}
+
+
+def _handle_hostfs_chat_command(profile: str, conv: str, message: str) -> dict[str, Any] | None:
+    parsed = _parse_hostfs_chat_command(message)
+    if parsed is None:
+        return None
+    if profile not in HOST_FILESYSTEM_CHAT_PROFILES:
+        raise HTTPException(status_code=403, detail="host filesystem chat commands are enabled only for Dr. Smith and Little John")
+    tx = {"mode": "prepare", "profile": profile, "operations": [parsed["operation"]]}
+    req = OperationRequestCreate(
+        action="host_filesystem",
+        target=f"Host filesystem {parsed['mode']}: {parsed['path'][:96]}",
+        reason=f"Chat-requested host filesystem {parsed['mode']} from {profile}.",
+        requested_by=profile,
+        filesystem_transaction=tx,
+        risk="high",
+    )
+    item = _create_operation_request(req, requested_by=profile, conversation_id=conv)
+    reply = (
+        f"Host filesystem {parsed['mode']} request created: `{item['id']}`.\n\n"
+        "Approve it in Mission Control Approvals. This is a prepare-only request, "
+        "so it will list/read and return evidence without changing host files."
+    )
+    return {"ok": True, "reply": reply, "approval_id": item["id"], "request": _operation_view(item)}
+
+
 def set_auto_title(profile: str, conv: str, title: str) -> bool:
     """Upgrade a conversation's title to an LLM-generated one — but ONLY if it's
     still auto (the user hasn't renamed it) and hasn't already been LLM-titled.
@@ -789,6 +1093,104 @@ def terminal_targets() -> JSONResponse:
     return JSONResponse(content={"targets": targets})
 
 
+@router.get("/api/approval-webauthn/status")
+def approval_webauthn_status(_: None = Depends(require_admin)) -> JSONResponse:
+    store = _read_store()
+    creds = _webauthn_credentials(store)
+    return JSONResponse(content={
+        "rp_id": APPROVAL_WEBAUTHN_RP_ID,
+        "origins": sorted(APPROVAL_WEBAUTHN_ORIGINS),
+        "credential_count": len(creds),
+        "credentials": [{"id": c.get("id"), "name": c.get("name"), "created_at": c.get("created_at"),
+                         "last_used_at": c.get("last_used_at"),
+                         "renamed_at": c.get("renamed_at")} for c in creds],
+    })
+
+
+@router.post("/api/approval-webauthn/register/options")
+def approval_webauthn_register_options(req: WebAuthnRegistrationStart,
+                                       _: None = Depends(require_admin)) -> JSONResponse:
+    store = _read_store()
+    challenge = _new_webauthn_challenge(store, "register", name=req.name.strip())
+    _write_store(store)
+    user_id = _b64u(os.urandom(16))
+    return JSONResponse(content={"publicKey": {
+        "challenge": challenge,
+        "rp": {"name": "IronNest Mission Control", "id": APPROVAL_WEBAUTHN_RP_ID},
+        "user": {"id": user_id, "name": "mission-control-approver",
+                 "displayName": req.name.strip()},
+        "pubKeyCredParams": [{"type": "public-key", "alg": -7}],
+        "timeout": APPROVAL_WEBAUTHN_TIMEOUT_MS,
+        "attestation": "none",
+        "authenticatorSelection": {
+            "authenticatorAttachment": "cross-platform",
+            "residentKey": "discouraged",
+            "requireResidentKey": False,
+            "userVerification": "discouraged",
+        },
+    }})
+
+
+@router.post("/api/approval-webauthn/register/verify")
+def approval_webauthn_register_verify(req: WebAuthnCredentialResponse,
+                                      _: None = Depends(require_admin)) -> JSONResponse:
+    credential = _verify_webauthn_registration(req)
+    return JSONResponse(content={"ok": True, "credential": {
+        "id": credential["id"],
+        "name": credential["name"],
+        "created_at": credential["created_at"],
+    }})
+
+
+@router.patch("/api/approval-webauthn/credentials/{credential_id}")
+def approval_webauthn_credential_rename(credential_id: str, req: WebAuthnCredentialRename,
+                                        _: None = Depends(require_admin)) -> JSONResponse:
+    store = _read_store()
+    credentials = _webauthn_store(store).get("credentials", [])
+    credential = next((c for c in credentials if c.get("id") == credential_id), None)
+    if credential is None:
+        raise HTTPException(status_code=404, detail="trusted FIDO key not found")
+    credential["name"] = req.name.strip()
+    credential["renamed_at"] = _now()
+    _write_store(store)
+    return JSONResponse(content={"ok": True, "credential": {
+        "id": credential.get("id"),
+        "name": credential.get("name"),
+        "created_at": credential.get("created_at"),
+        "last_used_at": credential.get("last_used_at"),
+        "renamed_at": credential.get("renamed_at"),
+    }})
+
+
+@router.post("/api/operations/{operation_id}/approval-webauthn/options")
+def operation_approval_webauthn_options(operation_id: str,
+                                        _: None = Depends(require_admin)) -> JSONResponse:
+    store = _read_store()
+    item = next((x for x in store.get("operations", []) if x.get("id") == operation_id), None)
+    if item is None:
+        raise HTTPException(status_code=404, detail="operation request not found")
+    if item.get("status") != "pending_approval":
+        raise HTTPException(status_code=409, detail="operation request is no longer pending")
+    creds = _webauthn_credentials(store)
+    if not creds:
+        raise HTTPException(status_code=409, detail="register an approval passkey first")
+    challenge = _new_webauthn_challenge(store, "approve", operation_id=operation_id)
+    _write_store(store)
+    return JSONResponse(content={"publicKey": {
+        "challenge": challenge,
+        "rpId": APPROVAL_WEBAUTHN_RP_ID,
+        "timeout": APPROVAL_WEBAUTHN_TIMEOUT_MS,
+        "userVerification": "discouraged",
+        "allowCredentials": [{"type": "public-key", "id": c["id"]} for c in creds],
+    }, "operation": {
+        "id": item.get("id"),
+        "action": item.get("action"),
+        "requested_by": item.get("requested_by"),
+        "target": item.get("target"),
+        "created_at": item.get("created_at"),
+    }})
+
+
 @router.post("/api/agent/{profile}/chat")
 def agent_chat(profile: str, req: AgentChat) -> JSONResponse:
     """Proxy a one-shot agent turn to the profile's in-container chat bridge.
@@ -811,6 +1213,14 @@ def agent_chat(profile: str, req: AgentChat) -> JSONResponse:
     user_entry = {"role": "user", "text": req.message,
                   "attachments": _att_meta(req.attachments), "ts": _now()}
     title = _conv_title_from(req.message)
+    if req.message.strip().lower().startswith("/hostfs"):
+        conv_append(profile, conv, user_entry, autotitle=title)
+        payload = _handle_hostfs_chat_command(profile, conv, req.message)
+        if payload:
+            conv_append(profile, conv, {"role": "agent", "text": payload["reply"],
+                                        "ts": _now(), "approval_id": payload["approval_id"],
+                                        "approval_status": "requested"})
+            return JSONResponse(status_code=200, content=payload)
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=BRIDGE_TIMEOUT) as resp:
@@ -854,6 +1264,22 @@ def agent_chat_stream(profile: str, req: AgentChat) -> StreamingResponse:
     user_entry = {"role": "user", "text": req.message,
                   "attachments": _att_meta(req.attachments), "ts": _now()}
     title = _conv_title_from(req.message)
+    if req.message.strip().lower().startswith("/hostfs"):
+        conv_append(profile, conv, user_entry, autotitle=title)
+        payload = _handle_hostfs_chat_command(profile, conv, req.message)
+        if payload:
+            conv_append(profile, conv, {"role": "agent", "text": payload["reply"],
+                                        "ts": _now(), "approval_id": payload["approval_id"],
+                                        "approval_status": "requested"})
+
+            def hostfs_done():
+                event = {"type": "done", "reply": payload["reply"],
+                         "approval_id": payload["approval_id"]}
+                yield f"data: {json.dumps(event)}\n\n"
+
+            return StreamingResponse(hostfs_done(), media_type="text/event-stream",
+                                     headers={"Cache-Control": "no-cache",
+                                              "X-Accel-Buffering": "no"})
 
     def relay():
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
@@ -2703,6 +3129,10 @@ def _operation_target_allowed(value: str) -> bool:
         OPERATIONS_ALLOW_ALL_CONTAINERS or value in OPERATIONS_ALLOWED_CONTAINERS)
 
 
+def _host_queue_action(action: str) -> bool:
+    return action in {"host_powershell", "host_filesystem"}
+
+
 def _operation_view(item: dict[str, Any]) -> dict[str, Any]:
     """Return a copy safe for API consumers (there are no credentials in state)."""
     return dict(item)
@@ -2721,10 +3151,10 @@ def _notify_operation_thread(item: dict[str, Any], event: str) -> None:
     action = str(item.get("action", "operation")).replace("_", " ")
     target = str(item.get("target", "local system"))
     messages = {
-        "requested": f"🛡️ Approval requested: {action} for {target}. It is waiting in Mission Control Approvals.",
-        "executing": f"✅ Approval granted: {action} for {target} is now executing.",
+        "requested": f"🛡️ Approval requested: {action} for {target}. Review and approve it here in this chat with your FIDO key.",
+        "executing": f"✅ FIDO approval granted: {action} for {target} is now executing.",
         "executed": f"✅ Approved action completed: {action} for {target}.",
-        "failed": f"⚠️ Approved action failed: {action} for {target}. Review Mission Control Approvals for details.",
+        "failed": f"⚠️ Approved action failed: {action} for {target}. Review the operation details in this thread or the Approvals ledger.",
         "expired": f"⌛ Approval expired: {action} for {target}. Submit a fresh request if it is still needed.",
     }
     text = messages.get(event)
@@ -2740,7 +3170,7 @@ def _reconcile_host_operations(store: dict[str, Any]) -> None:
         return
     changed = False
     for item in store.get("operations", []):
-        if item.get("action") != "host_powershell" or item.get("status") != "executing":
+        if not _host_queue_action(str(item.get("action", ""))) or item.get("status") != "executing":
             continue
         result_file = HOST_OPERATIONS_QUEUE_DIR / "results" / f"{item['id']}.json"
         try:
@@ -2791,35 +3221,57 @@ def operations_list(_: None = Depends(require_admin)) -> JSONResponse:
     if backfilled:
         _write_store(store)
     items = sorted(store.get("operations", []), key=lambda x: x.get("created_at", ""), reverse=True)
+    creds = _webauthn_credentials(store)
     return JSONResponse(content={"enabled": _operations_enabled(),
-                                 "actions": ["start", "stop", "restart", "docker_api", "host_powershell"],
+                                 "actions": ["start", "stop", "restart", "docker_api", "host_powershell", "host_filesystem"],
                                  "targets": sorted(_operation_targets()),
                                  "archive_after_days": OPERATIONS_ARCHIVE_AFTER_DAYS,
                                  "retention_days": OPERATIONS_RETENTION_DAYS,
+                                 "approval_webauthn": {
+                                     "rp_id": APPROVAL_WEBAUTHN_RP_ID,
+                                     "credential_count": len(creds),
+                                 },
                                  "requests": [_operation_view(x) for x in items]})
 
 
-def _create_operation_request(req: OperationRequestCreate, requested_by: str | None = None) -> dict[str, Any]:
+def _create_operation_request(req: OperationRequestCreate, requested_by: str | None = None,
+                              conversation_id: str | None = None) -> dict[str, Any]:
     if not _operations_enabled():
         raise HTTPException(status_code=503, detail="operations runner is not configured")
-    if req.action not in ("docker_api", "host_powershell") and not _operation_target_allowed(req.target):
+    effective_requester = (requested_by or req.requested_by).strip()
+    if req.action not in ("docker_api", "host_powershell", "host_filesystem") and not _operation_target_allowed(req.target):
         raise HTTPException(status_code=400, detail="target is not approved for lifecycle operations")
     if req.action == "docker_api" and (not req.method or not req.path):
         raise HTTPException(status_code=400, detail="docker_api requires method and path")
     if req.action == "host_powershell" and (not req.script or not req.script.strip()):
         raise HTTPException(status_code=400, detail="host_powershell requires a non-empty script")
+    if req.action == "host_filesystem":
+        if effective_requester not in HOST_FILESYSTEM_ALLOWED_PROFILES:
+            raise HTTPException(status_code=403, detail="profile is not approved for host filesystem transactions")
+        if not req.filesystem_transaction:
+            raise HTTPException(status_code=400, detail="host_filesystem requires filesystem_transaction")
+        declared_profile = str(req.filesystem_transaction.get("profile", "")).strip()
+        if declared_profile and declared_profile != effective_requester:
+            raise HTTPException(status_code=400, detail="filesystem transaction profile must match authenticated requester")
     item = {
         "id": f"op-{uuid.uuid4().hex}", "action": req.action, "target": req.target,
-        "reason": req.reason.strip(), "requested_by": (requested_by or req.requested_by).strip(),
+        "reason": req.reason.strip(), "requested_by": effective_requester,
         "status": "pending_approval", "created_at": _now(), "approved_at": None,
         "approved_by": None, "approval_note": "", "result": None,
     }
+    if conversation_id:
+        item["conversation_id"] = conversation_id
     if req.action == "docker_api":
         item["docker_request"] = {"method": req.method, "path": req.path,
                                   "body": req.body or {}}
     if req.action == "host_powershell":
         item["script"] = req.script
         item["remediation_id"] = req.remediation_id.strip() if req.remediation_id else ""
+        item["risk"] = req.risk
+    if req.action == "host_filesystem":
+        tx = dict(req.filesystem_transaction or {})
+        tx["profile"] = effective_requester
+        item["filesystem_transaction"] = tx
         item["risk"] = req.risk
     store = _read_store()
     store.setdefault("operations", []).append(item)
@@ -2900,6 +3352,16 @@ def operations_request(req: OperationRequestCreate, _: None = Depends(require_ad
     return JSONResponse(status_code=201, content={"ok": True, "request": _operation_view(item)})
 
 
+@router.post("/api/operations/requests/default")
+def default_operations_request(req: OperationRequestCreate,
+                               _: None = Depends(require_default_operations_submit)) -> JSONResponse:
+    """Dr. Smith's narrow proposal ingress for host filesystem transactions."""
+    if req.action != "host_filesystem":
+        raise HTTPException(status_code=403, detail="Dr. Smith may only submit host filesystem transaction proposals")
+    item = _create_operation_request(req, requested_by="default")
+    return JSONResponse(status_code=201, content={"ok": True, "request": _operation_view(item)})
+
+
 @router.post("/api/operations/requests/octo")
 def octo_operations_request(req: OperationRequestCreate,
                             _: None = Depends(require_octo_operations_submit)) -> JSONResponse:
@@ -2921,7 +3383,7 @@ def littlejohn_operations_request(req: OperationRequestCreate,
         return JSONResponse(status_code=200 if item["status"] == "executed" else 502,
                             content={"ok": item["status"] == "executed",
                                      "request": _operation_view(item)})
-    if req.action != "host_powershell":
+    if req.action not in ("host_powershell", "host_filesystem"):
         raise HTTPException(status_code=403, detail="Little John may only request host changes or pre-approved Kali lifecycle operations")
     item = _create_operation_request(req, requested_by="littlejohn")
     return JSONResponse(status_code=201, content={"ok": True, "request": _operation_view(item)})
@@ -2949,27 +3411,38 @@ def operations_approve(operation_id: str, approval: OperationApproval,
         _write_store(store)
         raise HTTPException(status_code=409, detail="operation request expired; submit a fresh request")
 
+    approval_credential = _verify_webauthn_assertion(store, item, approval.webauthn)
+
     # Stamp approval before calling the runner, so even a network timeout leaves
     # an auditable record.  A runner-side request-id ledger prevents replays.
     item["status"] = "executing"
     item["approved_at"] = _now()
     item["approved_by"] = approval.approved_by.strip()
     item["approval_note"] = approval.note.strip()
+    item["approval_webauthn"] = {
+        "credential_id": approval_credential.get("id"),
+        "credential_name": approval_credential.get("name"),
+        "rp_id": APPROVAL_WEBAUTHN_RP_ID,
+        "verified_at": _now(),
+    }
     _notify_operation_thread(item, "executing")
     _write_store(store)
     runner_payload = {"request_id": item["id"], "action": item["action"],
                       "target": item["target"]}
     if item.get("docker_request"):
         runner_payload["docker_request"] = item["docker_request"]
-    if item["action"] == "host_powershell":
+    if _host_queue_action(str(item["action"])):
         if not HOST_OPERATIONS_QUEUE_DIR:
             item["status"] = "failed"; item["result"] = {"error": "host operation queue is not configured"}; _write_store(store)
             raise HTTPException(status_code=503, detail="host operation queue is not configured")
         HOST_OPERATIONS_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
         jobs = HOST_OPERATIONS_QUEUE_DIR / "jobs"; jobs.mkdir(exist_ok=True)
         job = {"request_id": item["id"], "action": item["action"], "target": item["target"],
-               "script": item["script"], "risk": item.get("risk", "medium"),
-               "remediation_id": item.get("remediation_id", "")}
+               "risk": item.get("risk", "medium"), "requested_by": item.get("requested_by", "")}
+        if item["action"] == "host_powershell":
+            job.update({"script": item["script"], "remediation_id": item.get("remediation_id", "")})
+        if item["action"] == "host_filesystem":
+            job["filesystem_transaction"] = item.get("filesystem_transaction", {})
         temp = jobs / f"{item['id']}.tmp"; final = jobs / f"{item['id']}.json"
         temp.write_text(json.dumps(job), encoding="utf-8"); os.replace(temp, final)
         return JSONResponse(status_code=202, content={"ok": True, "request": _operation_view(item)})

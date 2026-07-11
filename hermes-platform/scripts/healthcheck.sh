@@ -25,6 +25,7 @@ containers=(
     hermes-platform-openviking
     hermes-platform-memory-gateway
     hermes-platform-mission-control
+    hermes-platform-artifact-apps
     hermes-platform-ttyd
 )
 while IFS= read -r p; do

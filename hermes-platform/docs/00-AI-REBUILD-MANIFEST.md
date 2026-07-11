@@ -16,9 +16,20 @@
 7. **Per-profile agent-chat bridges** — small Python stdlib co-processes inside each `hermes-pf-*` container. Mission Control talks to these bridges on `8011/tcp` for live chat, IronNest Task actions, shared Kanban board actions, and profile-local actions without Docker socket access.
 8. **Shared Hermes Kanban board** — `hermes-platform_kanban-shared` mounted at `/opt/kanban` in every profile container. It is the substrate for IronNest Tasks: a deliberate cross-profile coordination plane for goals, task state, workspaces, artifacts, and worker logs; keep it secret-free.
 9. **IronNest Task workflow** — Mission Control's governed layer over Hermes Kanban. A Task can start as a triage goal, be decomposed by the orchestrator, routed by profile role descriptions, executed by specialist agents such as Steve for code, Little John for security, `qa` for independent verification, and Octo for platform operations, then reviewed through logs, Reports, Apps, and artifacts.
+10. **Artifact Apps origin** — a core read-only nginx service at `https://apps.ironnest.local/` that serves task web apps from Kanban artifacts under a restrictive CSP and separate origin from Mission Control.
+11. **Governed operations** — optional `operations-runner` is the only Docker-socket holder and accepts exact, persisted, single-use requests over `mission-control-ops-net`. Windows work uses a separate file-backed localhost queue whose default elevated runner executes allowlisted remediation IDs and structured filesystem transactions.
+12. **LittleJohn security tooling** — optional Kali MCP is isolated on dedicated LittleJohn/Kali networks with no host port. Wazuh queries go to the existing external read-only `wazuh-query` broker on `platform-net`, not directly to the indexer and not through internet access.
 
 Do not mistake component names: `ironnest_gateway` is the Hermes-side adapter; `memory-gateway` is the policy-enforcing service; OpenViking is the storage/search backend.
 Also do not mistake Mission Control for the gateway: Mission Control is an operator UI/control plane, while `memory-gateway` remains the security boundary for all OpenViking memory access.
+
+## Rebuild scope
+
+This bundle reconstructs **Hermes Platform** from the checked-out `platform/` repository. It does not independently recreate the wider IronNest perimeter: Rancher Desktop/WSL2, `platform-net`, `platform-egress`, AdGuard, Squid, Infisical, Traefik/Authelia, Wazuh, and the read-only `wazuh-query` broker are prerequisites created by `platform/bootstrap.sh` and their own stack definitions. A blank-Windows-host rebuild must establish those prerequisites first.
+
+A clean functional rebuild can reproduce containers, networks, policies, and empty persistent volumes. Reproducing the exact live system additionally requires operator-supplied Infisical secrets and backups of named volumes, profile data/SOUL files, Mission Control state, Kanban artifacts, and OpenViking data. Those values are deliberately absent from Git.
+
+Service counts use one definition everywhere: **15 core services** start without Compose profiles; `operations-runner` and `kali-mcp-littlejohn` are the two optional services, for **17 declared services** total.
 
 ## Read me first
 
@@ -31,7 +42,7 @@ Also do not mistake Mission Control for the gateway: Mission Control is an opera
 | `spec/registry.schema.json` | JSON Schema for `registry/profiles-registry.yaml`. |
 | `spec/profile.schema.json` | Variables substituted into `profile-template/*.template` files. |
 | `spec/validation-plan.yaml` | Every isolation/sharing case the validation scripts run. |
-| `spec/rebuild-checklist.yaml` | 12 ordered steps to rebuild from scratch. |
+| `spec/rebuild-checklist.yaml` | 15 ordered core, migration, validation, and optional-capability steps. |
 | `docs/01-ARCHITECTURE.md` | Picture + word description. |
 | `docs/08-SECURITY-MODEL.md` | The threat model and why each layer exists. |
 | `docs/17-LLM-HANDOFF.md` | Second-person notes to the next AI. |
@@ -39,7 +50,7 @@ Also do not mistake Mission Control for the gateway: Mission Control is an opera
 
 ## The single source of truth for "what to do"
 
-`spec/rebuild-checklist.yaml` — 12 steps with `command`, `expects`, `validates`. Run them in order. Steps marked `manual: true` need a human (Infisical UI, .env values).
+`spec/rebuild-checklist.yaml` — 15 steps with `command`, `expects`, and `validates`. Run the core steps in order; run a step with `applies_when` only when that condition is true. Steps marked `manual: true` need a human (Infisical UI, `.env` values).
 
 ## Invariants you MUST preserve
 
@@ -51,11 +62,11 @@ These appear in `spec/system.manifest.yaml` and are non-negotiable:
 - **I4**  Bearer tokens never appear in this repo. Tokens live in Infisical at `/hermes-platform/`.
 - **I5**  SOUL.md content is preserved. `scripts/patch-souls.sh` backs up to `SOUL.md.bak.<epoch>` and only replaces the `## OpenViking Memory Policy` section.
 - **I6**  Normal Hermes conversational memory uses `ironnest_gateway` to call `memory-gateway`; connectivity alone is not proof of automatic memory use.
-- **I7**  Mission Control stays outside the memory policy kernel: `platform-net` only, no OpenViking/profile bearer tokens, no Infisical machine identity, and no Docker socket.
+- **I7**  Mission Control stays outside the memory policy kernel: `platform-net` for profile/ingress traffic plus the private `mission-control-ops-net` for exact runner requests; no OpenViking/profile bearer tokens, Infisical machine identity, or Docker socket.
 - **I8**  Shared Kanban lives on `/opt/kanban` only. It is cross-profile by design, but it must remain separate from private `/opt/data` volumes and must not be used for secrets.
 - **I9**  LittleJohn's Kali MCP is optional, on-demand, has no host port, stays off the memory and shared platform networks, and is reachable only over its dedicated LittleJohn/Kali network. Only its exact start/stop/restart lifecycle is pre-approved.
 - **I10**  `operations-runner` is the only Hermes Platform service with Docker socket access. Mission Control and agents submit exact, persisted, single-use operations; they never receive a standing raw Docker API.
-- **I11**  Windows host work crosses the localhost boundary through the Mission Control queue. The default elevated runner executes only built-in allowlisted remediation IDs; arbitrary submitted PowerShell requires an explicit operator-enabled raw mode.
+- **I11**  Windows host work crosses the localhost boundary through the Mission Control queue. The default elevated runner executes only built-in allowlisted remediation IDs and structured `host_filesystem` transactions for approved profiles; arbitrary submitted PowerShell requires an explicit operator-enabled raw mode.
 
 If a change would violate any invariant, **stop and ask the operator**.
 
@@ -66,7 +77,7 @@ If a change would violate any invariant, **stop and ask the operator**.
 - Bump pinned image digests (Infisical CLI, base images) in lock-step across the stack.
 - Add `tools.yaml` MCP entries per profile (gateway is unaffected).
 - Extend `ironnest_gateway` when Hermes lifecycle behavior changes, while keeping all memory operations routed through `memory-gateway`.
-- Extend Mission Control UI/API features when they stay on `platform-net` and do not require OpenViking/profile bearer secrets.
+- Extend Mission Control UI/API features when they stay on `platform-net` or the narrowly scoped `mission-control-ops-net` and do not require OpenViking/profile bearer secrets or Docker access.
 - Extend the Mission Control Task/Kanban surface through bridge-mediated, structured actions. Manual runs must execute in the assignee profile's own container; decomposition must route through the configured orchestrator; auto-dispatch must remain per-profile opt-in.
 
 ## What you CANNOT change without an architectural review
@@ -93,4 +104,4 @@ If a change would violate any invariant, **stop and ask the operator**.
 8. **DO NOT** give Mission Control profile bearer tokens, OpenViking root keys, or Infisical machine identity credentials. It reads registry/policy/audit files and owns only its dashboard state.
 9. **DO NOT** treat `/opt/kanban` as private storage. It is intentionally shared by all profile agents for Task coordination, artifacts, and worker logs.
 10. **DO NOT** mount the Docker socket into Mission Control or any `hermes-pf-*` container. Only `operations-runner` may hold it, behind the private operations network and exact request validation.
-11. **DO NOT** run agent-submitted PowerShell on Windows by default. The scoped host runner ignores submitted script bodies and executes only locally implemented remediation IDs.
+11. **DO NOT** run agent-submitted PowerShell on Windows by default. The scoped host runner ignores submitted script bodies and executes only locally implemented remediation IDs or structured filesystem transaction primitives.

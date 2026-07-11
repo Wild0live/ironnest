@@ -43,6 +43,7 @@ const kanban = {
   orchPlans: {}, collapsedGroups: loadKanbanCollapsedGroups(), selected: new Set(), health: null,
 };
 const operations = { requests: [], targets: [], enabled: false, selected: null, view: "pending", search: "", requester: "", risk: "", includeArchived: false };
+const systemSettings = { webauthn: null, loaded: false };
 const cronCatchup = { running: false };
 const freshness = {
   lastSuccess: null,
@@ -72,6 +73,50 @@ function token() {
 function headers() {
   const adminToken = token();
   return adminToken ? { Authorization: `Bearer ${adminToken}`, "Content-Type": "application/json" } : { "Content-Type": "application/json" };
+}
+
+function b64uToBytes(value) {
+  const pad = "=".repeat((4 - (value.length % 4)) % 4);
+  const raw = atob((value + pad).replaceAll("-", "+").replaceAll("_", "/"));
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+function bytesToB64u(value) {
+  const bytes = value instanceof Uint8Array ? value : new Uint8Array(value || []);
+  let raw = "";
+  bytes.forEach((b) => { raw += String.fromCharCode(b); });
+  return btoa(raw).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
+
+function credentialToJson(credential) {
+  const response = credential.response || {};
+  const out = {
+    id: credential.id,
+    rawId: bytesToB64u(credential.rawId),
+    type: credential.type,
+    response: {
+      clientDataJSON: bytesToB64u(response.clientDataJSON),
+    },
+  };
+  if (response.attestationObject) out.response.attestationObject = bytesToB64u(response.attestationObject);
+  if (response.authenticatorData) out.response.authenticatorData = bytesToB64u(response.authenticatorData);
+  if (response.signature) out.response.signature = bytesToB64u(response.signature);
+  if (response.userHandle) out.response.userHandle = bytesToB64u(response.userHandle);
+  return out;
+}
+
+function prepareCredentialCreateOptions(publicKey) {
+  const options = structuredClone(publicKey);
+  options.challenge = b64uToBytes(options.challenge);
+  options.user.id = b64uToBytes(options.user.id);
+  return options;
+}
+
+function prepareCredentialGetOptions(publicKey) {
+  const options = structuredClone(publicKey);
+  options.challenge = b64uToBytes(options.challenge);
+  options.allowCredentials = (options.allowCredentials || []).map((cred) => ({ ...cred, id: b64uToBytes(cred.id) }));
+  return options;
 }
 
 function fmtTime(value) {
@@ -181,7 +226,7 @@ function render() {
 }
 
 function operationLabel(action) {
-  return ({ start: "Start", stop: "Stop", restart: "Restart", docker_api: "Docker API request", host_powershell: "Windows host remediation" })[action] || action;
+  return ({ start: "Start", stop: "Stop", restart: "Restart", docker_api: "Docker API request", host_powershell: "Windows host remediation", host_filesystem: "Windows filesystem transaction" })[action] || action;
 }
 
 function operationTime(value) {
@@ -195,8 +240,9 @@ function renderOperations() {
   const badge = $("#approvalBadge");
   if (badge) { badge.hidden = pending === 0; badge.textContent = pending; }
   const hint = $("#approvalRunnerHint");
+  const keyCount = operations.webauthn?.credential_count || 0;
   if (hint) hint.textContent = operations.enabled
-    ? "Each approval is single-use and expires after ten minutes. Little John's Windows plans run only after you review and approve the exact script."
+    ? `Each approval is single-use and expires after ten minutes. FIDO touch required${keyCount ? ` (${keyCount} trusted key${keyCount === 1 ? "" : "s"} registered)` : " - add a trusted FIDO key in System Settings first"}.`
     : "The operations runner is not configured, so new requests and execution are unavailable.";
   const list = $("#approvalList");
   if (!list) return;
@@ -226,9 +272,11 @@ function renderOperations() {
       ? `<p class="approval-detail"><strong>Remediation:</strong> <code>${escapeHtml(item.remediation_id)}</code></p>` : "";
     const script = item.action === "host_powershell"
       ? `<p class="approval-detail"><strong>Risk: ${escapeHtml(item.risk || "medium")}</strong></p>${remediation}<details class="approval-plan"><summary>Review exact PowerShell plan</summary><pre>${escapeHtml(item.script || "")}</pre></details>` : "";
+    const filesystem = item.action === "host_filesystem"
+      ? `<p class="approval-detail"><strong>Risk: ${escapeHtml(item.risk || "high")}</strong></p><details class="approval-plan"><summary>Review filesystem transaction JSON</summary><pre>${escapeHtml(JSON.stringify(item.filesystem_transaction || {}, null, 2))}</pre></details>` : "";
     return `<article class="approval-card">
       <div class="approval-card-main"><div class="approval-card-title"><span class="approval-requester-avatar">${avatarHtml(item.requested_by || "__you", 34)}</span><div><strong>${escapeHtml(displayName(item.requested_by || "Operator"))} requests ${escapeHtml(operationLabel(item.action))}</strong><p><code>${escapeHtml(item.target)}</code> · ${escapeHtml(operationTime(item.created_at))}</p></div></div>
-      <p class="approval-reason">${escapeHtml(item.reason)}</p>${details}${script}</div>
+      <p class="approval-reason">${escapeHtml(item.reason)}</p>${details}${script}${filesystem}</div>
       <div class="approval-card-actions"><span class="approval-status ${escapeHtml(item.status)}">${escapeHtml(item.status.replaceAll("_", " "))}</span>${pendingAction}${item.approved_by ? `<small>Approved by ${escapeHtml(item.approved_by)}</small>` : ""}</div>
     </article>`;
   };
@@ -249,26 +297,194 @@ async function loadOperations() {
     operations.requests = data.requests || [];
     operations.targets = data.targets || [];
     operations.enabled = !!data.enabled;
+    operations.webauthn = data.approval_webauthn || operations.webauthn || null;
+    if (!systemSettings.webauthn && data.approval_webauthn) {
+      systemSettings.webauthn = data.approval_webauthn;
+    }
   } catch (err) {
     operations.requests = [];
     operations.targets = [];
     operations.enabled = false;
   }
   renderOperations();
+  if ($("#view-settings")?.classList.contains("active")) renderSystemSettings();
   if ($("#view-agent")?.classList.contains("active")) renderChat({ preserveScroll: true });
+}
+
+function renderSystemSettings() {
+  const data = systemSettings.webauthn || operations.webauthn || {};
+  const creds = data.credentials || [];
+  const count = Number(data.credential_count ?? creds.length ?? 0);
+  const summary = $("#trustedFidoSummary");
+  const list = $("#trustedFidoList");
+  if (summary) {
+    const rp = data.rp_id ? ` RP ID: ${data.rp_id}.` : "";
+    const origins = (data.origins || []).length ? ` Origin: ${(data.origins || []).join(", ")}.` : "";
+    summary.textContent = `${count} trusted FIDO approval key${count === 1 ? "" : "s"} registered.${rp}${origins}`;
+  }
+  if (!list) return;
+  if (!systemSettings.loaded && !systemSettings.webauthn) {
+    list.innerHTML = `<p class="empty">Loading trusted keys…</p>`;
+    return;
+  }
+  if (!creds.length) {
+    list.innerHTML = `<p class="empty">No trusted FIDO keys yet. Add one before approving host operations from chat.</p>`;
+    return;
+  }
+  list.innerHTML = creds.map((cred) => `<article class="trusted-fido-card">
+    <div>
+      <strong>${escapeHtml(cred.name || "Approval key")}</strong>
+      <p><code>${escapeHtml(String(cred.id || "").slice(0, 18))}${cred.id ? "…" : ""}</code></p>
+    </div>
+    <dl>
+      <div><dt>Created</dt><dd>${escapeHtml(operationTime(cred.created_at))}</dd></div>
+      <div><dt>Last used</dt><dd>${escapeHtml(cred.last_used_at ? operationTime(cred.last_used_at) : "Never")}</dd></div>
+      ${cred.renamed_at ? `<div><dt>Renamed</dt><dd>${escapeHtml(operationTime(cred.renamed_at))}</dd></div>` : ""}
+    </dl>
+    <div class="trusted-fido-actions">
+      <button type="button" class="ghost-btn" data-fido-rename="${escapeHtml(cred.id || "")}" data-fido-name="${escapeHtml(cred.name || "Approval key")}">Rename</button>
+    </div>
+  </article>`).join("");
+  list.querySelectorAll("[data-fido-rename]").forEach((button) => {
+    button.addEventListener("click", () => renameTrustedFidoKey(button.dataset.fidoRename, button.dataset.fidoName || "Approval key"));
+  });
+}
+
+async function loadSystemSettings() {
+  try {
+    const data = await api("/api/approval-webauthn/status", { headers: headers() });
+    systemSettings.webauthn = data || null;
+    systemSettings.loaded = true;
+    operations.webauthn = {
+      rp_id: data?.rp_id,
+      credential_count: data?.credential_count || 0,
+    };
+  } catch (err) {
+    systemSettings.loaded = true;
+    systemSettings.webauthn = null;
+    setSync("Could not load System Settings — check the admin token");
+  }
+  renderSystemSettings();
+  renderOperations();
+  if ($("#view-agent")?.classList.contains("active")) renderChat({ preserveScroll: true });
+}
+
+async function registerApprovalKey() {
+  if (!window.PublicKeyCredential || !navigator.credentials) {
+    setSync("This browser does not support passkeys/WebAuthn");
+    return;
+  }
+  const name = window.prompt("Approval key name:", "Mission Control approval key");
+  if (name === null) return;
+  try {
+    const options = await api("/api/approval-webauthn/register/options", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ name: name.trim() || "Approval key" }),
+    });
+    const credential = await navigator.credentials.create({
+      publicKey: prepareCredentialCreateOptions(options.publicKey),
+    });
+    await api("/api/approval-webauthn/register/verify", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify(credentialToJson(credential)),
+    });
+    setSync("Trusted FIDO approval key registered");
+    await loadSystemSettings();
+    await loadOperations();
+  } catch (err) {
+    setSync(`Trusted FIDO key registration failed: ${err.message || err}`);
+  }
+}
+
+async function renameTrustedFidoKey(id, currentName) {
+  if (!id) return;
+  const next = window.prompt("Trusted FIDO key name:", currentName || "Approval key");
+  if (next === null) return;
+  const name = next.trim();
+  if (!name) {
+    setSync("Trusted FIDO key name cannot be empty");
+    return;
+  }
+  try {
+    await api(`/api/approval-webauthn/credentials/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: headers(),
+      body: JSON.stringify({ name }),
+    });
+    setSync("Trusted FIDO key renamed");
+    await loadSystemSettings();
+    await loadOperations();
+  } catch (err) {
+    setSync(`Rename failed: ${err.message || err}`);
+  }
+}
+
+async function getApprovalAssertion(operationId) {
+  if (!window.PublicKeyCredential || !navigator.credentials) {
+    throw new Error("This browser does not support passkeys/WebAuthn");
+  }
+  const options = await api(`/api/operations/${encodeURIComponent(operationId)}/approval-webauthn/options`, {
+    method: "POST",
+    headers: headers(),
+  });
+  const credential = await navigator.credentials.get({
+    publicKey: prepareCredentialGetOptions(options.publicKey),
+  });
+  return credentialToJson(credential);
 }
 
 function openOperationApproval(id) {
   const item = operations.requests.find((request) => request.id === id);
-  if (!item) return;
+  if (!item) { setSync("That approval is no longer available"); return; }
+  if (item.status !== "pending_approval") { setSync("That approval is no longer pending"); return; }
   operations.selected = item;
-  $("#approvalExecuteSummary").textContent = `${operationLabel(item.action)} ${item.target}: ${item.reason}`;
+  $("#approvalExecuteSummary").textContent = `${operationLabel(item.action)} ${item.target}: ${item.reason} Touch your registered FIDO key to approve this exact operation.`;
   $("#approvalExecuteDialog").showModal();
 }
 
+function approvalOperatorName() {
+  return String((chat.agentMeta["__you"] || {}).label || "Mission Control operator").trim().slice(0, 80) || "Mission Control operator";
+}
+
+async function approveOperationWithFidoNow(id, source = "chat") {
+  let item = operations.requests.find((request) => request.id === id);
+  if (!item) {
+    await loadOperations();
+    item = operations.requests.find((request) => request.id === id);
+  }
+  if (!item) { setSync("That approval is no longer available"); return; }
+  if (item.status !== "pending_approval") { setSync("That approval is no longer pending"); return; }
+  let assertion;
+  try {
+    setSync("Touch your FIDO key to approve…");
+    assertion = await getApprovalAssertion(item.id);
+  } catch (err) {
+    setSync(`FIDO approval failed: ${err.message || err}`);
+    return;
+  }
+  try {
+    await api(`/api/operations/${encodeURIComponent(item.id)}/approve`, {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({
+        approved_by: approvalOperatorName(),
+        note: source === "chat" ? "Approved directly from Mission Control chat thread." : "",
+        webauthn: assertion,
+      }),
+    });
+    setSync("FIDO approval accepted — executing operation…");
+    await loadOperations();
+    if ($("#view-settings")?.classList.contains("active")) await loadSystemSettings();
+  } catch (err) {
+    setSync(`Approval failed after FIDO touch: ${err.message || err}`);
+    await loadOperations();
+  }
+}
+
 async function openChatApproval(id) {
-  await loadOperations();
-  openOperationApproval(id);
+  await approveOperationWithFidoNow(id, "chat");
 }
 
 const approvalTabs = $("#approvalTabs");
@@ -729,6 +945,12 @@ async function kanbanClarify(id) {
 function profileSelectHtml(selected) {
   return state.profiles.map((p) =>
     `<option value="${escapeHtml(p.name)}" ${p.name === selected ? "selected" : ""}>${escapeHtml(displayName(p.name))}</option>`).join("");
+}
+
+function defaultKanbanAssignee() {
+  return state.profiles.some((p) => p.name === "default")
+    ? "default"
+    : (state.profiles[0]?.name || "");
 }
 
 function planNodeLabel(nodes, key, goalId) {
@@ -2737,6 +2959,7 @@ function activateView(view) {
   if (view === "wiki") ensureWiki();
   if (view === "tasks") loadKanban();
   if (view === "approvals") loadOperations();
+  if (view === "settings") loadSystemSettings();
   if (view === "reports") loadReports();
   if (view === "apps") loadApps();
   if (view === "calendar") loadCron();
@@ -2941,6 +3164,8 @@ $("#requestApprovalBtn").addEventListener("click", () => {
   $("#approvalRequestDialog").showModal();
 });
 
+$("#registerTrustedFidoKeyBtn")?.addEventListener("click", registerApprovalKey);
+
 $("#approvalRequestForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (event.submitter?.value === "cancel") { $("#approvalRequestDialog").close(); return; }
@@ -2949,7 +3174,7 @@ $("#approvalRequestForm").addEventListener("submit", async (event) => {
     body.requested_by = "operator";
     await api("/api/operations/requests", { method: "POST", headers: headers(), body: JSON.stringify(body) });
     $("#approvalRequestDialog").close(); event.currentTarget.reset();
-    setSync("Docker action sent for review"); await loadOperations();
+    setSync("Operation sent for review"); await loadOperations();
   } catch (err) { setSync("Request failed — check the admin token and runner"); }
 });
 
@@ -2962,6 +3187,16 @@ $("#approvalExecuteForm").addEventListener("submit", async (event) => {
   if (!operation) return;
   form.dataset.submitting = "1";
   const body = Object.fromEntries(new FormData(form).entries());
+  let assertion;
+  try {
+    setSync("Touch your FIDO key to approve…");
+    assertion = await getApprovalAssertion(operation.id);
+  } catch (err) {
+    form.dataset.submitting = "0";
+    setSync(`FIDO approval failed: ${err.message || err}`);
+    return;
+  }
+  body.webauthn = assertion;
   // Approval has been explicitly submitted. Close promptly rather than making
   // the operator wait behind a potentially slow action runner.
   $("#approvalExecuteDialog").close();
@@ -2969,7 +3204,7 @@ $("#approvalExecuteForm").addEventListener("submit", async (event) => {
   setSync("Approval submitted — executing action…");
   try {
     await api(`/api/operations/${encodeURIComponent(operation.id)}/approve`, { method: "POST", headers: headers(), body: JSON.stringify(body) });
-    setSync("Approved Docker action executed"); await loadOperations();
+    setSync("Approved operation executed"); await loadOperations();
   } catch (err) {
     setSync("Approval submitted, but execution failed — check Approvals for details");
     await loadOperations();
@@ -2978,7 +3213,7 @@ $("#approvalExecuteForm").addEventListener("submit", async (event) => {
 
 // Kanban: create dialog + archived toggle wiring
 $("#addTaskBtn").addEventListener("click", () => {
-  $("#kanbanAssignee").innerHTML = state.profiles.map((p) => `<option value="${escapeHtml(p.name)}">${escapeHtml(displayName(p.name))}</option>`).join("");
+  $("#kanbanAssignee").innerHTML = profileSelectHtml(defaultKanbanAssignee());
   $("#kanbanDialog").showModal();
 });
 $("#kanbanForm").addEventListener("submit", async (event) => {
@@ -3823,7 +4058,7 @@ function renderChat(options = {}) {
     const cursor = m.role === "agent" && m.streaming ? `<span class="cursor"></span>` : "";
     const timeHtml = m.ts ? `<time class="msg-time" datetime="${escapeHtml(m.ts)}">${escapeHtml(formatTime(m.ts))}</time>` : "";
     const approvalAction = m.approval_id && m.approval_status === "requested"
-      ? `<button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(m.approval_id)}">Approve &amp; execute</button>` : "";
+      ? `<button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(m.approval_id)}">Approve here with FIDO</button>` : "";
     // Agents commonly cite proposal IDs in their own response. Make those
     // references actionable in-place, rather than making the operator hunt for
     // a separate system notification below the reply.
@@ -3832,14 +4067,19 @@ function renderChat(options = {}) {
           .map((id) => operations.requests.find((item) => item.id === id && item.status === "pending_approval"))
           .filter(Boolean) : [];
     const referencedActions = referenced.length ? `<div class="chat-inline-approvals">${referenced.map((item) =>
-      `<button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(item.id)}">Approve ${escapeHtml(operationLabel(item.action))}</button>`).join("")}</div>` : "";
+      `<button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(item.id)}">Approve ${escapeHtml(operationLabel(item.action))} with FIDO</button>`).join("")}</div>` : "";
     return `<div class="msg ${cls}"><span class="meta">${metaInner}${timeHtml}</span><div class="md-body msg-md">${renderMarkdown(m.text, profile)}</div>${approvalAction}${referencedActions}${cursor}${atts}</div>`;
   }).join("");
   const pendingApprovals = operations.requests.filter((item) =>
-    item.status === "pending_approval" && item.requested_by === profile);
+    item.status === "pending_approval" && item.requested_by === profile && item.conversation_id === convId);
+  const approvalKeyCount = operations.webauthn?.credential_count || 0;
+  const approvalKeyHint = approvalKeyCount
+    ? `${approvalKeyCount} approval key${approvalKeyCount === 1 ? "" : "s"} registered. Touch your FIDO key to approve from this thread.`
+    : `Register an approval key before approving from this thread.`;
   const approvalPanel = pendingApprovals.length ? `<section class="chat-approval-panel">
-    <div class="chat-approval-panel-title">🛡️ Pending approvals <span>${pendingApprovals.length}</span></div>
-    ${pendingApprovals.map((item) => `<div class="chat-approval-row"><div><strong>${escapeHtml(operationLabel(item.action))}</strong><p>${escapeHtml(item.target)} · ${escapeHtml(item.reason)}</p></div><button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(item.id)}">Approve &amp; execute</button></div>`).join("")}
+    <div class="chat-approval-panel-title">🛡️ Pending approvals in this thread <span>${pendingApprovals.length}</span></div>
+    <p class="chat-approval-hint">${escapeHtml(approvalKeyHint)}</p>
+    ${pendingApprovals.map((item) => `<div class="chat-approval-row"><div><strong>${escapeHtml(operationLabel(item.action))}</strong><p>${escapeHtml(item.target)} · ${escapeHtml(item.reason)}</p></div><button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(item.id)}">Approve with FIDO</button></div>`).join("")}
   </section>` : "";
   log.innerHTML = messagesHtml + approvalPanel;
   if (preserveScroll) log.scrollTop = oldScrollTop;
@@ -3899,6 +4139,10 @@ async function fallbackChat(profile, convId, text, attachments, agentMsg) {
     agentMsg.streaming = false;
     if (resp.ok && data.ok) {
       agentMsg.text = data.reply || "(empty reply)";
+      if (data.approval_id) {
+        agentMsg.approval_id = data.approval_id;
+        agentMsg.approval_status = "requested";
+      }
     } else {
       agentMsg.role = "error";
       agentMsg.text = data.error || `request failed (HTTP ${resp.status})`;
@@ -3951,6 +4195,10 @@ async function streamTurn(profile, convId, text, attachments, agentMsg, schedule
           // Bridge sends a rewritten reply when it turned a MEDIA: directive into
           // a download link — swap it in so the message renders the real link.
           if (evt.reply) agentMsg.text = evt.reply;
+          if (evt.approval_id) {
+            agentMsg.approval_id = evt.approval_id;
+            agentMsg.approval_status = "requested";
+          }
         }
         else if (evt.type === "error") { streamError = evt.error; }
       }
@@ -4059,6 +4307,7 @@ const SLASH_COMMANDS = {
   retry:  "re-ask your last message (the agent answers again)",
   rename: "rename this thread — /rename <title>",
   model:  "show or switch the model — /model [name]",
+  hostfs: "request localhost folder/file read approval — /hostfs list \"D:\\Folder\"",
 };
 
 function pushSystem(convId, text) {
@@ -4093,6 +4342,17 @@ async function handleSlash(profile, cmd, arg) {
   }
 
   if (!convId) { await newConv(); convId = currentConv(); if (!convId) return; }
+
+  if (cmd === "hostfs") {
+    if (!arg) {
+      pushSystem(convId, 'Usage: /hostfs list "D:\\Folder" [--recursive] [--max 200] or /hostfs read "D:\\Folder\\file.txt" [--max-bytes 65536]');
+      return;
+    }
+    const text = `/hostfs ${arg}`;
+    pushMsg(convId, { role: "user", text, attachments: [], ts: new Date().toISOString() });
+    await executeTurn(profile, convId, text, []);
+    return;
+  }
 
   if (cmd === "clear") {
     try {
@@ -4223,10 +4483,20 @@ if (_brandMark) {
 // rename yourself. Both use the reserved __you key (icon + label) in agent-meta.
 const _chatLogEl = $("#chatLog");
 if (_chatLogEl) {
-  _chatLogEl.addEventListener("click", (e) => {
+  _chatLogEl.addEventListener("click", async (e) => {
     const youName = (chat.agentMeta["__you"] || {}).label || "you";
     const approval = e.target.closest("[data-chat-approval]");
-    if (approval) openChatApproval(approval.dataset.chatApproval);
+    if (approval) {
+      if (approval.dataset.submitting === "1") return;
+      approval.dataset.submitting = "1";
+      approval.disabled = true;
+      try {
+        await openChatApproval(approval.dataset.chatApproval);
+      } finally {
+        approval.dataset.submitting = "0";
+        approval.disabled = false;
+      }
+    }
     else if (e.target.closest(".you-ava-btn")) openAvatarEditor("__you", youName);
     else if (e.target.closest(".you-name-btn")) editYouName();
   });
