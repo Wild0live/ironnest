@@ -37,7 +37,10 @@ FS_TRANSACTIONS.mkdir(exist_ok=True)
 REMEDIATION_MARKER = re.compile(
     r"(?im)^\s*#\s*IRONNEST_REMEDIATION_ID:\s*([A-Za-z0-9_.-]+)\s*$"
 )
-ALLOWED_REMEDIATIONS = {"cis-windows-top5-v1"}
+SOFTWARE_REMEDIATION_ID = "software-vulnerability-remediation-v1"
+ALLOWED_REMEDIATIONS = {"cis-windows-top5-v1", SOFTWARE_REMEDIATION_ID}
+WINGET_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+\-]{1,160}$")
+CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 ALLOWED_FILESYSTEM_PROFILES = {
     item.strip() for item in os.environ.get(
         "HOST_FILESYSTEM_ALLOWED_PROFILES", "default,littlejohn,octo"
@@ -217,6 +220,166 @@ def run_cis_windows_top5(job: dict[str, Any]) -> dict[str, Any]:
     if gpupdate_out:
         lines.extend(["", "gpupdate:", gpupdate_out])
     return {"ok": True, "exit_code": 0, "stdout": tail("\n".join(lines)), "stderr": ""}
+
+
+def _clean_text(value: Any, limit: int = 500) -> str:
+    return str(value or "").strip()[:limit]
+
+
+def _software_remediation_packages(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        raise ValueError("remediation_payload must be an object")
+    packages = payload.get("packages")
+    if packages is None:
+        packages = [payload]
+    if not isinstance(packages, list) or not packages or len(packages) > 10:
+        raise ValueError("remediation_payload.packages must contain 1-10 package objects")
+
+    out: list[dict[str, Any]] = []
+    for raw in packages:
+        if not isinstance(raw, dict):
+            raise ValueError("each remediation package must be an object")
+        package_id = _clean_text(raw.get("winget_id") or raw.get("package_id"), 180)
+        if not WINGET_ID_RE.fullmatch(package_id):
+            raise ValueError(f"invalid winget package id: {package_id!r}")
+        action = _clean_text(raw.get("action") or "upgrade", 40).lower()
+        if action not in {"upgrade", "install", "uninstall"}:
+            raise ValueError("software remediation action must be upgrade, install, or uninstall")
+        cves_raw = raw.get("cves") or []
+        if not isinstance(cves_raw, list) or len(cves_raw) > 50:
+            raise ValueError("cves must be a list of at most 50 CVE IDs")
+        cves = []
+        for cve in cves_raw:
+            value = _clean_text(cve, 32).upper()
+            if value and not CVE_RE.fullmatch(value):
+                raise ValueError(f"invalid CVE ID: {value!r}")
+            if value:
+                cves.append(value)
+        scope = _clean_text(raw.get("scope") or "machine", 20).lower()
+        if scope not in {"machine", "user", "any"}:
+            raise ValueError("scope must be machine, user, or any")
+        out.append({
+            "winget_id": package_id,
+            "action": action,
+            "name": _clean_text(raw.get("name"), 160),
+            "publisher": _clean_text(raw.get("publisher"), 160),
+            "scope": scope,
+            "cves": cves,
+            "justification": _clean_text(raw.get("justification"), 1000),
+        })
+    return out
+
+
+def _run_winget(args: list[str], timeout: int = 1800) -> dict[str, Any]:
+    winget = shutil.which("winget.exe") or shutil.which("winget")
+    if not winget:
+        raise FileNotFoundError("winget is not available to the scoped remediation runner account")
+    result = subprocess.run(
+        [winget, *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    return {
+        "command": "winget " + " ".join(args),
+        "exit_code": int(result.returncode),
+        "stdout": tail(result.stdout, 6000),
+        "stderr": tail(result.stderr, 6000),
+    }
+
+
+def _winget_list(package_id: str) -> dict[str, Any]:
+    return _run_winget(["list", "--id", package_id, "--exact",
+                        "--accept-source-agreements", "--disable-interactivity"], timeout=300)
+
+
+def _winget_show(package_id: str) -> dict[str, Any]:
+    return _run_winget(["show", "--id", package_id, "--exact",
+                        "--accept-source-agreements", "--disable-interactivity"], timeout=300)
+
+
+def _winget_remediate_package(package: dict[str, Any]) -> dict[str, Any]:
+    package_id = package["winget_id"]
+    action = package["action"]
+    before = _winget_list(package_id)
+    show = _winget_show(package_id)
+
+    if action == "upgrade":
+        args = ["upgrade", "--id", package_id, "--exact", "--silent",
+                "--accept-package-agreements", "--accept-source-agreements",
+                "--disable-interactivity"]
+    elif action == "install":
+        args = ["install", "--id", package_id, "--exact", "--silent",
+                "--accept-package-agreements", "--accept-source-agreements",
+                "--disable-interactivity"]
+        if package.get("scope") in {"machine", "user"}:
+            args.extend(["--scope", package["scope"]])
+    else:
+        args = ["uninstall", "--id", package_id, "--exact", "--silent",
+                "--disable-interactivity"]
+
+    action_result = _run_winget(args)
+    after = _winget_list(package_id)
+    return {
+        "package": package,
+        "before": before,
+        "show": show,
+        "action": action_result,
+        "after": after,
+        "ok": action_result["exit_code"] == 0,
+    }
+
+
+def run_software_vulnerability_remediation(job: dict[str, Any]) -> dict[str, Any]:
+    """Generic localhost software-vulnerability remediation.
+
+    This intentionally does not execute submitted PowerShell.  Little John
+    supplies structured package data; the local runner executes fixed winget
+    command shapes only after Mission Control/FIDO approval.
+    """
+    if not is_admin():
+        raise PermissionError("scoped remediation runner must be elevated")
+    payload = job.get("remediation_payload") or {}
+    packages = _software_remediation_packages(payload)
+    results = []
+    for package in packages:
+        results.append(_winget_remediate_package(package))
+    ok = all(item.get("ok") for item in results)
+    lines = [
+        "IronNest scoped software vulnerability remediation",
+        f"Request: {job.get('request_id', '')}",
+        f"Remediation: {SOFTWARE_REMEDIATION_ID}",
+        f"Target: {job.get('target', '')}",
+        f"Requested by: {job.get('requested_by', '')}",
+        f"Package count: {len(results)}",
+        "",
+    ]
+    for item in results:
+        package = item["package"]
+        lines.append(f"Package: {package['winget_id']} ({package.get('name') or 'unnamed'})")
+        lines.append(f"Action: {package['action']}")
+        if package.get("cves"):
+            lines.append("CVEs: " + ", ".join(package["cves"]))
+        if package.get("justification"):
+            lines.append("Justification: " + package["justification"])
+        lines.append(f"Command: {item['action']['command']}")
+        lines.append(f"Exit: {item['action']['exit_code']}")
+        if item["action"].get("stdout"):
+            lines.append("stdout:")
+            lines.append(item["action"]["stdout"])
+        if item["action"].get("stderr"):
+            lines.append("stderr:")
+            lines.append(item["action"]["stderr"])
+        lines.append("")
+    return {
+        "ok": ok,
+        "exit_code": 0 if ok else 67,
+        "remediation_id": SOFTWARE_REMEDIATION_ID,
+        "package_results": results,
+        "stdout": tail("\n".join(lines)),
+        "stderr": "",
+    }
 
 
 def _request_id(value: str) -> str:
@@ -525,6 +688,8 @@ def execute(job: dict[str, Any]) -> dict[str, Any]:
         }
     if rid == "cis-windows-top5-v1":
         return run_cis_windows_top5(job)
+    if rid == SOFTWARE_REMEDIATION_ID:
+        return run_software_vulnerability_remediation(job)
     return {"ok": False, "exit_code": 66, "error": "remediation is declared but not implemented"}
 
 

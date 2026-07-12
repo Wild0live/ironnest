@@ -43,6 +43,7 @@ const kanban = {
   orchPlans: {}, collapsedGroups: loadKanbanCollapsedGroups(), selected: new Set(), health: null,
 };
 const operations = { requests: [], targets: [], enabled: false, selected: null, view: "pending", search: "", requester: "", risk: "", includeArchived: false };
+const octoAdmin = { active: null, timer: null };
 const systemSettings = { webauthn: null, loaded: false };
 const cronCatchup = { running: false };
 const freshness = {
@@ -235,6 +236,39 @@ function operationTime(value) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
+function approvalStatusClass(status) {
+  return String(status || "unknown").toLowerCase().replace(/_/g, "-").replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "unknown";
+}
+
+function approvalStatusLabel(item, fallbackStatus = "") {
+  const status = item?.status || fallbackStatus || "unknown";
+  const approver = item?.approved_by ? displayName(item.approved_by) : "";
+  if (status === "pending_approval" || status === "requested") return "Waiting for FIDO approval";
+  if (status === "executing") return approver ? `Approved by ${approver} · executing` : "Approved · executing";
+  if (status === "executed") return approver ? `Completed · approved by ${approver}` : "Completed";
+  if (status === "failed") return approver ? `Failed · approved by ${approver}` : "Failed";
+  if (status === "expired") return "Expired";
+  return status.replace(/_/g, " ");
+}
+
+function chatApprovalControl(approvalId, fallbackStatus = "") {
+  if (!approvalId) return { html: "", className: "" };
+  const item = operations.requests.find((candidate) => candidate.id === approvalId);
+  const status = item?.status || fallbackStatus || "unknown";
+  if (status === "pending_approval" || status === "requested") {
+    return {
+      html: `<button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(approvalId)}">Approve here with FIDO</button>`,
+      className: "",
+    };
+  }
+  const label = approvalStatusLabel(item, status);
+  const statusClass = approvalStatusClass(status);
+  return {
+    html: `<span class="chat-approval-status ${statusClass}" aria-label="${escapeHtml(label)}">${escapeHtml(label)}</span>`,
+    className: ` approval-handled approval-${statusClass}`,
+  };
+}
+
 function renderOperations() {
   const pending = operations.requests.filter((item) => item.status === "pending_approval").length;
   const badge = $("#approvalBadge");
@@ -270,8 +304,10 @@ function renderOperations() {
       ? `<p class="approval-detail"><code>${escapeHtml(item.docker_request.method)} ${escapeHtml(item.docker_request.path)}</code></p>` : "";
     const remediation = item.remediation_id
       ? `<p class="approval-detail"><strong>Remediation:</strong> <code>${escapeHtml(item.remediation_id)}</code></p>` : "";
+    const remediationPayload = item.remediation_payload
+      ? `<details class="approval-plan"><summary>Review structured remediation payload</summary><pre>${escapeHtml(JSON.stringify(item.remediation_payload || {}, null, 2))}</pre></details>` : "";
     const script = item.action === "host_powershell"
-      ? `<p class="approval-detail"><strong>Risk: ${escapeHtml(item.risk || "medium")}</strong></p>${remediation}<details class="approval-plan"><summary>Review exact PowerShell plan</summary><pre>${escapeHtml(item.script || "")}</pre></details>` : "";
+      ? `<p class="approval-detail"><strong>Risk: ${escapeHtml(item.risk || "medium")}</strong></p>${remediation}${remediationPayload}<details class="approval-plan"><summary>Review exact PowerShell plan</summary><pre>${escapeHtml(item.script || "")}</pre></details>` : "";
     const filesystem = item.action === "host_filesystem"
       ? `<p class="approval-detail"><strong>Risk: ${escapeHtml(item.risk || "high")}</strong></p><details class="approval-plan"><summary>Review filesystem transaction JSON</summary><pre>${escapeHtml(JSON.stringify(item.filesystem_transaction || {}, null, 2))}</pre></details>` : "";
     return `<article class="approval-card">
@@ -320,7 +356,9 @@ function renderSystemSettings() {
   if (summary) {
     const rp = data.rp_id ? ` RP ID: ${data.rp_id}.` : "";
     const origins = (data.origins || []).length ? ` Origin: ${(data.origins || []).join(", ")}.` : "";
-    summary.textContent = `${count} trusted FIDO approval key${count === 1 ? "" : "s"} registered.${rp}${origins}`;
+    const legacy = Number(data.unbound_legacy_credential_count || 0);
+    const legacyText = legacy ? ` ${legacy} legacy key${legacy === 1 ? "" : "s"} must be deleted and re-enrolled before use.` : "";
+    summary.textContent = `${count} trusted FIDO approval key${count === 1 ? "" : "s"} registered.${rp}${origins}${legacyText}`;
   }
   if (!list) return;
   if (!systemSettings.loaded && !systemSettings.webauthn) {
@@ -333,7 +371,7 @@ function renderSystemSettings() {
   }
   list.innerHTML = creds.map((cred) => `<article class="trusted-fido-card">
     <div>
-      <strong>${escapeHtml(cred.name || "Approval key")}</strong>
+      <strong>${escapeHtml(cred.name || "Approval key")}${cred.legacy_unbound ? ` <span class="trusted-fido-badge">Legacy key</span>` : ""}</strong>
       <p><code>${escapeHtml(String(cred.id || "").slice(0, 18))}${cred.id ? "…" : ""}</code></p>
     </div>
     <dl>
@@ -343,10 +381,14 @@ function renderSystemSettings() {
     </dl>
     <div class="trusted-fido-actions">
       <button type="button" class="ghost-btn" data-fido-rename="${escapeHtml(cred.id || "")}" data-fido-name="${escapeHtml(cred.name || "Approval key")}">Rename</button>
+      <button type="button" class="ghost-btn trusted-fido-delete" data-fido-delete="${escapeHtml(cred.id || "")}" data-fido-name="${escapeHtml(cred.name || "Approval key")}" data-fido-last="${creds.length === 1 ? "1" : "0"}">Delete</button>
     </div>
   </article>`).join("");
   list.querySelectorAll("[data-fido-rename]").forEach((button) => {
     button.addEventListener("click", () => renameTrustedFidoKey(button.dataset.fidoRename, button.dataset.fidoName || "Approval key"));
+  });
+  list.querySelectorAll("[data-fido-delete]").forEach((button) => {
+    button.addEventListener("click", () => deleteTrustedFidoKey(button.dataset.fidoDelete, button.dataset.fidoName || "Approval key", button.dataset.fidoLast === "1"));
   });
 }
 
@@ -421,6 +463,26 @@ async function renameTrustedFidoKey(id, currentName) {
   }
 }
 
+async function deleteTrustedFidoKey(id, currentName, isLastKey = false) {
+  if (!id) return;
+  const label = currentName || "Approval key";
+  const warning = isLastKey
+    ? `\n\nThis is your last trusted approval key. You will need to register a new FIDO key before approving host operations again.`
+    : "";
+  if (!window.confirm(`Delete trusted FIDO key "${label}"? This cannot be undone.${warning}`)) return;
+  try {
+    await api(`/api/approval-webauthn/credentials/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: headers(),
+    });
+    setSync("Trusted FIDO key deleted");
+    await loadSystemSettings();
+    await loadOperations();
+  } catch (err) {
+    setSync(`Delete failed: ${err.message || err}`);
+  }
+}
+
 async function getApprovalAssertion(operationId) {
   if (!window.PublicKeyCredential || !navigator.credentials) {
     throw new Error("This browser does not support passkeys/WebAuthn");
@@ -434,6 +496,94 @@ async function getApprovalAssertion(operationId) {
   });
   return credentialToJson(credential);
 }
+
+function renderOctoAdminSession() {
+  const status = $("#octoAdminSessionStatus");
+  const start = $("#startOctoAdminSessionBtn");
+  const revoke = $("#revokeOctoAdminSessionBtn");
+  const session = octoAdmin.active;
+  if (!status || !start || !revoke) return;
+  status.className = "approval-runner octo-session-state";
+  if (!session) {
+    status.textContent = "Octo admin session inactive";
+    status.classList.add("inactive");
+    start.hidden = false;
+    start.disabled = false;
+    start.textContent = "Start 10-minute Octo session";
+    revoke.hidden = true;
+    return;
+  }
+  const remaining = Math.max(0, Math.ceil((Date.parse(session.expires_at) - Date.now()) / 1000));
+  if (remaining) {
+    status.classList.add("active");
+    status.textContent = `✓ Octo admin approval successful · active for ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")} · ${session.operator_name || session.operator_subject}`;
+    start.hidden = false;
+    start.disabled = true;
+    start.textContent = "Approved — Octo session active";
+  } else {
+    status.classList.add("expired");
+    status.textContent = "Octo admin session expired";
+    start.hidden = false;
+    start.disabled = false;
+    start.textContent = "Start 10-minute Octo session";
+  }
+  revoke.hidden = remaining <= 0;
+}
+
+async function loadOctoAdminSession() {
+  try {
+    const data = await api("/api/octo-admin-session", { headers: headers() });
+    octoAdmin.active = data.active || null;
+  } catch (_) {
+    octoAdmin.active = null;
+  }
+  renderOctoAdminSession();
+  if (!octoAdmin.timer) octoAdmin.timer = window.setInterval(renderOctoAdminSession, 1000);
+}
+
+async function startOctoAdminSession() {
+  if (!window.PublicKeyCredential || !navigator.credentials) {
+    setSync("This browser does not support passkeys/WebAuthn");
+    return;
+  }
+  const reason = window.prompt("Reason for opening Octo's 10-minute admin session:", "Administer eligible Rancher Desktop workloads");
+  if (reason === null || !reason.trim()) return;
+  try {
+    const start = $("#startOctoAdminSessionBtn");
+    if (start) {
+      start.disabled = true;
+      start.textContent = "Waiting for FIDO touch…";
+    }
+    const options = await api("/api/octo-admin-session/webauthn/options", { method: "POST", headers: headers() });
+    setSync("Verify with your FIDO key to open Octo's admin session…");
+    const credential = await navigator.credentials.get({ publicKey: prepareCredentialGetOptions(options.publicKey) });
+    if (start) start.textContent = "Opening Octo session…";
+    const data = await api("/api/octo-admin-session/start", {
+      method: "POST", headers: headers(),
+      body: JSON.stringify({ reason: reason.trim(), webauthn: credentialToJson(credential) }),
+    });
+    octoAdmin.active = data.session || null;
+    renderOctoAdminSession();
+    setSync("Octo admin approval successful — session is active");
+  } catch (err) {
+    setSync(`Could not open Octo admin session: ${err.message || err}`);
+    renderOctoAdminSession();
+  }
+}
+
+async function revokeOctoAdminSession() {
+  try {
+    await api("/api/octo-admin-session/revoke", { method: "POST", headers: headers() });
+    octoAdmin.active = null;
+    renderOctoAdminSession();
+    setSync("Octo admin session revoked");
+  } catch (err) {
+    setSync(`Could not revoke Octo admin session: ${err.message || err}`);
+  }
+}
+
+$("#startOctoAdminSessionBtn")?.addEventListener("click", startOctoAdminSession);
+$("#revokeOctoAdminSessionBtn")?.addEventListener("click", revokeOctoAdminSession);
 
 function openOperationApproval(id) {
   const item = operations.requests.find((request) => request.id === id);
@@ -465,15 +615,21 @@ async function approveOperationWithFidoNow(id, source = "chat") {
     return;
   }
   try {
+    const approver = approvalOperatorName();
     await api(`/api/operations/${encodeURIComponent(item.id)}/approve`, {
       method: "POST",
       headers: headers(),
       body: JSON.stringify({
-        approved_by: approvalOperatorName(),
+        approved_by: approver,
         note: source === "chat" ? "Approved directly from Mission Control chat thread." : "",
         webauthn: assertion,
       }),
     });
+    item.status = "executing";
+    item.approved_by = approver;
+    item.approved_at = new Date().toISOString();
+    renderOperations();
+    if ($("#view-agent")?.classList.contains("active")) renderChat({ preserveScroll: true });
     setSync("FIDO approval accepted — executing operation…");
     await loadOperations();
     if ($("#view-settings")?.classList.contains("active")) await loadSystemSettings();
@@ -4057,8 +4213,7 @@ function renderChat(options = {}) {
     ).join("");
     const cursor = m.role === "agent" && m.streaming ? `<span class="cursor"></span>` : "";
     const timeHtml = m.ts ? `<time class="msg-time" datetime="${escapeHtml(m.ts)}">${escapeHtml(formatTime(m.ts))}</time>` : "";
-    const approvalAction = m.approval_id && m.approval_status === "requested"
-      ? `<button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(m.approval_id)}">Approve here with FIDO</button>` : "";
+    const approvalControl = chatApprovalControl(m.approval_id, m.approval_status);
     // Agents commonly cite proposal IDs in their own response. Make those
     // references actionable in-place, rather than making the operator hunt for
     // a separate system notification below the reply.
@@ -4068,7 +4223,7 @@ function renderChat(options = {}) {
           .filter(Boolean) : [];
     const referencedActions = referenced.length ? `<div class="chat-inline-approvals">${referenced.map((item) =>
       `<button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(item.id)}">Approve ${escapeHtml(operationLabel(item.action))} with FIDO</button>`).join("")}</div>` : "";
-    return `<div class="msg ${cls}"><span class="meta">${metaInner}${timeHtml}</span><div class="md-body msg-md">${renderMarkdown(m.text, profile)}</div>${approvalAction}${referencedActions}${cursor}${atts}</div>`;
+    return `<div class="msg ${cls}${approvalControl.className}"><span class="meta">${metaInner}${timeHtml}</span><div class="md-body msg-md">${renderMarkdown(m.text, profile)}</div>${approvalControl.html}${referencedActions}${cursor}${atts}</div>`;
   }).join("");
   const pendingApprovals = operations.requests.filter((item) =>
     item.status === "pending_approval" && item.requested_by === profile && item.conversation_id === convId);
@@ -4779,6 +4934,7 @@ loadUsage();
 loadCron();
 loadKanban();
 loadOperations();
+loadOctoAdminSession();
 setInterval(loadState, 15000);
 setInterval(() => updateFreshnessStatus(), 15000);
 setInterval(loadAgentsHealth, 15000);

@@ -35,7 +35,7 @@ Service counts use one definition everywhere: **15 core services** start without
 
 | File | Purpose |
 |---|---|
-| `spec/system.manifest.yaml` | Canonical machine-readable manifest. Invariants I1-I11. |
+| `spec/system.manifest.yaml` | Canonical machine-readable manifest. Invariants I1-I12. |
 | `spec/services.yaml` | Service list + ports + networks + volumes. |
 | `spec/namespaces.yaml` | Logical → OpenViking URI mapping rules. |
 | `spec/policies.schema.json` | JSON Schema for `policies/*.policy.yaml`. |
@@ -67,6 +67,7 @@ These appear in `spec/system.manifest.yaml` and are non-negotiable:
 - **I9**  LittleJohn's Kali MCP is optional, on-demand, has no host port, stays off the memory and shared platform networks, and is reachable only over its dedicated LittleJohn/Kali network. Only its exact start/stop/restart lifecycle is pre-approved.
 - **I10**  `operations-runner` is the only Hermes Platform service with Docker socket access. Mission Control and agents submit exact, persisted, single-use operations; they never receive a standing raw Docker API.
 - **I11**  Windows host work crosses the localhost boundary through the Mission Control queue. The default elevated runner executes only built-in allowlisted remediation IDs and structured `host_filesystem` transactions for approved profiles; arbitrary submitted PowerShell requires an explicit operator-enabled raw mode.
+- **I12**  Octo administration is a single operator-opened, ten-minute brokered session over explicitly enrolled non-protected workloads; destructive actions retain per-operation FIDO step-up.
 
 If a change would violate any invariant, **stop and ask the operator**.
 

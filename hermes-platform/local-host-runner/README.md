@@ -41,6 +41,8 @@ agent-submitted PowerShell. It only executes built-in remediations whose
 Current allowlist:
 
 - `cis-windows-top5-v1`
+- `software-vulnerability-remediation-v1` for FIDO-approved, structured
+  localhost software vulnerability remediation through fixed `winget` actions
 - `host_filesystem` structured transactions for `default`, `littlejohn`, and
   `octo` (prepare first, commit by separate approval)
 
@@ -57,6 +59,48 @@ Little John should submit a host operation with:
 
 The script remains visible in Mission Control for human review, but the scoped
 runner ignores it and executes its local implementation for the remediation ID.
+
+## Generic software vulnerability remediation
+
+For software vulnerabilities on the localhost, Little John should use the
+allowlisted `software-vulnerability-remediation-v1` lane instead of submitting
+arbitrary PowerShell. The submitted script is still review text only; the runner
+executes fixed `winget` command shapes from a structured JSON payload after FIDO
+approval.
+
+Example payload:
+
+```json
+{
+  "packages": [
+    {
+      "action": "upgrade",
+      "winget_id": "Microsoft.VisualStudioCode",
+      "name": "Microsoft Visual Studio Code",
+      "publisher": "Microsoft Corporation",
+      "scope": "machine",
+      "cves": ["CVE-2026-47281"],
+      "justification": "Wazuh reports critical/high VS Code vulnerability findings on localhost."
+    }
+  ]
+}
+```
+
+Supported actions are `upgrade`, `install`, and `uninstall` against exact
+`winget_id` values. The runner captures `winget show`, pre/post `winget list`,
+the fixed command line, exit code, and output.
+
+Submit with:
+
+```bash
+/opt/ironnest/request-host-operation.py \
+  "Localhost software vulnerability remediation" \
+  --script-file /path/to/operator-review-plan.ps1 \
+  --reason "Remediate Wazuh-reported localhost software vulnerabilities" \
+  --remediation-id software-vulnerability-remediation-v1 \
+  --remediation-payload-file /path/to/software-remediation.json \
+  --risk critical
+```
 
 ## Host filesystem transaction lane
 

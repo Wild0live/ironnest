@@ -381,7 +381,7 @@ Invariant I3 (per-profile volume isolation) was designed for the AGENT container
 
 **Security notes:**
 - `MISSION_CONTROL_BRIDGE_TOKEN` is the shared secret between Mission Control and the bridges. If unset, the network/FIDO boundary is the only gate; production should set it.
-- Mission Control write APIs can also be gated by `MISSION_CONTROL_ADMIN_TOKEN`; if unset, Authelia FIDO is the write boundary.
+- Mission Control administrative write APIs revalidate the browser cookie directly with Authelia. `MISSION_CONTROL_ADMIN_TOKEN`, when configured, is an additional gate rather than an alternative identity boundary.
 - File downloads are basename-only and revalidated both in Mission Control and the bridge, with a realpath prefix check under `/opt/data/.mission-control-uploads`.
 - SOUL.md and model edits reset the profile's warm ACP process so the next turn reloads config.
 
@@ -410,3 +410,20 @@ Invariant I3 (per-profile volume isolation) was designed for the AGENT container
 - Auto-dispatch is inert until enabled per profile. Sensitive profiles can remain human-approval-only.
 
 **Impacts:** `docker-compose.yml`, `services.d/hermes-pf-{jaime,bigbert}.yml`, `agent-bridge/agent-chat-bridge.py`, `mission-control/app/main.py`, `mission-control/app/static/*`, `docs/02-SERVICES.md`, `spec/services.yaml`, `spec/system.manifest.yaml` invariant I8.
+
+---
+
+## D-019 — Octo administration is a short-lived brokered capability, never standing Docker authority
+
+**Date:** 2026-07-11
+**Status:** accepted
+
+**Decision:** Extend Mission Control and `operations-runner` with exactly one active Octo admin session. An individually identified Authelia operator opens it with an operator-bound WebAuthn assertion requiring user verification. The runner enforces a ten-minute hard expiry, while Mission Control adds a two-minute idle expiry. Octo keeps only its proposal credential and never receives the runner token or Docker socket.
+
+Eligible workload administration includes streamed root exec and validated non-destructive Docker lifecycle/factory actions. Existing workloads are enrolled by an exact operator-maintained list or the `io.ironnest.octo-admin=eligible` label; new workloads default to denied. The `io.ironnest.security-boundary=protected` label, an exact protected-name list, and Docker-socket mount detection override eligibility. Container deletion, kill, and factory volume/network deletion remain on the exact operation-bound FIDO approval path.
+
+**Identity boundary:** Mission Control is reachable internally for scoped agent proposals, so forwarded `Remote-User` headers alone are not authoritative. Administrative endpoints revalidate the browser cookie directly with Authelia and use the returned immutable subject for credential ownership and audit attribution. Legacy credentials without an operator subject are intentionally unusable until re-enrolled.
+
+**Rejected alternatives:** raw Docker socket access in Octo, unrestricted socket-proxy writes, privileged Octo, and shared root credentials. Each would let an agent bypass FIDO, alter the approver/audit plane, or escape to the Rancher Desktop host.
+
+**Impacts:** `mission-control/app/main.py`, `mission-control/app/static/*`, `operations-runner/app/main.py`, `authored-skills/octo/devops/approval-gated-operations`, `docker-compose.yml`, `security/socket-proxy/docker-compose.yml`, and manifest invariant I12.

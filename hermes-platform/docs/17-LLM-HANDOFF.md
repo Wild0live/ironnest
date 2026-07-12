@@ -11,7 +11,7 @@ A multi-profile Hermes runtime fronted by a policy-enforcing memory gateway in f
 ## Read these in this order
 
 1. `docs/00-AI-REBUILD-MANIFEST.md` — the meta-doc.
-2. `spec/system.manifest.yaml` — the canonical machine-readable manifest, including invariants I1-I11 you must preserve.
+2. `spec/system.manifest.yaml` — the canonical machine-readable manifest, including invariants I1-I12 you must preserve.
 3. `docs/01-ARCHITECTURE.md` — the picture.
 4. `docs/08-SECURITY-MODEL.md` — what the design protects against.
 5. `docs/16-DECISION-LOG.md` — why each non-obvious choice was made.
@@ -30,6 +30,7 @@ A multi-profile Hermes runtime fronted by a policy-enforcing memory gateway in f
 9. LittleJohn's Kali MCP is on-demand, has no host port, stays off the memory and shared platform networks, and exposes only its exact lifecycle as pre-approved.
 10. Only `operations-runner` may mount the Docker socket; Mission Control and agents submit exact, persisted, single-use operations instead of receiving raw Docker access.
 11. Windows host operations use the localhost file queue. The default elevated runner executes only built-in remediation IDs and structured filesystem transactions; raw PowerShell requires an explicit operator override.
+12. Octo admin access is a single operator-attributed, ten-minute brokered session over explicitly enrolled workloads. Protected control-plane containers and Docker-socket holders are always excluded; destructive actions require fresh operation-bound FIDO approval.
 
 If a proposed change would violate any of these, **stop and ask the operator**. Don't "improve" the architecture out of these constraints — they are the architecture.
 

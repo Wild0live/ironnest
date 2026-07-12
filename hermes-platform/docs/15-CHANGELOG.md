@@ -5,6 +5,7 @@ All notable changes to hermes-platform. Format follows Keep a Changelog 1.1.0.
 ## [Unreleased] - 2026-07-11
 
 ### Added
+- **FIDO-gated Octo just-in-time administration** now provides one globally active, non-renewable session with a ten-minute hard limit and two-minute idle limit. Individually attributed operators open the session with an operator-bound WebAuthn credential requiring PIN/biometric verification. Octo can stream root-command output and run validated Docker lifecycle/factory operations only for explicitly enrolled, non-protected containers; destructive container/volume/network actions still require a fresh operation-specific FIDO approval.
 - **LittleJohn Kali MCP sidecar** added as optional on-demand service `kali-mcp-littlejohn` (`--profile kali`). It uses the community `k3nn3dy-ai/kali-mcp` SSE server pinned at commit `d46b46bd23f9801b63fc3d16253b5af07b653ec9`, publishes no host ports, mounts persistent `/work`, maps `/reports` to `./shared/littlejohn/kali`, and is reachable only from LittleJohn over `littlejohn-kali-net`.
 - **Pre-approved LittleJohn lifecycle lane** for the exact actions `start`, `stop`, and `restart` on `kali-mcp-littlejohn`. Other Docker, host, network, mount, image, and privileged changes remain approval-gated.
 - **LittleJohn Kali tool baseline** now includes Nmap, Masscan, Amass, theHarvester, ffuf, OWASP ZAP, sqlmap, Nikto, XSStrike, Metasploit Framework, Hydra, John the Ripper, Nuclei, GVM/OpenVAS packages, Lynis, YARA, Volatility 3, and Autopsy. GVM/OpenVAS is installed but still requires runtime scanner/feed initialization before full scanner use.
@@ -14,6 +15,8 @@ All notable changes to hermes-platform. Format follows Keep a Changelog 1.1.0.
 - **Missed-cron catch-up** added through `scripts/catch-up-missed-cron.sh` and Mission Control's cron catch-up endpoint so overdue schedules can run once after the stack returns.
 
 ### Changed
+- Mission Control now revalidates its browser cookie directly with Authelia for administrative APIs instead of trusting network-originated `Remote-*` headers. Existing unbound approval credentials must be re-enrolled under their individual Authelia operator accounts.
+- The shared `socket-proxy` is read-only again: unauthenticated start/stop/restart on `platform-net` is disabled so agents cannot bypass Mission Control's FIDO/session boundary.
 - **Profile `wifey` renamed to `qa`** (QA/verification specialist; repurposed from the former home/household persona). Container `hermes-pf-wifey` → `hermes-pf-qa`, named volume `hermes-platform_data-wifey` → `hermes-platform_data-qa` (data migrated), policy `wifey.policy.yaml` → `qa.policy.yaml`, Infisical path `/hermes-platform/wifey` → `/hermes-platform/qa`. Registry `description` rewritten for QA routing.
 - **Hermes Agent upgraded to v0.17.0** (NousResearch tag `v2026.6.19`), with all profile and ttyd consumers pinned to `platform/hermes-agent:v2026.6.19-patched`.
 - Kanban decompose routing now reads declarative `description` fields from `registry/profiles-registry.yaml` (schema-validated) and materializes them into the orchestrator roster via the idempotent `scripts/sync-orchestrator-roster.sh` (wired into `start.sh`).

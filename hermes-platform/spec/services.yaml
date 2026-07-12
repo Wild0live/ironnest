@@ -232,6 +232,10 @@ services:
         url_pattern: http://hermes-pf-<profile>:8011
         auth: MISSION_CONTROL_BRIDGE_TOKEN
         features: [chat, token_streaming, file_downloads, soul_edit, model_switch, role_summary, kanban_proxy, manual_task_run, task_decompose, autodispatch_controls]
+      - target: operations-runner
+        url_pattern: http://operations-runner:8091
+        auth: OPERATIONS_RUNNER_TOKEN
+        features: [exact_approved_operations, octo_admin_session_broker, streamed_exec_relay]
 
   - name: operations-runner
     container_name: hermes-platform-operations-runner
@@ -250,7 +254,7 @@ services:
       no_new_privileges: true
     owns:
       - hermes-platform_operations-runner-state:/var/lib/operations-runner
-    notes: The only Hermes Platform service with Docker socket access; requests are exact, persisted, allowlisted, and single-use.
+    notes: The only Hermes Platform service with Docker socket access; requests are exact, persisted, allowlisted, and single-use. Octo admin sessions are non-renewable, capped at ten minutes, enrollment-gated, and cannot target protected or Docker-socket containers.
 
   - name: artifact-apps
     container_name: hermes-platform-artifact-apps

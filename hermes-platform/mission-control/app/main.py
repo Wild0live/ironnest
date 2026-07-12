@@ -7,9 +7,9 @@ OpenViking networks. It reads two of the gateway's files read-only:
     - the profile registry  (registry/profiles-registry.yaml, bind-mounted ro)
     - the audit log          (memory-gateway-log volume, mounted ro)
 
-…and owns a small JSON store for tasks/schedules on its own volume. Writes are
-optionally gated by MISSION_CONTROL_ADMIN_TOKEN; when unset, the Authelia FIDO
-gate in front of this host is the auth boundary.  Its optional operations
+…and owns a small JSON store for tasks/schedules on its own volume. Administrative
+writes require a browser session revalidated directly with Authelia; when
+MISSION_CONTROL_ADMIN_TOKEN is set, it is an additional gate. Its optional operations
 integration carries only a runner-specific capability token, never Docker,
 gateway, or profile credentials.
 """
@@ -32,7 +32,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -54,6 +54,10 @@ AUDIT_LOG = Path(os.environ.get("MISSION_CONTROL_AUDIT_LOG", "/var/log/gateway/a
 STATE_FILE = Path(os.environ.get("MISSION_CONTROL_STATE_FILE",
                                  "/var/lib/mission-control/state.json"))
 ADMIN_TOKEN = os.environ.get("MISSION_CONTROL_ADMIN_TOKEN", "").strip()
+AUTHELIA_VERIFY_URL = os.environ.get(
+    "MISSION_CONTROL_AUTHELIA_VERIFY_URL", "http://authelia:9091/api/authz/forward-auth").strip()
+MISSION_CONTROL_PUBLIC_ORIGIN = os.environ.get(
+    "MISSION_CONTROL_PUBLIC_ORIGIN", "https://mission.ironnest.local").rstrip("/")
 
 # Per-profile agent chat bridge (listener inside each hermes-pf-* container).
 BRIDGE_TOKEN = os.environ.get("MISSION_CONTROL_BRIDGE_TOKEN", "").strip()
@@ -72,6 +76,9 @@ OPERATIONS_ALLOW_ALL_CONTAINERS = os.environ.get("OPERATIONS_ALLOW_ALL_CONTAINER
     "1", "true", "yes", "on"}
 _DOCKER_CONTAINER_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
 OPERATIONS_APPROVAL_TTL = int(os.environ.get("OPERATIONS_APPROVAL_TTL_SECONDS", "600"))
+OCTO_ADMIN_SESSION_TTL = min(600, max(60, int(os.environ.get("OCTO_ADMIN_SESSION_TTL_SECONDS", "600"))))
+OCTO_ADMIN_SESSION_IDLE_TTL = min(OCTO_ADMIN_SESSION_TTL, max(
+    30, int(os.environ.get("OCTO_ADMIN_SESSION_IDLE_TTL_SECONDS", "120"))))
 OPERATIONS_ARCHIVE_AFTER_DAYS = int(os.environ.get("OPERATIONS_ARCHIVE_AFTER_DAYS", "30"))
 OPERATIONS_RETENTION_DAYS = int(os.environ.get("OPERATIONS_RETENTION_DAYS", "180"))
 # Scoped credential held by Octo and Mission Control only. It authorizes a
@@ -188,6 +195,9 @@ class OperationRequestCreate(BaseModel):
     # Optional narrow-runner selector. A scoped host runner may ignore script
     # text and execute only its local implementation for this ID.
     remediation_id: str | None = Field(default=None, max_length=80)
+    # Optional structured input for an allowlisted remediation implementation.
+    # This is data for the local runner, not shell text.
+    remediation_payload: dict[str, Any] | None = None
     # Only used for host_filesystem. This is structured JSON consumed by the
     # local Windows runner; it is not script or shell text.
     filesystem_transaction: dict[str, Any] | None = None
@@ -215,6 +225,28 @@ class WebAuthnCredentialRename(BaseModel):
     name: str = Field(..., min_length=1, max_length=80)
 
 
+class AdminSessionStart(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=500)
+    webauthn: dict[str, Any]
+
+
+class AdminSessionExec(BaseModel):
+    target: str = Field(..., min_length=1, max_length=128)
+    command: list[str] = Field(..., min_length=1, max_length=128)
+    working_dir: str | None = Field(default=None, max_length=512)
+    env: list[str] = Field(default_factory=list, max_length=64)
+    reason: str = Field(..., min_length=3, max_length=500)
+
+
+class AdminSessionActionRequest(BaseModel):
+    action: Literal["start", "stop", "restart", "pause", "unpause", "docker_api"]
+    target: str = Field(..., min_length=1, max_length=128)
+    reason: str = Field(..., min_length=3, max_length=500)
+    method: Literal["POST"] | None = None
+    path: str | None = Field(default=None, max_length=300)
+    body: dict[str, Any] | None = None
+
+
 class AppReleasePublish(BaseModel):
     """An explicit promotion of a runnable artifact into the Apps catalogue."""
     task_id: str = Field(..., min_length=1, max_length=160)
@@ -240,15 +272,46 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def require_admin(authorization: str | None = Header(default=None)) -> None:
-    """If a token is configured, enforce it on writes. If not, the Authelia
-    FIDO gate in front of this host is the auth boundary — allow."""
-    if not ADMIN_TOKEN:
-        return
-    expected = f"Bearer {ADMIN_TOKEN}"
-    if authorization != expected:
+def require_admin(request: Request,
+                  authorization: str | None = Header(default=None)) -> dict[str, str]:
+    """Revalidate the browser's Authelia session and return its operator identity.
+
+    Mission Control is also reachable from profile containers for scoped proposal
+    endpoints, so trusting forwarded Remote-* headers alone would allow an agent
+    to impersonate an operator.  The cookie is rechecked with Authelia here and
+    the identity returned by that verification response is authoritative.
+    """
+    if ADMIN_TOKEN and authorization != f"Bearer {ADMIN_TOKEN}":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail="admin token required")
+    cookie = request.headers.get("cookie", "")
+    if not AUTHELIA_VERIFY_URL or not cookie:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="authenticated Authelia operator session required")
+    verify = urllib.request.Request(AUTHELIA_VERIFY_URL, method="GET", headers={
+        "Cookie": cookie,
+        "X-Original-URL": f"{MISSION_CONTROL_PUBLIC_ORIGIN}{request.url.path}",
+        "X-Forwarded-Proto": "https",
+        "X-Forwarded-Host": urllib.parse.urlsplit(MISSION_CONTROL_PUBLIC_ORIGIN).netloc,
+        "X-Forwarded-URI": request.url.path,
+        "X-Forwarded-Method": request.method,
+    })
+    try:
+        with urllib.request.urlopen(verify, timeout=5) as response:
+            subject = str(response.headers.get("Remote-User") or "").strip()
+            groups = str(response.headers.get("Remote-Groups") or "").strip()
+            name = str(response.headers.get("Remote-Name") or subject).strip()
+            email = str(response.headers.get("Remote-Email") or "").strip()
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Authelia operator session was rejected") from exc
+    except (OSError, urllib.error.URLError) as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="Authelia verification is unavailable") from exc
+    if not subject:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Authelia response did not identify an operator")
+    return {"subject": subject, "groups": groups, "name": name, "email": email}
 
 
 def require_octo_operations_submit(
@@ -304,6 +367,7 @@ def _default_store() -> dict[str, Any]:
         "schedules": [],
         "operations": [],
         "approval_webauthn": {"credentials": [], "challenges": []},
+        "octo_admin_sessions": [],
         # Release metadata is Mission Control-owned. It never changes the
         # gateway-owned artifacts that supplied the runnable app.
         "app_releases": [],
@@ -327,6 +391,7 @@ def _read_store() -> dict[str, Any]:
     data.setdefault("approval_webauthn", {"credentials": [], "challenges": []})
     data["approval_webauthn"].setdefault("credentials", [])
     data["approval_webauthn"].setdefault("challenges", [])
+    data.setdefault("octo_admin_sessions", [])
     data.setdefault("app_releases", [])
     data.setdefault("app_candidates", [])
     return data
@@ -358,7 +423,7 @@ def _webauthn_store(store: dict[str, Any]) -> dict[str, Any]:
 
 def _new_webauthn_challenge(store: dict[str, Any], purpose: str,
                             operation_id: str | None = None,
-                            name: str = "") -> str:
+                            name: str = "", operator_subject: str = "") -> str:
     data = _webauthn_store(store)
     now = time.time()
     data["challenges"] = [
@@ -371,6 +436,7 @@ def _new_webauthn_challenge(store: dict[str, Any], purpose: str,
         "purpose": purpose,
         "operation_id": operation_id or "",
         "name": name,
+        "operator_subject": operator_subject,
         "expires_at": now + APPROVAL_WEBAUTHN_CHALLENGE_TTL,
         "created_at": _now(),
     })
@@ -378,13 +444,16 @@ def _new_webauthn_challenge(store: dict[str, Any], purpose: str,
 
 
 def _consume_webauthn_challenge(store: dict[str, Any], challenge: str,
-                                purpose: str, operation_id: str | None = None) -> dict[str, Any]:
+                                purpose: str, operation_id: str | None = None,
+                                operator_subject: str = "") -> dict[str, Any]:
     data = _webauthn_store(store)
     now = time.time()
     for item in data.get("challenges", []):
         if item.get("challenge") != challenge or item.get("purpose") != purpose:
             continue
         if (operation_id or "") != str(item.get("operation_id", "")):
+            continue
+        if operator_subject and operator_subject != str(item.get("operator_subject", "")):
             continue
         if item.get("used") or float(item.get("expires_at", 0)) <= now:
             raise HTTPException(status_code=409, detail="WebAuthn challenge expired")
@@ -420,6 +489,8 @@ def _parse_authenticator_data(auth_data: bytes) -> dict[str, Any]:
     flags = auth_data[32]
     if not flags & 0x01:
         raise HTTPException(status_code=403, detail="FIDO key touch/user presence is required")
+    if not flags & 0x04:
+        raise HTTPException(status_code=403, detail="FIDO user verification (PIN or biometric) is required")
     sign_count = int.from_bytes(auth_data[33:37], "big")
     out: dict[str, Any] = {"flags": flags, "sign_count": sign_count}
     if flags & 0x40:
@@ -457,11 +528,25 @@ def _webauthn_credentials(store: dict[str, Any]) -> list[dict[str, Any]]:
     return list(_webauthn_store(store).get("credentials", []))
 
 
-def _verify_webauthn_registration(payload: WebAuthnCredentialResponse) -> dict[str, Any]:
+def _credential_visible_to_operator(credential: dict[str, Any],
+                                    operator: dict[str, str]) -> bool:
+    owner = str(credential.get("operator_subject") or "").strip()
+    return not owner or owner == operator["subject"]
+
+
+def _operator_webauthn_credentials(store: dict[str, Any],
+                                   operator: dict[str, str]) -> list[dict[str, Any]]:
+    return [c for c in _webauthn_credentials(store)
+            if str(c.get("operator_subject") or "").strip() == operator["subject"]]
+
+
+def _verify_webauthn_registration(payload: WebAuthnCredentialResponse,
+                                  operator: dict[str, str]) -> dict[str, Any]:
     store = _read_store()
     response = payload.response
     client, _client_raw, challenge = _client_data(response, "webauthn.create")
-    challenge_item = _consume_webauthn_challenge(store, challenge, "register")
+    challenge_item = _consume_webauthn_challenge(
+        store, challenge, "register", operator_subject=operator["subject"])
     attestation_object = cbor2.loads(_unb64u(str(response.get("attestationObject", ""))))
     auth_data = _parse_authenticator_data(attestation_object.get("authData", b""))
     credential_id = _b64u(auth_data["credential_id"])
@@ -479,6 +564,8 @@ def _verify_webauthn_registration(payload: WebAuthnCredentialResponse) -> dict[s
         "created_at": _now(),
         "last_used_at": None,
         "origin": client.get("origin", ""),
+        "operator_subject": operator["subject"],
+        "operator_name": operator.get("name", operator["subject"]),
     }
     data["credentials"].append(credential)
     _write_store(store)
@@ -486,7 +573,8 @@ def _verify_webauthn_registration(payload: WebAuthnCredentialResponse) -> dict[s
 
 
 def _verify_webauthn_assertion(store: dict[str, Any], operation: dict[str, Any],
-                               payload: dict[str, Any] | None) -> dict[str, Any]:
+                               payload: dict[str, Any] | None,
+                               operator: dict[str, str], purpose: str = "approve") -> dict[str, Any]:
     if not payload:
         raise HTTPException(status_code=428, detail="FIDO key touch is required for approval")
     credentials = _webauthn_credentials(store)
@@ -496,9 +584,14 @@ def _verify_webauthn_assertion(store: dict[str, Any], operation: dict[str, Any],
     credential = next((c for c in credentials if c.get("id") == credential_id), None)
     if not credential:
         raise HTTPException(status_code=403, detail="unknown approval passkey")
+    if not credential.get("operator_subject"):
+        raise HTTPException(status_code=403, detail="legacy approval passkey must be deleted and re-enrolled")
+    if not _credential_visible_to_operator(credential, operator):
+        raise HTTPException(status_code=403, detail="approval passkey belongs to another operator")
     response = payload.get("response") or {}
     _client, client_raw, challenge = _client_data(response, "webauthn.get")
-    _consume_webauthn_challenge(store, challenge, "approve", str(operation.get("id", "")))
+    _consume_webauthn_challenge(store, challenge, purpose, str(operation.get("id", "")),
+                                operator_subject=operator["subject"])
     auth_data_raw = _unb64u(str(response.get("authenticatorData", "")))
     auth_data = _parse_authenticator_data(auth_data_raw)
     signature = _unb64u(str(response.get("signature", "")))
@@ -1094,31 +1187,36 @@ def terminal_targets() -> JSONResponse:
 
 
 @router.get("/api/approval-webauthn/status")
-def approval_webauthn_status(_: None = Depends(require_admin)) -> JSONResponse:
+def approval_webauthn_status(operator: dict[str, str] = Depends(require_admin)) -> JSONResponse:
     store = _read_store()
-    creds = _webauthn_credentials(store)
+    all_creds = _webauthn_credentials(store)
+    creds = _operator_webauthn_credentials(store, operator)
     return JSONResponse(content={
         "rp_id": APPROVAL_WEBAUTHN_RP_ID,
         "origins": sorted(APPROVAL_WEBAUTHN_ORIGINS),
         "credential_count": len(creds),
+        "unbound_legacy_credential_count": sum(1 for c in all_creds if not c.get("operator_subject")),
+        "operator": {"subject": operator["subject"], "name": operator.get("name", operator["subject"])},
         "credentials": [{"id": c.get("id"), "name": c.get("name"), "created_at": c.get("created_at"),
                          "last_used_at": c.get("last_used_at"),
-                         "renamed_at": c.get("renamed_at")} for c in creds],
+                         "renamed_at": c.get("renamed_at"),
+                         "legacy_unbound": not bool(c.get("operator_subject"))} for c in creds],
     })
 
 
 @router.post("/api/approval-webauthn/register/options")
 def approval_webauthn_register_options(req: WebAuthnRegistrationStart,
-                                       _: None = Depends(require_admin)) -> JSONResponse:
+                                       operator: dict[str, str] = Depends(require_admin)) -> JSONResponse:
     store = _read_store()
-    challenge = _new_webauthn_challenge(store, "register", name=req.name.strip())
+    challenge = _new_webauthn_challenge(store, "register", name=req.name.strip(),
+                                         operator_subject=operator["subject"])
     _write_store(store)
-    user_id = _b64u(os.urandom(16))
+    user_id = _b64u(hashlib.sha256(f"mission-control:{operator['subject']}".encode()).digest()[:16])
     return JSONResponse(content={"publicKey": {
         "challenge": challenge,
         "rp": {"name": "IronNest Mission Control", "id": APPROVAL_WEBAUTHN_RP_ID},
-        "user": {"id": user_id, "name": "mission-control-approver",
-                 "displayName": req.name.strip()},
+        "user": {"id": user_id, "name": operator["subject"],
+                 "displayName": operator.get("name", operator["subject"])},
         "pubKeyCredParams": [{"type": "public-key", "alg": -7}],
         "timeout": APPROVAL_WEBAUTHN_TIMEOUT_MS,
         "attestation": "none",
@@ -1126,15 +1224,15 @@ def approval_webauthn_register_options(req: WebAuthnRegistrationStart,
             "authenticatorAttachment": "cross-platform",
             "residentKey": "discouraged",
             "requireResidentKey": False,
-            "userVerification": "discouraged",
+            "userVerification": "required",
         },
     }})
 
 
 @router.post("/api/approval-webauthn/register/verify")
 def approval_webauthn_register_verify(req: WebAuthnCredentialResponse,
-                                      _: None = Depends(require_admin)) -> JSONResponse:
-    credential = _verify_webauthn_registration(req)
+                                      operator: dict[str, str] = Depends(require_admin)) -> JSONResponse:
+    credential = _verify_webauthn_registration(req, operator)
     return JSONResponse(content={"ok": True, "credential": {
         "id": credential["id"],
         "name": credential["name"],
@@ -1144,12 +1242,14 @@ def approval_webauthn_register_verify(req: WebAuthnCredentialResponse,
 
 @router.patch("/api/approval-webauthn/credentials/{credential_id}")
 def approval_webauthn_credential_rename(credential_id: str, req: WebAuthnCredentialRename,
-                                        _: None = Depends(require_admin)) -> JSONResponse:
+                                        operator: dict[str, str] = Depends(require_admin)) -> JSONResponse:
     store = _read_store()
     credentials = _webauthn_store(store).get("credentials", [])
     credential = next((c for c in credentials if c.get("id") == credential_id), None)
     if credential is None:
         raise HTTPException(status_code=404, detail="trusted FIDO key not found")
+    if not _credential_visible_to_operator(credential, operator):
+        raise HTTPException(status_code=403, detail="trusted FIDO key belongs to another operator")
     credential["name"] = req.name.strip()
     credential["renamed_at"] = _now()
     _write_store(store)
@@ -1162,25 +1262,52 @@ def approval_webauthn_credential_rename(credential_id: str, req: WebAuthnCredent
     }})
 
 
+@router.delete("/api/approval-webauthn/credentials/{credential_id}")
+def approval_webauthn_credential_delete(credential_id: str,
+                                        operator: dict[str, str] = Depends(require_admin)) -> JSONResponse:
+    store = _read_store()
+    data = _webauthn_store(store)
+    credentials = data.get("credentials", [])
+    credential = next((c for c in credentials if c.get("id") == credential_id), None)
+    if credential is None:
+        raise HTTPException(status_code=404, detail="trusted FIDO key not found")
+    if not _credential_visible_to_operator(credential, operator):
+        raise HTTPException(status_code=403, detail="trusted FIDO key belongs to another operator")
+    data["credentials"] = [c for c in credentials if c.get("id") != credential_id]
+    # Drop outstanding WebAuthn challenges for this operator. This prevents a
+    # challenge minted before deletion from being completed with a now-deleted
+    # key, while leaving other operators' registration/approval flows alone.
+    data["challenges"] = [
+        c for c in data.get("challenges", [])
+        if c.get("operator_subject") != operator["subject"] or c.get("used")
+    ]
+    _write_store(store)
+    return JSONResponse(content={"ok": True, "deleted": {
+        "id": credential.get("id"),
+        "name": credential.get("name"),
+    }})
+
+
 @router.post("/api/operations/{operation_id}/approval-webauthn/options")
 def operation_approval_webauthn_options(operation_id: str,
-                                        _: None = Depends(require_admin)) -> JSONResponse:
+                                        operator: dict[str, str] = Depends(require_admin)) -> JSONResponse:
     store = _read_store()
     item = next((x for x in store.get("operations", []) if x.get("id") == operation_id), None)
     if item is None:
         raise HTTPException(status_code=404, detail="operation request not found")
     if item.get("status") != "pending_approval":
         raise HTTPException(status_code=409, detail="operation request is no longer pending")
-    creds = _webauthn_credentials(store)
+    creds = _operator_webauthn_credentials(store, operator)
     if not creds:
         raise HTTPException(status_code=409, detail="register an approval passkey first")
-    challenge = _new_webauthn_challenge(store, "approve", operation_id=operation_id)
+    challenge = _new_webauthn_challenge(store, "approve", operation_id=operation_id,
+                                         operator_subject=operator["subject"])
     _write_store(store)
     return JSONResponse(content={"publicKey": {
         "challenge": challenge,
         "rpId": APPROVAL_WEBAUTHN_RP_ID,
         "timeout": APPROVAL_WEBAUTHN_TIMEOUT_MS,
-        "userVerification": "discouraged",
+        "userVerification": "required",
         "allowCredentials": [{"type": "public-key", "id": c["id"]} for c in creds],
     }, "operation": {
         "id": item.get("id"),
@@ -3129,6 +3256,51 @@ def _operation_target_allowed(value: str) -> bool:
         OPERATIONS_ALLOW_ALL_CONTAINERS or value in OPERATIONS_ALLOWED_CONTAINERS)
 
 
+def _parse_utc(value: str) -> datetime:
+    try:
+        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail="admin session has an invalid timestamp") from exc
+    if result.tzinfo is None:
+        raise HTTPException(status_code=409, detail="admin session timestamp lacks timezone")
+    return result.astimezone(timezone.utc)
+
+
+def _active_octo_admin_session(store: dict[str, Any], *, touch: bool = False) -> dict[str, Any]:
+    now_dt = datetime.now(timezone.utc)
+    active = [s for s in store.get("octo_admin_sessions", []) if s.get("status") == "active"]
+    for session in active:
+        expired = _parse_utc(str(session.get("expires_at", ""))) <= now_dt
+        idle = (now_dt - _parse_utc(str(session.get("last_activity_at", session.get("issued_at", ""))))).total_seconds()
+        if expired or idle > OCTO_ADMIN_SESSION_IDLE_TTL:
+            session["status"] = "expired"
+            session["expired_at"] = _now()
+    active = [s for s in active if s.get("status") == "active"]
+    if not active:
+        raise HTTPException(status_code=403, detail="no active Octo admin session")
+    if len(active) > 1:
+        raise HTTPException(status_code=409, detail="multiple active Octo admin sessions detected")
+    if touch:
+        active[0]["last_activity_at"] = _now()
+    return active[0]
+
+
+def _runner_json(path: str, payload: dict[str, Any], timeout: int = 45) -> dict[str, Any]:
+    if not OPERATIONS_RUNNER_URL or not OPERATIONS_RUNNER_TOKEN:
+        raise HTTPException(status_code=503, detail="operations runner is not configured")
+    request = urllib.request.Request(
+        f"{OPERATIONS_RUNNER_URL}{path}", data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {OPERATIONS_RUNNER_TOKEN}"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(1000).decode("utf-8", "replace")
+        raise HTTPException(status_code=exc.code, detail=f"operations runner rejected request: {detail}") from exc
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        raise HTTPException(status_code=502, detail=f"operations runner unavailable: {exc}") from exc
+
+
 def _host_queue_action(action: str) -> bool:
     return action in {"host_powershell", "host_filesystem"}
 
@@ -3208,8 +3380,189 @@ def _maintain_operations(store: dict[str, Any]) -> None:
         _write_store(store)
 
 
+@router.post("/api/octo-admin-session/webauthn/options")
+def octo_admin_session_options(operator: dict[str, str] = Depends(require_admin)) -> JSONResponse:
+    store = _read_store()
+    try:
+        _active_octo_admin_session(store)
+    except HTTPException as exc:
+        if exc.status_code != 403:
+            raise
+    else:
+        raise HTTPException(status_code=409, detail="an Octo admin session is already active")
+    creds = _operator_webauthn_credentials(store, operator)
+    if not creds:
+        raise HTTPException(status_code=409, detail="register an operator-bound approval key first")
+    operation_id = "octo-admin-session"
+    challenge = _new_webauthn_challenge(
+        store, "admin-session", operation_id=operation_id,
+        operator_subject=operator["subject"])
+    _write_store(store)
+    return JSONResponse(content={"publicKey": {
+        "challenge": challenge, "rpId": APPROVAL_WEBAUTHN_RP_ID,
+        "timeout": APPROVAL_WEBAUTHN_TIMEOUT_MS, "userVerification": "required",
+        "allowCredentials": [{"type": "public-key", "id": c["id"]} for c in creds],
+    }, "ttl_seconds": OCTO_ADMIN_SESSION_TTL,
+       "idle_ttl_seconds": OCTO_ADMIN_SESSION_IDLE_TTL})
+
+
+@router.post("/api/octo-admin-session/start")
+def octo_admin_session_start(req: AdminSessionStart,
+                             operator: dict[str, str] = Depends(require_admin)) -> JSONResponse:
+    store = _read_store()
+    try:
+        _active_octo_admin_session(store)
+    except HTTPException as exc:
+        if exc.status_code != 403:
+            raise
+    else:
+        raise HTTPException(status_code=409, detail="an Octo admin session is already active")
+    approval_target = {"id": "octo-admin-session"}
+    credential = _verify_webauthn_assertion(
+        store, approval_target, req.webauthn, operator, purpose="admin-session")
+    issued = datetime.now(timezone.utc)
+    expires = issued + timedelta(seconds=OCTO_ADMIN_SESSION_TTL)
+    session = {
+        "session_id": f"oas-{uuid.uuid4().hex}", "requested_by": "octo",
+        "operator_subject": operator["subject"],
+        "operator_name": operator.get("name", operator["subject"]),
+        "credential_id": credential["id"], "reason": req.reason.strip(),
+        "issued_at": issued.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "expires_at": expires.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "last_activity_at": issued.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "status": "active",
+    }
+    _runner_json("/v1/admin-sessions/open", session)
+    store.setdefault("octo_admin_sessions", []).append(session)
+    _write_store(store)
+    return JSONResponse(status_code=201, content={"ok": True, "session": session})
+
+
+@router.get("/api/octo-admin-session")
+def octo_admin_session_status(operator: dict[str, str] = Depends(require_admin)) -> JSONResponse:
+    store = _read_store()
+    try:
+        active = _active_octo_admin_session(store)
+    except HTTPException as exc:
+        if exc.status_code != 403:
+            raise
+        active = None
+    _write_store(store)
+    return JSONResponse(content={"active": active, "operator": {
+        "subject": operator["subject"], "name": operator.get("name", operator["subject"]),
+    }, "ttl_seconds": OCTO_ADMIN_SESSION_TTL,
+       "idle_ttl_seconds": OCTO_ADMIN_SESSION_IDLE_TTL})
+
+
+@router.post("/api/octo-admin-session/revoke")
+def octo_admin_session_revoke(operator: dict[str, str] = Depends(require_admin)) -> JSONResponse:
+    store = _read_store()
+    session = _active_octo_admin_session(store)
+    _runner_json(f"/v1/admin-sessions/{urllib.parse.quote(session['session_id'])}/close", {})
+    session["status"] = "revoked"
+    session["revoked_at"] = _now()
+    session["revoked_by"] = operator["subject"]
+    _write_store(store)
+    return JSONResponse(content={"ok": True})
+
+
+@router.get("/api/octo-admin-session/current/octo")
+def octo_admin_session_current(_: None = Depends(require_octo_operations_submit)) -> JSONResponse:
+    store = _read_store()
+    try:
+        session = _active_octo_admin_session(store)
+    except HTTPException as exc:
+        if exc.status_code != 403:
+            raise
+        session = None
+    _write_store(store)
+    return JSONResponse(content={"active": session})
+
+
+@router.post("/api/octo-admin-session/action/octo")
+def octo_admin_session_action(req: AdminSessionActionRequest,
+                              _: None = Depends(require_octo_operations_submit)) -> JSONResponse:
+    store = _read_store()
+    session = _active_octo_admin_session(store, touch=True)
+    request_id = f"op-{uuid.uuid4().hex}"
+    payload: dict[str, Any] = {
+        "session_id": session["session_id"], "request_id": request_id,
+        "action": req.action, "target": req.target,
+    }
+    if req.action == "docker_api":
+        if not req.method or not req.path:
+            raise HTTPException(status_code=400, detail="docker_api requires method and path")
+        payload["docker_request"] = {"method": req.method, "path": req.path, "body": req.body or {}}
+    result = _runner_json("/v1/admin-sessions/action", payload)
+    item = {
+        "id": request_id, "action": f"session:{req.action}", "target": req.target,
+        "reason": req.reason.strip(), "requested_by": "octo", "status": "executed",
+        "created_at": _now(), "approved_at": session["issued_at"],
+        "approved_by": session["operator_subject"], "admin_session_id": session["session_id"],
+        "result": result.get("result", result),
+    }
+    store.setdefault("operations", []).append(item)
+    _write_store(store)
+    return JSONResponse(content={"ok": True, "request": item})
+
+
+@router.post("/api/octo-admin-session/exec/octo")
+def octo_admin_session_exec(req: AdminSessionExec,
+                            _: None = Depends(require_octo_operations_submit)) -> StreamingResponse:
+    store = _read_store()
+    session = _active_octo_admin_session(store, touch=True)
+    request_id = f"op-{uuid.uuid4().hex}"
+    payload = {
+        "session_id": session["session_id"], "request_id": request_id,
+        "target": req.target, "command": req.command, "working_dir": req.working_dir,
+        "env": req.env,
+    }
+    runner_request = urllib.request.Request(
+        f"{OPERATIONS_RUNNER_URL}/v1/admin-sessions/exec",
+        data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {OPERATIONS_RUNNER_TOKEN}"})
+    try:
+        response = urllib.request.urlopen(runner_request, timeout=OCTO_ADMIN_SESSION_TTL + 30)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(1000).decode("utf-8", "replace")
+        raise HTTPException(status_code=exc.code, detail=f"operations runner rejected exec: {detail}") from exc
+    item = {
+        "id": request_id, "action": "session:exec", "target": req.target,
+        "reason": req.reason.strip(), "requested_by": "octo", "status": "executing",
+        "created_at": _now(), "approved_at": session["issued_at"],
+        "approved_by": session["operator_subject"], "admin_session_id": session["session_id"],
+        "command_sha256": hashlib.sha256(json.dumps(req.command, separators=(",", ":")).encode()).hexdigest(),
+        "result": None,
+    }
+    store.setdefault("operations", []).append(item)
+    _write_store(store)
+
+    def relay():
+        try:
+            while True:
+                chunk = response.read1(8192)
+                if not chunk:
+                    break
+                yield chunk
+            item["status"] = "executed"
+            item["result"] = {"streamed": True, "completed_at": _now()}
+        except OSError as exc:
+            item["status"] = "failed"
+            item["result"] = {"error": str(exc)}
+        finally:
+            response.close()
+            latest = _read_store()
+            saved = next((x for x in latest.get("operations", []) if x.get("id") == request_id), None)
+            if saved is not None:
+                saved.update({"status": item["status"], "result": item["result"]})
+                _write_store(latest)
+
+    return StreamingResponse(relay(), media_type="application/x-ndjson",
+                             headers={"Cache-Control": "no-store", "X-Operation-ID": request_id})
+
+
 @router.get("/api/operations")
-def operations_list(_: None = Depends(require_admin)) -> JSONResponse:
+def operations_list(operator: dict[str, str] = Depends(require_admin)) -> JSONResponse:
     store = _read_store()
     _reconcile_host_operations(store)
     _maintain_operations(store)
@@ -3221,7 +3574,7 @@ def operations_list(_: None = Depends(require_admin)) -> JSONResponse:
     if backfilled:
         _write_store(store)
     items = sorted(store.get("operations", []), key=lambda x: x.get("created_at", ""), reverse=True)
-    creds = _webauthn_credentials(store)
+    creds = _operator_webauthn_credentials(store, operator)
     return JSONResponse(content={"enabled": _operations_enabled(),
                                  "actions": ["start", "stop", "restart", "docker_api", "host_powershell", "host_filesystem"],
                                  "targets": sorted(_operation_targets()),
@@ -3267,6 +3620,8 @@ def _create_operation_request(req: OperationRequestCreate, requested_by: str | N
     if req.action == "host_powershell":
         item["script"] = req.script
         item["remediation_id"] = req.remediation_id.strip() if req.remediation_id else ""
+        if req.remediation_payload:
+            item["remediation_payload"] = req.remediation_payload
         item["risk"] = req.risk
     if req.action == "host_filesystem":
         tx = dict(req.filesystem_transaction or {})
@@ -3391,7 +3746,7 @@ def littlejohn_operations_request(req: OperationRequestCreate,
 
 @router.post("/api/operations/{operation_id}/approve")
 def operations_approve(operation_id: str, approval: OperationApproval,
-                       _: None = Depends(require_admin)) -> JSONResponse:
+                       operator: dict[str, str] = Depends(require_admin)) -> JSONResponse:
     if not _operations_enabled():
         raise HTTPException(status_code=503, detail="operations runner is not configured")
     store = _read_store()
@@ -3411,13 +3766,14 @@ def operations_approve(operation_id: str, approval: OperationApproval,
         _write_store(store)
         raise HTTPException(status_code=409, detail="operation request expired; submit a fresh request")
 
-    approval_credential = _verify_webauthn_assertion(store, item, approval.webauthn)
+    approval_credential = _verify_webauthn_assertion(store, item, approval.webauthn, operator)
 
     # Stamp approval before calling the runner, so even a network timeout leaves
     # an auditable record.  A runner-side request-id ledger prevents replays.
     item["status"] = "executing"
     item["approved_at"] = _now()
-    item["approved_by"] = approval.approved_by.strip()
+    item["approved_by"] = operator["subject"]
+    item["approved_by_name"] = operator.get("name", operator["subject"])
     item["approval_note"] = approval.note.strip()
     item["approval_webauthn"] = {
         "credential_id": approval_credential.get("id"),
@@ -3441,6 +3797,8 @@ def operations_approve(operation_id: str, approval: OperationApproval,
                "risk": item.get("risk", "medium"), "requested_by": item.get("requested_by", "")}
         if item["action"] == "host_powershell":
             job.update({"script": item["script"], "remediation_id": item.get("remediation_id", "")})
+            if item.get("remediation_payload"):
+                job["remediation_payload"] = item.get("remediation_payload", {})
         if item["action"] == "host_filesystem":
             job["filesystem_transaction"] = item.get("filesystem_transaction", {})
         temp = jobs / f"{item['id']}.tmp"; final = jobs / f"{item['id']}.json"

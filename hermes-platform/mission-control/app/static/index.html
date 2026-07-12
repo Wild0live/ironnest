@@ -135,7 +135,12 @@
           <section class="panel approvals-panel">
             <div class="panel-head approvals-head">
               <div><h2>Mission Control Approvals</h2><p>Agent operations stay pending until an operator approves them with a registered FIDO key touch.</p></div>
-              <button id="requestApprovalBtn" class="approval-request">Request review</button>
+              <div class="approval-session-actions">
+                <span id="octoAdminSessionStatus" class="approval-runner">Octo admin session inactive</span>
+                <button id="startOctoAdminSessionBtn" class="approval-request" type="button">Start 10-minute Octo session</button>
+                <button id="revokeOctoAdminSessionBtn" class="ghost-btn" type="button" hidden>Revoke session</button>
+                <button id="requestApprovalBtn" class="approval-request">Request review</button>
+              </div>
             </div>
             <p id="approvalRunnerHint" class="approval-runner"></p>
             <div class="approval-toolbar" role="toolbar" aria-label="Approval views">

@@ -4,7 +4,7 @@
 # another AI/LLM agent uses to reconstruct the system from scratch.
 # Keep them in sync.
 
-manifest_version: 2
+manifest_version: 3
 stack_name: hermes-platform
 stack_kind: on-demand
 core_service_count: 15
@@ -136,6 +136,17 @@ invariants:
       execution requires the operator to start the runner with the explicit
       HOST_OPERATIONS_ALLOW_RAW_POWERSHELL=1 override.
     verified_by: local-host-runner/scoped-remediation-runner.py; docs/19-APPROVAL-GATED-OPERATIONS.md
+
+  - id: I12
+    description: |
+      Octo administration uses one operator-opened, non-renewable session with
+      a ten-minute hard limit and two-minute idle limit. Mission Control
+      revalidates the operator's Authelia cookie, binds WebAuthn credentials to
+      that operator, and requires user verification. operations-runner enforces
+      explicit enrollment, protected control-plane exclusions, and Docker-socket
+      exclusion independently. Destructive DELETE/kill operations remain bound
+      to a fresh operation-specific FIDO assertion even during a session.
+    verified_by: mission-control/tests/test_admin_sessions.py; operations-runner/tests/test_admin_sessions.py
 
 dependencies:
   external_networks:    [platform-net, platform-egress]

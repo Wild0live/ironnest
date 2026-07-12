@@ -33,9 +33,12 @@ services:
       VERSION: "1"
       VOLUMES: "1"
       # Allow only the Dozzle container control actions patched into HAProxy.
-      ALLOW_START: "1"
-      ALLOW_STOP: "1"
-      ALLOW_RESTARTS: "1"
+      # Lifecycle writes now flow only through Mission Control's FIDO-gated
+      # operations-runner.  The shared platform-net proxy is read-only so an
+      # agent cannot bypass the approval/session boundary.
+      ALLOW_START: "0"
+      ALLOW_STOP: "0"
+      ALLOW_RESTARTS: "0"
       # Generic write traffic remains blocked by the local HAProxy template.
       POST: "0"
       # Everything else that could mutate state stays 0.

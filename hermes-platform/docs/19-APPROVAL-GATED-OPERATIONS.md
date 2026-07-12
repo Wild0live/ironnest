@@ -98,8 +98,9 @@ docker restart hermes-pf-octo
 
 ## API flow
 
-All endpoints are behind Mission Control authentication and also obey
-`MISSION_CONTROL_ADMIN_TOKEN` when configured.
+All administrative endpoints require a browser cookie that Mission Control
+revalidates directly with Authelia and also obey `MISSION_CONTROL_ADMIN_TOKEN`
+when configured.
 
 1. `POST /api/operations/requests` creates a proposal; Docker is untouched.
 2. `POST /api/operations/{id}/approve` requires the approving operator name
@@ -159,6 +160,34 @@ Every `POST /api/operations/{id}/approve` request must include a fresh WebAuthn
 assertion bound to that exact operation ID. Mission Control verifies the RP ID
 (`mission.ironnest.local` by default), origin, challenge, signature, and user
 presence flag before the request can reach the runner.
+
+Approval credentials are now bound to the immutable Authelia operator subject,
+and WebAuthn user verification (security-key PIN or biometric) is required.
+Mission Control revalidates the browser cookie directly with Authelia; internal
+profile containers cannot become operators by spoofing forwarded identity
+headers. Credentials registered before this binding was introduced are listed
+as legacy/unbound and must be re-enrolled by each operator.
+
+## Octo ten-minute admin session
+
+Mission Control can open exactly one Octo session after an operator-bound FIDO
+ceremony. It expires after ten minutes regardless of activity and after two
+minutes of inactivity; Octo cannot renew it. Octo retains only its scoped
+submission token. The runner independently checks the session ID, expiry,
+container enrollment, protected names/labels, and Docker-socket mounts.
+
+Existing workloads may be enrolled by the exact
+`OCTO_ADMIN_ELIGIBLE_CONTAINERS` setting. New containers default to denied and
+should be recreated with `io.ironnest.octo-admin=eligible` only after operator
+review. `io.ironnest.security-boundary=protected`, the protected-name list, and
+Docker-socket detection always win.
+
+During the session, `octo-admin.py exec` streams root-command stdout/stderr as
+NDJSON through Mission Control; command text is not stored in the general
+ledger, only its SHA-256 digest and execution metadata. Lifecycle and validated
+factory actions use the same broker. DELETE, kill, and destructive factory
+volume/network requests still use the normal proposal and fresh per-operation
+FIDO approval flow.
 
 ## Windows filesystem transactions
 
@@ -235,6 +264,38 @@ Mission Control chat:
 
 The chat command only creates a pending `prepare` approval. The operator still
 approves it in Mission Control before the Windows runner reads the host path.
+
+## Software vulnerability remediation lane
+
+Little John may request broad localhost software vulnerability remediation after
+FIDO approval through the allowlisted remediation ID
+`software-vulnerability-remediation-v1`. This is not raw PowerShell execution:
+the submitted script is operator-review text, while the local Windows runner
+executes only fixed `winget` command shapes from structured JSON.
+
+Payload shape:
+
+```json
+{
+  "packages": [
+    {
+      "action": "upgrade",
+      "winget_id": "Microsoft.VisualStudioCode",
+      "name": "Microsoft Visual Studio Code",
+      "publisher": "Microsoft Corporation",
+      "scope": "machine",
+      "cves": ["CVE-2026-47281"],
+      "justification": "Scanner evidence shows vulnerable localhost install."
+    }
+  ]
+}
+```
+
+Supported actions are `upgrade`, `install`, and `uninstall` for exact Winget
+package IDs. The runner records package metadata and pre/post package state as
+evidence. If a software product cannot be safely controlled through this
+structured lane, create a new local remediation implementation rather than
+enabling raw PowerShell as the default.
 
 ## Extending safely
 

@@ -140,7 +140,7 @@ Main API surface:
 - `GET/PUT /api/agent/{profile}/soul` and `PUT /api/agent/{profile}/model` — proxied profile configuration changes.
 - `GET/PUT/DELETE /api/agent/{profile}/avatar` — dashboard avatar metadata.
 
-Writes can be additionally gated by `MISSION_CONTROL_ADMIN_TOKEN`. If unset, the Authelia FIDO gate is the write boundary.
+Administrative writes require a browser cookie that Mission Control revalidates directly with Authelia. `MISSION_CONTROL_ADMIN_TOKEN`, when configured, is an additional gate and does not replace operator-session validation.
 
 ## artifact-apps
 
@@ -148,7 +148,7 @@ Writes can be additionally gated by `MISSION_CONTROL_ADMIN_TOKEN`. If unset, the
 
 ## operations-runner
 
-`hermes-platform-operations-runner` is optional under the `operations` Compose profile. It is the only Hermes Platform service with Docker-socket access and communicates with Mission Control only over the internal `mission-control-ops-net`. It validates exact allowlisted requests, records request IDs in `hermes-platform_operations-runner-state`, rejects replay, and exposes no raw Docker API. It does not join `platform-net`, either memory network, or any profile-agent network.
+`hermes-platform-operations-runner` is optional under the `operations` Compose profile. It is the only Hermes Platform service with Docker-socket access and communicates with Mission Control only over the internal `mission-control-ops-net`. It validates exact allowlisted requests, records request IDs in `hermes-platform_operations-runner-state`, rejects replay, and exposes no raw Docker API. It also enforces Octo's single ten-minute admin lease, explicit workload enrollment, protected-boundary exclusions, and streamed root exec. It does not join `platform-net`, either memory network, or any profile-agent network.
 
 ## hermes-platform-ttyd
 

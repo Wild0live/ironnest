@@ -465,6 +465,11 @@ services:
       # Optional bearer gate on writes. Unset = Authelia FIDO gate is the auth
       # boundary (writes allowed for any authenticated operator session).
       MISSION_CONTROL_ADMIN_TOKEN:   "${MISSION_CONTROL_ADMIN_TOKEN:-}"
+      # Revalidate the browser cookie with Authelia at the application boundary;
+      # profile containers can reach Mission Control for scoped proposals and
+      # must never be able to spoof Remote-User headers.
+      MISSION_CONTROL_AUTHELIA_VERIFY_URL: "http://authelia:9091/api/authz/forward-auth"
+      MISSION_CONTROL_PUBLIC_ORIGIN: "https://mission.ironnest.local"
       # Shared secret for calling the per-profile agent chat bridges.
       MISSION_CONTROL_BRIDGE_TOKEN:  "${MISSION_CONTROL_BRIDGE_TOKEN:-}"
       # Optional approval-gated lifecycle control. Both values must be present
@@ -474,6 +479,8 @@ services:
       OPERATIONS_ALLOWED_CONTAINERS:  "${OPERATIONS_ALLOWED_CONTAINERS:-hermes-pf-default,hermes-pf-mark,hermes-pf-steve,hermes-pf-qa,hermes-pf-littlejohn,hermes-pf-jaime,hermes-pf-bigbert,hermes-pf-octo,kali-mcp-littlejohn}"
       OPERATIONS_ALLOW_ALL_CONTAINERS: "${OPERATIONS_ALLOW_ALL_CONTAINERS:-0}"
       OPERATIONS_APPROVAL_TTL_SECONDS: "${OPERATIONS_APPROVAL_TTL_SECONDS:-600}"
+      OCTO_ADMIN_SESSION_TTL_SECONDS: "600"
+      OCTO_ADMIN_SESSION_IDLE_TTL_SECONDS: "120"
       DEFAULT_OPERATIONS_SUBMIT_TOKEN: "${DEFAULT_OPERATIONS_SUBMIT_TOKEN:-}"
       OCTO_OPERATIONS_SUBMIT_TOKEN:   "${OCTO_OPERATIONS_SUBMIT_TOKEN:-}"
       LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN: "${LITTLEJOHN_OPERATIONS_SUBMIT_TOKEN:-}"
@@ -514,7 +521,8 @@ services:
   # The only service in this project with Docker socket access.  It is not a
   # Docker API proxy: its code permits only start/stop/restart for its explicit
   # profile gateway allowlist, requires a bearer token, and persists single-use
-  # request IDs.  Never add exec/create/build/pull endpoints here.
+  # request IDs. Short-lived Octo admin actions remain shape-validated and
+  # eligibility-gated; this must never become a standing raw Docker proxy.
   operations-runner:
     profiles: ["operations"]
     build:
@@ -538,6 +546,15 @@ services:
       # Exact image references Octo may pull after an individual operator approval.
       # Keep this list small; e.g. nginx:alpine,nginx:1.27-alpine.
       FACTORY_ALLOWED_IMAGES: "${FACTORY_ALLOWED_IMAGES:-}"
+      OCTO_ADMIN_SESSION_TTL_SECONDS: "600"
+      OCTO_ADMIN_ELIGIBILITY_LABEL: "io.ironnest.octo-admin"
+      OCTO_ADMIN_ELIGIBILITY_VALUE: "eligible"
+      OCTO_ADMIN_PROTECTED_LABEL: "io.ironnest.security-boundary"
+      OCTO_ADMIN_PROTECTED_VALUE: "protected"
+      # Default-deny enrollment. New containers are ineligible until an operator
+      # adds them here or recreates them with the eligibility label.
+      OCTO_ADMIN_ELIGIBLE_CONTAINERS: "${OCTO_ADMIN_ELIGIBLE_CONTAINERS:-hermes-pf-default,hermes-pf-mark,hermes-pf-steve,hermes-pf-qa,hermes-pf-littlejohn,hermes-pf-jaime,hermes-pf-bigbert,hermes-pf-octo,hermes-platform-artifact-apps,openclaw-gateway,openclaw-ttyd,browser-intent-mcp,browser-intent-worker,trivy-server,wiki-service,wiki-curator,wiki-chat,wiki-chat-gateway,wiki-artifact-exporter}"
+      OCTO_ADMIN_PROTECTED_CONTAINERS: "${OCTO_ADMIN_PROTECTED_CONTAINERS:-hermes-platform-operations-runner,hermes-platform-mission-control,socket-proxy,authelia,traefik,infisical,infisical-postgres,infisical-redis,ingress-infisical-agent,wazuh.manager,wazuh.indexer,wazuh.dashboard,wazuh-infisical-agent,wazuh-query,hermes-platform-memory-gateway,hermes-platform-openviking,hermes-platform-openviking-infisical-agent,hermes-platform-ollama,egress-proxy,adguard,dozzle,monitoring-container-sync,monitoring-fluent-bit,blocklist-updater,openclaw-infisical-agent,browser-intent-infisical-agent,llm-wiki-infisical-agent}"
       OPERATIONS_RUNNER_STATE_FILE: "/var/lib/operations-runner/executed.json"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro

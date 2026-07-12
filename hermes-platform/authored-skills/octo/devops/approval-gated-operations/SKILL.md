@@ -1,15 +1,46 @@
 ---
 name: approval-gated-operations
-description: Propose a factory Docker operation to Mission Control for human approval. Use for factory-* container, exec, network, or approved host-bind actions.
+description: Use an operator-opened 10-minute Octo admin session for eligible containers, or propose destructive Docker operations for separate FIDO approval.
 ---
 
 # Approval-gated operations
 
-You do **not** have Docker socket, Docker CLI, Compose, or approval authority.
+You do **not** have Docker socket, runner credentials, or approval authority.
 Never claim an operation was performed until Mission Control reports that an
 operator approved and executed it.
 
-For a requested Docker action, first state the plan clearly: image, container
+## Ten-minute admin session
+
+An operator opens exactly one session from Mission Control with an individually
+bound FIDO key. The session has a hard ten-minute maximum and a two-minute idle
+timeout. It cannot be renewed by Octo. Only containers explicitly labelled
+`io.ironnest.octo-admin=eligible` are reachable; protected control-plane
+containers and Docker-socket holders remain denied by the runner.
+
+Check the session:
+
+```sh
+python3 /opt/data/skills/devops/approval-gated-operations/octo-admin.py status
+```
+
+Stream a root command from an eligible container:
+
+```sh
+python3 /opt/data/skills/devops/approval-gated-operations/octo-admin.py exec CONTAINER \
+  --reason "Exact operator-visible reason" -- COMMAND ARG...
+```
+
+Lifecycle operations during the session:
+
+```sh
+python3 /opt/data/skills/devops/approval-gated-operations/octo-admin.py lifecycle restart CONTAINER \
+  --reason "Exact operator-visible reason"
+```
+
+Never try another route if Mission Control says a container is ineligible or
+protected. New containers are ineligible by default.
+
+For a destructive Docker action, first state the plan clearly: image, container
 name, command, exposed ports, factory network, named volumes/bind mounts, and
 the reason each is required. Use only `factory-*` names for factory Docker API
 requests (create, exec, and networks). For lifecycle-only start, stop, or

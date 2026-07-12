@@ -107,6 +107,17 @@ Test files (all under `gateway/tests/`):
 
 **The gateway integration suite is the canonical guarantee** for the policy and isolation invariants (I1-I5 in `spec/system.manifest.yaml`). If any test ever fails, do NOT ship.
 
+## Governed administration tests
+
+Run the focused standard-library suites after changing Mission Control approval identity, WebAuthn ownership, Octo admin sessions, or runner eligibility:
+
+```bash
+python -m unittest discover -s mission-control/tests -v
+python -m unittest discover -s operations-runner/tests -v
+```
+
+These suites cover Authelia cookie revalidation, operator-bound WebAuthn credentials, required user verification, the single active-session rule, expiry, explicit enrollment, protected labels/names, Docker-socket exclusion, and destructive-action step-up. Run them in environments containing each service's pinned requirements, such as the corresponding built image or an isolated test environment.
+
 The runtime conversational-memory validator is the canonical proof for I6: that normal Hermes memory is wired through `ironnest_gateway` to `memory-gateway`, rather than merely having reachable gateway connectivity.
 
 ## Manual probe (curl from host)
