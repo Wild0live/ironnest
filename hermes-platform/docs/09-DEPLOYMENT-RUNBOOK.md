@@ -4,7 +4,7 @@
 
 ## First-time bring-up
 
-Assumes IronNest's always-on stacks are already up (`bash platform/bootstrap.sh`) and the `platform/hermes-agent:v2026.6.19-patched` image exists (`bash platform/hermes/build.sh`).
+Assumes IronNest's always-on stacks are already up (`bash platform/bootstrap.sh`), the `platform/hermes-agent:v2026.6.19-patched` image exists (`bash platform/hermes/build.sh`), and the separate `D:\LLM Wiki` stack/checkout has created `llm-wiki_wiki-net` plus the Big Bert wiki/role paths referenced by `services.d/hermes-pf-bigbert.yml`.
 
 ### Step 1 — `.env`
 ```bash
@@ -45,7 +45,7 @@ cp .env.example .env
 ```bash
 bash build.sh
 ```
-This builds `openviking`, `memory-gateway`, and `mission-control` images; the `platform/hermes-agent:v2026.6.19-patched` image is reused unchanged (already built by `hermes/build.sh`).
+This builds `openviking`, `memory-gateway`, `mission-control`, and `operations-runner` images; the `platform/hermes-agent:v2026.6.19-patched` image is reused unchanged (already built by `hermes/build.sh`).
 
 ### Step 4 — Start the stack
 ```bash
@@ -100,8 +100,8 @@ Expected `/health` response:
 {
   "status": "ok",
   "version": "0.1.0",
-  "policies_loaded": 7,
-  "profiles_registered": 7,
+  "policies_loaded": 8,
+  "profiles_registered": 8,
   "openviking_url": "http://openviking:1933",
   "openviking": "reachable",
   "dry_run": false

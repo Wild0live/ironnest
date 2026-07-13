@@ -168,6 +168,22 @@ profile containers cannot become operators by spoofing forwarded identity
 headers. Credentials registered before this binding was introduced are listed
 as legacy/unbound and must be re-enrolled by each operator.
 
+Mission Control also stores browser-reported authenticator transport metadata
+from `PublicKeyCredential.response.getTransports()` and returns it in
+`allowCredentials`. Credentials enrolled before transport capture receive a
+configurable `usb` fallback hint. A transport value is only a browser-picker
+hint: it does not replace the operation-bound challenge, signature, RP ID,
+origin, immutable operator ownership, or required user verification checks.
+Unknown and duplicate transport values are discarded server-side.
+
+Pending approval discoverability is separate from agent presence. The Agent
+picker keeps its lower-right online/working/offline dot and adds an upper-right
+amber shield for each requester with `pending_approval` records. The shield
+shows `!`, the exact count, or `9+`; selecting it opens the pending Approvals
+view filtered to that agent and clears stale search/risk/archive filters. The
+indicator is derived from the live operations ledger and disappears when the
+requests leave the pending state.
+
 ## Octo ten-minute admin session
 
 Mission Control can open exactly one Octo session after an operator-bound FIDO

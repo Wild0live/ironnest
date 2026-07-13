@@ -10,10 +10,18 @@ hermes-platform/
 ├── docker-compose.yml                    base services/profiles + named volumes + networks
 ├── services.d/                           dynamic profile compose fragments
 │   ├── hermes-pf-jaime.yml
-│   └── hermes-pf-bigbert.yml
+│   ├── hermes-pf-bigbert.yml
+│   └── hermes-pf-octo.yml
 ├── start.sh                              on-demand stack entrypoint
-├── build.sh                              builds openviking + memory-gateway images
+├── build.sh                              builds openviking + memory-gateway + Mission Control + operations-runner images
 ├── with-infisical.sh                     copied verbatim from hermes/with-infisical.sh
+│
+├── mission-control/                      FastAPI operator UI, static assets, and focused security tests
+├── agent-bridge/                         per-profile chat/Kanban/wiki/host-operation bridge and scoped request clients
+├── operations-runner/                    exact approval-gated Docker operation broker
+├── local-host-runner/                    localhost Windows queue consumers and allowlisted remediation implementations
+├── artifact-apps/                        read-only nginx configuration for task web apps
+├── kali-mcp/                             optional Little John Kali MCP image
 │
 ├── hermes-plugin/
 │   └── ironnest_gateway/
@@ -78,11 +86,15 @@ hermes-platform/
 ├── scripts/
 │   ├── _common.sh                        helpers sourced by every script
 │   ├── create-profile.sh
+│   ├── provision-profile.sh
 │   ├── delete-profile.sh
 │   ├── validate-profile.sh
 │   ├── rotate-profile-token.sh
 │   ├── backup-souls.sh
 │   ├── patch-souls.sh
+│   ├── repair-auth-lock-permissions.sh
+│   ├── sync-orchestrator-roster.sh
+│   ├── catch-up-missed-cron.sh
 │   ├── validate-isolation.sh
 │   ├── validate-sharing.sh
 │   ├── validate-conversational-memory.sh
@@ -109,7 +121,8 @@ hermes-platform/
 │   ├── 15-CHANGELOG.md
 │   ├── 16-DECISION-LOG.md
 │   ├── 17-LLM-HANDOFF.md
-│   └── 18-AUTOMATIC-CONVERSATIONAL-MEMORY.md
+│   ├── 18-AUTOMATIC-CONVERSATIONAL-MEMORY.md
+│   └── 19-APPROVAL-GATED-OPERATIONS.md
 │
 └── spec/                                 machine-readable manifests
     ├── system.manifest.yaml

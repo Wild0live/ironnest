@@ -5,7 +5,7 @@
 #   - external monitoring/observability tools
 #   - AI rebuild agents (spec/rebuild-checklist.yaml references this)
 #
-# Current as of 2026-07-11.
+# Current as of 2026-07-13.
 
 stack_name: hermes-platform
 stack_kind: on-demand
@@ -17,10 +17,16 @@ core_profiles: []
 optional_profiles: [operations, kali]
 hermes_agent_image: platform/hermes-agent:v2026.6.19-patched
 profile_startup_model: s6-overlay image entrypoint; no Compose entrypoint override.
+profile_bridge_defaults:
+  prompt_timeout_seconds: 900
+  init_timeout_seconds: 150
+  idle_timeout_seconds: 900
+  notes: The bridge is bind-mounted; a running bridge process adopts changed defaults only after its profile container or bridge process restarts.
 
 networks:
   - name: platform-net
     external: true
+    runtime_internal: true
     members:
       - ollama
       - memory-gateway
@@ -38,6 +44,7 @@ networks:
     notes: AdGuard DNS at 172.30.0.10, Squid at squid:3128, Infisical at infisical:8090, Traefik routes Mission Control.
   - name: platform-egress
     external: true
+    runtime_internal: false
     members: [openviking-infisical-agent]
     notes: Used by the OpenViking Infisical sidecar.
   - name: hermes-platform-mem-net
@@ -60,6 +67,10 @@ networks:
     internal: true
     members: [mission-control, operations-runner]
     notes: Private request channel for exact approval-gated operations; no profile agent joins it.
+  - name: llm-wiki-wiki-net
+    external: true
+    members: [hermes-pf-bigbert]
+    notes: Cross-stack LLM Wiki channel for Big Bert. The wiki remains a separate system; this does not join Big Bert to a memory-tier network.
   - name: ingress
     internal: false
     members: [memory-gateway, hermes-platform-ttyd]
@@ -150,6 +161,26 @@ host_binds:
     role: LittleJohn Kali report handoff
     services: [kali-mcp-littlejohn]
     notes: Mounted as /reports and visible through the shared artifact tree.
+  - path: D:/LLM Wiki/sources/mission-control-reports
+    role: Mission Control report publication staging
+    services: [hermes-pf-default]
+    notes: Mounted read-write at /opt/mission-control-reports. Wiki credentials are delivered through Infisical, not this bind.
+  - path: D:/LLM Wiki/wiki
+    role: Big Bert published wiki knowledge
+    services: [hermes-pf-bigbert]
+    notes: Mounted read-only at /knowledge/wiki; only the nested _review/proposals path is mounted again read-write.
+  - path: D:/LLM Wiki/wiki/_review/proposals
+    role: Big Bert wiki proposal drafts
+    services: [hermes-pf-bigbert]
+    notes: The only writable slice of the mounted wiki tree.
+  - path: D:/LLM Wiki/ironnest/bigbert-wiki-instructions.md
+    role: Big Bert wiki role instructions
+    services: [hermes-pf-bigbert]
+    notes: Mounted read-only.
+  - path: D:/LLM Wiki/ironnest/install-bigbert-wiki-role.py
+    role: Big Bert idempotent wiki role installer
+    services: [hermes-pf-bigbert]
+    notes: Mounted read-only and executed before the Hermes gateway starts.
 
 services:
   - name: openviking-infisical-agent
@@ -221,6 +252,11 @@ services:
       rootfs: read_only
       capabilities: drop_all
       no_new_privileges: true
+      approval_webauthn:
+        operator_identity: direct Authelia cookie revalidation
+        user_verification: required
+        transport_hints: registered browser transports; usb fallback for legacy credentials
+        note: Transport hints narrow the browser picker only and are not an authorization control.
     reads:
       - registry/profiles-registry.yaml:ro
       - policies/:ro
@@ -231,7 +267,7 @@ services:
       - target: agent-chat bridge
         url_pattern: http://hermes-pf-<profile>:8011
         auth: MISSION_CONTROL_BRIDGE_TOKEN
-        features: [chat, token_streaming, file_downloads, soul_edit, model_switch, role_summary, kanban_proxy, manual_task_run, task_decompose, autodispatch_controls]
+        features: [chat, token_streaming, file_downloads, soul_edit, model_switch, role_summary, kanban_proxy, manual_task_run, task_decompose, autodispatch_controls, report_publish_wiki, wiki_session_handoff]
       - target: operations-runner
         url_pattern: http://operations-runner:8091
         auth: OPERATIONS_RUNNER_TOKEN
@@ -319,6 +355,10 @@ services:
     shared_artifacts:
       own_rw: /opt/shared/mine
       all_ro: /opt/shared/all
+    wiki_publish:
+      reports_root: /opt/mission-control-reports
+      host_source: D:/LLM Wiki/sources/mission-control-reports
+      credential_source: Infisical WIKI_ADMIN_TOKEN
     healthcheck: "pgrep -f 'hermes gateway run'"
     resources:
       cpus: "2.0"
@@ -471,7 +511,7 @@ services:
     profile: bigbert
     listens: ["8011/tcp"]
     publishes: []
-    networks: [platform-net, hermes-platform-app-net]
+    networks: [platform-net, hermes-platform-app-net, llm-wiki-wiki-net]
     memory_provider: ironnest_gateway
     memory_provider_mount: ./hermes-plugin/ironnest_gateway:/opt/data/plugins/ironnest_gateway:ro
     kanban:
@@ -482,6 +522,11 @@ services:
     shared_artifacts:
       own_rw: /opt/shared/mine
       all_ro: /opt/shared/all
+    wiki:
+      published_ro: D:/LLM Wiki/wiki:/knowledge/wiki
+      proposals_rw: D:/LLM Wiki/wiki/_review/proposals:/knowledge/wiki/_review/proposals
+      network: llm-wiki-wiki-net
+      role_installer: D:/LLM Wiki/ironnest/install-bigbert-wiki-role.py
     healthcheck: "pgrep -f 'hermes gateway run'"
     resources:
       cpus: "2.0"

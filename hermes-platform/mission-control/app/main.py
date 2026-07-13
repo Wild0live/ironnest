@@ -101,6 +101,16 @@ APPROVAL_WEBAUTHN_ORIGINS = frozenset(item.strip() for item in os.environ.get(
     "APPROVAL_WEBAUTHN_ORIGINS", "https://mission.ironnest.local").split(",") if item.strip())
 APPROVAL_WEBAUTHN_TIMEOUT_MS = int(os.environ.get("APPROVAL_WEBAUTHN_TIMEOUT_MS", "60000"))
 APPROVAL_WEBAUTHN_CHALLENGE_TTL = int(os.environ.get("APPROVAL_WEBAUTHN_CHALLENGE_TTL_SECONDS", "120"))
+# A transport hint narrows the browser's native passkey picker; it is not an
+# authorization control.  The assertion remains cryptographically verified and
+# user verification is still mandatory below.  USB is the safe fallback for
+# approval keys enrolled before browsers exposed getTransports().
+APPROVAL_WEBAUTHN_FALLBACK_TRANSPORTS = tuple(
+    item.strip().lower() for item in os.environ.get(
+        "APPROVAL_WEBAUTHN_FALLBACK_TRANSPORTS", "usb").split(",")
+    if item.strip().lower() in {"usb", "nfc", "ble", "internal", "hybrid"}
+)
+WEBAUTHN_TRANSPORTS = frozenset({"usb", "nfc", "ble", "internal", "hybrid"})
 HOST_OPERATIONS_RUNNER_URL = os.environ.get("HOST_OPERATIONS_RUNNER_URL", "").rstrip("/")
 HOST_OPERATIONS_RUNNER_TOKEN = os.environ.get("HOST_OPERATIONS_RUNNER_TOKEN", "").strip()
 HOST_OPERATIONS_QUEUE_DIR = Path(os.environ.get("HOST_OPERATIONS_QUEUE_DIR", "").strip())
@@ -219,6 +229,7 @@ class WebAuthnCredentialResponse(BaseModel):
     rawId: str = Field(..., min_length=1, max_length=2000)
     type: str = Field(default="public-key", max_length=40)
     response: dict[str, Any]
+    transports: list[str] = Field(default_factory=list, max_length=5)
 
 
 class WebAuthnCredentialRename(BaseModel):
@@ -540,6 +551,28 @@ def _operator_webauthn_credentials(store: dict[str, Any],
             if str(c.get("operator_subject") or "").strip() == operator["subject"]]
 
 
+def _credential_transports(credential: dict[str, Any]) -> list[str]:
+    """Return safe browser transport hints for an enrolled credential.
+
+    This is intentionally metadata only.  If a browser ignores it, server-side
+    signature, origin, RP-ID, operator ownership, and user-verification checks
+    still decide whether an approval is valid.
+    """
+    supplied = credential.get("transports")
+    values = supplied if isinstance(supplied, list) else APPROVAL_WEBAUTHN_FALLBACK_TRANSPORTS
+    return list(dict.fromkeys(
+        str(item).lower() for item in values if str(item).lower() in WEBAUTHN_TRANSPORTS
+    ))
+
+
+def _credential_descriptor(credential: dict[str, Any]) -> dict[str, Any]:
+    descriptor: dict[str, Any] = {"type": "public-key", "id": credential["id"]}
+    transports = _credential_transports(credential)
+    if transports:
+        descriptor["transports"] = transports
+    return descriptor
+
+
 def _verify_webauthn_registration(payload: WebAuthnCredentialResponse,
                                   operator: dict[str, str]) -> dict[str, Any]:
     store = _read_store()
@@ -566,6 +599,9 @@ def _verify_webauthn_registration(payload: WebAuthnCredentialResponse,
         "origin": client.get("origin", ""),
         "operator_subject": operator["subject"],
         "operator_name": operator.get("name", operator["subject"]),
+        "transports": list(dict.fromkeys(
+            item.lower() for item in payload.transports if item.lower() in WEBAUTHN_TRANSPORTS
+        )),
     }
     data["credentials"].append(credential)
     _write_store(store)
@@ -1308,7 +1344,7 @@ def operation_approval_webauthn_options(operation_id: str,
         "rpId": APPROVAL_WEBAUTHN_RP_ID,
         "timeout": APPROVAL_WEBAUTHN_TIMEOUT_MS,
         "userVerification": "required",
-        "allowCredentials": [{"type": "public-key", "id": c["id"]} for c in creds],
+        "allowCredentials": [_credential_descriptor(c) for c in creds],
     }, "operation": {
         "id": item.get("id"),
         "action": item.get("action"),
@@ -3401,7 +3437,7 @@ def octo_admin_session_options(operator: dict[str, str] = Depends(require_admin)
     return JSONResponse(content={"publicKey": {
         "challenge": challenge, "rpId": APPROVAL_WEBAUTHN_RP_ID,
         "timeout": APPROVAL_WEBAUTHN_TIMEOUT_MS, "userVerification": "required",
-        "allowCredentials": [{"type": "public-key", "id": c["id"]} for c in creds],
+        "allowCredentials": [_credential_descriptor(c) for c in creds],
     }, "ttl_seconds": OCTO_ADMIN_SESSION_TTL,
        "idle_ttl_seconds": OCTO_ADMIN_SESSION_IDLE_TTL})
 

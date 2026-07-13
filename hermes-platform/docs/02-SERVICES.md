@@ -20,7 +20,7 @@ Current declared stack size: **15 core containers** plus **2 optional containers
 | `hermes-pf-qa` | same | Agent (qa / QA-verification profile, renamed from wifey 2026-06-14) + Mission Control bridge | `8011/tcp` | none | same |
 | `hermes-pf-littlejohn` | same | Agent (littlejohn profile) + Mission Control bridge | `8011/tcp` | none | same |
 | `hermes-pf-jaime` | same | Agent (jaime profile) + Mission Control bridge | `8011/tcp` | none | same |
-| `hermes-pf-bigbert` | same | Agent (bigbert profile) + Mission Control bridge | `8011/tcp` | none | same |
+| `hermes-pf-bigbert` | same | Agent (bigbert profile) + Mission Control bridge + read-mostly LLM Wiki role | `8011/tcp` | none | `platform-net`, `hermes-platform-app-net`, external `llm-wiki_wiki-net` |
 | `hermes-pf-octo` | same | Agent (octo / platform-ops profile, added 2026-06-12) + Mission Control bridge | `8011/tcp` | none | same |
 | `kali-mcp-littlejohn` | `platform/kali-mcp-littlejohn:2026.07.03` | On-demand Kali Linux MCP sidecar for LittleJohn | `8000/tcp` | none | `littlejohn-kali-net`, `littlejohn-kali-egress-net` |
 
@@ -67,6 +67,8 @@ Each profile also joins the shared Hermes Kanban board by setting `HERMES_KANBAN
 
 Every profile also launches the Mission Control **agent-chat bridge** as a background co-process before `hermes gateway run`. The bridge is `agent-bridge/agent-chat-bridge.py`, mounted read-only into the profile at `/opt/ironnest/agent-chat-bridge.py`. It listens on `8011/tcp` inside the profile container, token-gated by `MISSION_CONTROL_BRIDGE_TOKEN`, and drives a persistent warm `hermes acp` session for that profile only.
 
+The bridge's default prompt budget is 900 seconds, with a 150-second ACP initialization budget and 900-second idle budget. These are process-start defaults (`AGENT_BRIDGE_TIMEOUT`, `AGENT_BRIDGE_INIT_TIMEOUT`, and `AGENT_BRIDGE_IDLE_TIMEOUT` can override them). Because the bridge source is bind-mounted, editing the file updates the mounted bytes immediately but a running Python bridge adopts changed constants only after its profile container or bridge process restarts.
+
 The bridge supports:
 
 - streamed and non-streamed browser chat from Mission Control;
@@ -84,6 +86,8 @@ The bridge supports:
 - per-profile opt-in auto-dispatch settings, persisted in that profile's `/opt/data/.mc-autodispatch.json`.
 
 Concurrency is intentionally one turn at a time per profile. A second request gets a busy response so the dashboard can retry without duplicating the transcript.
+
+Big Bert has an additional, explicit LLM Wiki boundary in `services.d/hermes-pf-bigbert.yml`: the published wiki tree is mounted read-only at `/knowledge/wiki`, only `_review/proposals` is over-mounted read-write, and the profile joins external `llm-wiki_wiki-net`. Dr. Smith (`default`) separately mounts `D:/LLM Wiki/sources/mission-control-reports` at `/opt/mission-control-reports` for the report publication flow. Wiki credentials are injected through Infisical; they are not stored in either host bind.
 
 ## kali-mcp-littlejohn
 
@@ -141,6 +145,10 @@ Main API surface:
 - `GET/PUT/DELETE /api/agent/{profile}/avatar` — dashboard avatar metadata.
 
 Administrative writes require a browser cookie that Mission Control revalidates directly with Authelia. `MISSION_CONTROL_ADMIN_TOKEN`, when configured, is an additional gate and does not replace operator-session validation.
+
+Approval credentials are bound to the immutable Authelia operator subject and require WebAuthn user verification. Registration stores browser-reported credential transports, while credentials enrolled before transport capture receive a `usb` picker hint by default. These hints only narrow the browser's native authenticator picker; signature, challenge, RP ID, origin, operator ownership, and user verification still control authorization. The Agent picker shows a separate amber shield/count for `pending_approval` records attributed to each profile; clicking it opens the pending Approvals view filtered to that requester without replacing the avatar's independent online/working/offline dot.
+
+Mission Control's LLM Wiki path is bridge-mediated. The default profile bridge owns the Infisical-delivered `WIKI_ADMIN_TOKEN`, imports reviewed task artifacts into `wiki-service`, requests reindexing, and mints a `wiki_session` handoff for the browser. Mission Control receives the scoped session result, not the admin token.
 
 ## artifact-apps
 

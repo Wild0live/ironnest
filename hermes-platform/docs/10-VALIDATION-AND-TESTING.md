@@ -9,7 +9,10 @@ bash scripts/healthcheck.sh
 Asserts:
 - platform-net + platform-egress exist.
 - All platform containers are healthy, including every registered `hermes-pf-*` profile.
-- `GET http://127.0.0.1:18080/health` returns 200.
+- The in-container memory-gateway health path succeeds. The optional
+  `GET http://127.0.0.1:18080/health` host-forward probe is reported as a
+  warning when Rancher Desktop's loopback forwarder is stale; it is not allowed
+  to override a successful in-container result.
 - openviking publishes no host port (`docker port hermes-platform-openviking` is empty).
 - openviking is unreachable from `hermes-pf-mark`.
 
@@ -76,7 +79,9 @@ Every deny event includes the matched rule (or absence thereof). After a `valida
 
 ## Unit + integration tests for the gateway
 
-`gateway/tests/` ships with v0.1.0. **178 tests, runtime <1 second.**
+`gateway/tests/` ships with v0.1.0 and has expanded with the profile matrix.
+Use pytest's collected total as the authoritative count; the current eight-profile
+suite collects 337 tests as of 2026-07-13.
 
 ```bash
 # In a clean container (matches CI):

@@ -2,9 +2,11 @@
 
 All notable changes to hermes-platform. Format follows Keep a Changelog 1.1.0.
 
-## [Unreleased] - 2026-07-11
+## [Unreleased] - 2026-07-13
 
 ### Added
+- **Per-agent pending-approval indicator** added to the Mission Control Agent picker. A separate upper-right amber shield/count is derived from live `pending_approval` operation records and opens the Approvals view filtered to the requesting agent without replacing the online/working/offline status dot.
+- **WebAuthn authenticator transport hints** are captured during approval-key registration, sanitized server-side, and returned through `allowCredentials`; legacy credentials use a configurable `usb` picker hint. Transport metadata does not replace operator binding, operation-bound challenge/signature verification, RP ID/origin checks, or required user verification.
 - **FIDO-gated Octo just-in-time administration** now provides one globally active, non-renewable session with a ten-minute hard limit and two-minute idle limit. Individually attributed operators open the session with an operator-bound WebAuthn credential requiring PIN/biometric verification. Octo can stream root-command output and run validated Docker lifecycle/factory operations only for explicitly enrolled, non-protected containers; destructive container/volume/network actions still require a fresh operation-specific FIDO approval.
 - **LittleJohn Kali MCP sidecar** added as optional on-demand service `kali-mcp-littlejohn` (`--profile kali`). It uses the community `k3nn3dy-ai/kali-mcp` SSE server pinned at commit `d46b46bd23f9801b63fc3d16253b5af07b653ec9`, publishes no host ports, mounts persistent `/work`, maps `/reports` to `./shared/littlejohn/kali`, and is reachable only from LittleJohn over `littlejohn-kali-net`.
 - **Pre-approved LittleJohn lifecycle lane** for the exact actions `start`, `stop`, and `restart` on `kali-mcp-littlejohn`. Other Docker, host, network, mount, image, and privileged changes remain approval-gated.
@@ -15,6 +17,8 @@ All notable changes to hermes-platform. Format follows Keep a Changelog 1.1.0.
 - **Missed-cron catch-up** added through `scripts/catch-up-missed-cron.sh` and Mission Control's cron catch-up endpoint so overdue schedules can run once after the stack returns.
 
 ### Changed
+- Agent-chat bridge prompt timeout now defaults to 900 seconds (initialization 150 seconds; idle 900 seconds) so long security/tool turns can complete. Because the bridge source is bind-mounted, running processes adopt this default only after restart.
+- Architecture documentation and machine-readable services now record Big Bert's read-only LLM Wiki mount, writable proposal slice, external wiki network, and the default profile's Mission Control report-publication staging bind. Stale current-state references to seven profiles, a fixed 27-container platform total, and ttyd Basic Auth were corrected against the live runtime.
 - Mission Control now revalidates its browser cookie directly with Authelia for administrative APIs instead of trusting network-originated `Remote-*` headers. Existing unbound approval credentials must be re-enrolled under their individual Authelia operator accounts.
 - The shared `socket-proxy` is read-only again: unauthenticated start/stop/restart on `platform-net` is disabled so agents cannot bypass Mission Control's FIDO/session boundary.
 - **Profile `wifey` renamed to `qa`** (QA/verification specialist; repurposed from the former home/household persona). Container `hermes-pf-wifey` → `hermes-pf-qa`, named volume `hermes-platform_data-wifey` → `hermes-platform_data-qa` (data migrated), policy `wifey.policy.yaml` → `qa.policy.yaml`, Infisical path `/hermes-platform/wifey` → `/hermes-platform/qa`. Registry `description` rewritten for QA routing.

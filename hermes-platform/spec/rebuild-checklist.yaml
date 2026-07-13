@@ -28,6 +28,19 @@ steps:
     validates: |
       docker image inspect platform/hermes-agent:v2026.6.19-patched >/dev/null
 
+  - id: R-02-WIKI
+    command: |
+      # Restore/start the separate D:/LLM Wiki stack by its own runbook, then verify:
+      docker network inspect llm-wiki_wiki-net >/dev/null
+      test -d "D:/LLM Wiki/wiki"
+      test -d "D:/LLM Wiki/wiki/_review/proposals"
+      test -f "D:/LLM Wiki/ironnest/bigbert-wiki-instructions.md"
+      test -f "D:/LLM Wiki/ironnest/install-bigbert-wiki-role.py"
+      test -d "D:/LLM Wiki/sources/mission-control-reports"
+    expects: external LLM Wiki network and Big Bert/report host paths exist before Compose resolves the core profile fragments
+    validates: 'echo OK'
+    manual: true
+
   - id: R-03
     command: |
       cp D:/claude-workspace/platform/hermes-platform/.env.example D:/claude-workspace/platform/hermes-platform/.env

@@ -179,6 +179,18 @@ If you put `deny: ["viking://profiles/*/**"]` in a policy thinking the allow re-
 
 Read-only scripts (`validate-*.sh`, `backup-souls.sh`, etc.) don't require `yq` on the host. The helper falls back to listing `policies/*.policy.yaml` basenames when yq is absent. Profile-mutating scripts (`create-profile.sh`, `delete-profile.sh`) still need yq.
 
+### Q17 — `hermes-platform-ttyd` is intentionally a cross-profile management plane
+
+The ttyd/dashboard sidecar mounts every profile volume so the operator UI can manage them. This does not relax agent isolation: each `hermes-pf-*` runtime still mounts only its own `/opt/data`. Direct ports `127.0.0.1:8123` and `127.0.0.1:8124` are localhost-only management escape hatches; routed access is behind Authelia. Do not add ttyd to either memory network and do not run `hermes gateway run` from its shell.
+
+### Q18 — Mission Control reaches profiles through bridges, not memory or Docker authority
+
+Mission Control calls each profile's token-gated bridge on `8011/tcp` over `platform-net`. It may join only the private `mission-control-ops-net` for exact operations-runner requests. Keep it off `hermes-platform-app-net` and `hermes-platform-mem-net`, and do not give it profile memory tokens, OpenViking credentials, Infisical machine identity, or the Docker socket.
+
+### Q19 — Agent bridge prompt timeout is 900 seconds and is loaded at process start
+
+`agent-chat-bridge.py` defaults `AGENT_BRIDGE_TIMEOUT` to 900 seconds so long security/tool turns can complete. Initialization and idle defaults remain 150 and 900 seconds. The bridge source is bind-mounted, so changed bytes appear immediately inside every container, but an already-running Python process retains the old constant until that bridge or profile container restarts. Do not mistake mounted-source truth for live-process truth.
+
 ---
 
 ## Common dangerous edges (don't trip these)

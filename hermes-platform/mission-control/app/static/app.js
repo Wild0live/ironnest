@@ -103,6 +103,7 @@ function credentialToJson(credential) {
   if (response.authenticatorData) out.response.authenticatorData = bytesToB64u(response.authenticatorData);
   if (response.signature) out.response.signature = bytesToB64u(response.signature);
   if (response.userHandle) out.response.userHandle = bytesToB64u(response.userHandle);
+  if (typeof response.getTransports === "function") out.transports = response.getTransports();
   return out;
 }
 
@@ -343,6 +344,7 @@ async function loadOperations() {
     operations.enabled = false;
   }
   renderOperations();
+  renderAgentPicker();
   if ($("#view-settings")?.classList.contains("active")) renderSystemSettings();
   if ($("#view-agent")?.classList.contains("active")) renderChat({ preserveScroll: true });
 }
@@ -3762,15 +3764,20 @@ function renderAgentPicker() {
   if (!box) return;
   box.innerHTML = state.profiles.map((p) => {
     const n = p.name;
+    const pendingApprovals = operations.requests.filter((item) =>
+      item.status === "pending_approval" && item.requested_by === n).length;
     const offline = p.status !== "enabled" || chat.health[n] === false;
     const cls = ["agent-ava",
       n === chat.profile ? "active" : "",
       chat.busyProfiles[n] ? "busy" : "",
       offline ? "offline" : ""].filter(Boolean).join(" ");
     const status = offline ? "offline" : (chat.busyProfiles[n] ? "working…" : "online");
-    return `<button class="${cls}" data-profile="${escapeHtml(n)}" title="${escapeHtml(displayName(n))} · ${status} — Shift+click to edit">${avatarHtml(n, 42)}<span class="status-dot"></span></button>`;
+    const approvalLabel = `${displayName(n)} · ${pendingApprovals} approval${pendingApprovals === 1 ? "" : "s"} waiting`;
+    const approvalCount = pendingApprovals > 9 ? "9+" : (pendingApprovals > 1 ? String(pendingApprovals) : "!");
+    const approvalBadge = pendingApprovals ? `<button type="button" class="agent-approval-badge" data-approval-profile="${escapeHtml(n)}" title="${escapeHtml(approvalLabel)}" aria-label="${escapeHtml(approvalLabel)}"><svg viewBox="0 0 20 22" aria-hidden="true" focusable="false"><path d="M10 1 18 4v6c0 5.2-3.2 8.8-8 11-4.8-2.2-8-5.8-8-11V4l8-3Z"></path></svg><span aria-hidden="true">${approvalCount}</span></button>` : "";
+    return `<span class="agent-ava-wrap"><button class="${cls}" data-profile="${escapeHtml(n)}" title="${escapeHtml(displayName(n))} · ${status} — Shift+click to edit">${avatarHtml(n, 42)}<span class="status-dot"></span></button>${approvalBadge}</span>`;
   }).join("");
-  box.querySelectorAll("[data-profile]").forEach((el) =>
+  box.querySelectorAll(".agent-ava[data-profile]").forEach((el) =>
     el.addEventListener("click", (e) => {
       const p = el.dataset.profile;
       if (e.shiftKey) {
@@ -3780,7 +3787,30 @@ function renderAgentPicker() {
         selectProfile(p);
       }
     }));
+  box.querySelectorAll("[data-approval-profile]").forEach((badge) =>
+    badge.addEventListener("click", () => openPendingApprovalsForProfile(badge.dataset.approvalProfile)));
   updateActiveAgentAva();
+}
+
+function openPendingApprovalsForProfile(profile) {
+  if (!profile) return;
+  selectProfile(profile);
+  operations.view = "pending";
+  operations.requester = profile;
+  operations.search = "";
+  operations.risk = "";
+  operations.includeArchived = false;
+  const tabs = $("#approvalTabs");
+  if (tabs) tabs.querySelectorAll("[data-approval-view]").forEach((button) =>
+    button.classList.toggle("active", button.dataset.approvalView === "pending"));
+  const search = $("#approvalSearch");
+  if (search) search.value = "";
+  const risk = $("#approvalRiskFilter");
+  if (risk) risk.value = "";
+  const archived = $("#approvalArchivedToggle");
+  if (archived) archived.checked = false;
+  activateView("approvals");
+  renderOperations();
 }
 
 function updateBusyIndicators() {

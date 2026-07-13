@@ -55,7 +55,7 @@ HERMES_BIN = os.environ.get("HERMES_BIN", "/opt/hermes/.venv/bin/hermes")
 VENV_PY = os.environ.get(
     "AGENT_BRIDGE_VENV_PY", os.path.join(os.path.dirname(HERMES_BIN), "python"))
 MODELS_TTL = int(os.environ.get("AGENT_BRIDGE_MODELS_TTL", "60"))  # seconds
-PROMPT_TIMEOUT = int(os.environ.get("AGENT_BRIDGE_TIMEOUT", "240"))
+PROMPT_TIMEOUT = int(os.environ.get("AGENT_BRIDGE_TIMEOUT", "900"))
 INIT_TIMEOUT = int(os.environ.get("AGENT_BRIDGE_INIT_TIMEOUT", "150"))
 IDLE_TIMEOUT = int(os.environ.get("AGENT_BRIDGE_IDLE_TIMEOUT", "900"))
 UPLOAD_DIR = os.environ.get("AGENT_BRIDGE_UPLOAD_DIR", "/opt/data/.mission-control-uploads")

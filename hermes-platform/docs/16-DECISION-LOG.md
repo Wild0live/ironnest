@@ -4,6 +4,60 @@ Architectural choices made during the design of hermes-platform v0.1.0. Each ent
 
 ---
 
+## D-021 — Big Bert receives a read-mostly LLM Wiki boundary, not general host access
+
+**Date:** 2026-07-13
+**Status:** accepted and deployed
+
+**Decision:** Integrate the `bigbert` profile with the separate LLM Wiki stack
+through three explicit surfaces: join external `llm-wiki_wiki-net`, mount the
+published wiki tree read-only at `/knowledge/wiki`, and over-mount only
+`_review/proposals` read-write. Mount the wiki role instructions/installer
+read-only and run the installer before the Hermes gateway. Keep Mission
+Control report publication on the default profile bridge, with its report
+staging directory host-bound and its wiki credential injected through
+Infisical rather than stored in the bind.
+
+**Rationale:** Big Bert needs first-class access to curated knowledge and a
+bounded proposal-writing lane, while Mission Control needs a governed way to
+publish reviewed task artifacts. A read-mostly mount plus one writable proposal
+slice makes the host-write boundary explicit. It keeps the LLM Wiki separate
+from OpenViking memory, avoids granting arbitrary wiki-tree writes, and keeps
+the wiki admin token out of repository files and cross-stack secret binds.
+
+**Impacts:** `services.d/hermes-pf-bigbert.yml`, `docker-compose.yml`,
+`agent-bridge/agent-chat-bridge.py`, `mission-control/app/main.py`,
+`spec/services.yaml`, and `docs/01-ARCHITECTURE.md`.
+
+---
+
+## D-020 — Passkey transports and avatar approval badges are metadata, not authority
+
+**Date:** 2026-07-13
+**Status:** accepted and deployed
+
+**Decision:** Retain browser-reported WebAuthn authenticator transports at
+credential registration, sanitize them to the WebAuthn transport allowlist,
+and use `usb` as the picker hint for legacy credentials with no captured
+transport. Separately, show each requesting agent's pending-operation count as
+an upper-right shield in the Mission Control Agent picker while preserving the
+lower-right online/working/offline status dot.
+
+**Rationale:** Transport hints make native security-key selection more
+reliable, and a persistent per-agent badge makes blocked work visible without
+overloading presence colors. Neither feature is allowed to weaken the approval
+boundary: authorization still requires the operation-bound challenge,
+signature, RP ID, origin, immutable Authelia operator ownership, and WebAuthn
+user verification. Badge state comes only from live `operations.requests`
+records with `status=pending_approval` and matching `requested_by`.
+
+**Impacts:** `mission-control/app/main.py`,
+`mission-control/app/static/app.js`, `mission-control/app/static/styles.css`,
+`mission-control/tests/test_admin_sessions.py`, and
+`docs/19-APPROVAL-GATED-OPERATIONS.md`.
+
+---
+
 ## D-018 — Host filesystem access uses two-step transactions, not mounts
 
 **Date:** 2026-07-11
@@ -132,7 +186,7 @@ IronNest's localhost-only posture and OpenViking/memory-gateway invariants.
 
 **Rationale:** A1 is config drift — the spec was stale. A2 leaves docker-compose.yml functionally inert at first boot, which is operationally hostile. Seeded + dynamic is both honest about the current state AND extensible.
 
-**Subsequent deployment state:** Dynamic provisioning later added `jaime` and `bigbert`; there are now seven enabled profiles. This decision records the initial seeded baseline, not the current registry size.
+**Subsequent deployment state:** Dynamic provisioning later added `jaime`, `bigbert`, and `octo`, and `wifey` was renamed to `qa`; there are now eight enabled profiles. This decision records the initial seeded baseline, not the current registry size.
 
 ---
 
@@ -328,7 +382,7 @@ Invariant I3 (per-profile volume isolation) was designed for the AGENT container
 
 **Persistence:** The provider source is read-only mounted from the stack directory and selected again by each container startup command. Stored turns are in the persistent OpenViking workspace through the gateway, so both wiring and memories survive normal container restarts and recreations.
 
-**Verification:** `scripts/validate-conversational-memory.sh` passes for all seven profiles. A real Wifey follow-up chat successfully recalled a phrase saved during an earlier chat. Big Bert passes provider lifecycle storage/recall through the gateway; a live model-generated chat additionally requires its inference-provider credential.
+**Verification:** `scripts/validate-conversational-memory.sh` passes for all eight current profiles. Historical live testing also proved Wifey follow-up recall before that profile was renamed to `qa`; Big Bert now passes provider lifecycle storage/recall and has its normal inference/wiki role configured.
 
 ---
 
@@ -363,6 +417,13 @@ Invariant I3 (per-profile volume isolation) was designed for the AGENT container
 **Decision:** Keep `hermes-platform-mission-control` as a standalone FastAPI/browser dashboard on `platform-net` only. It reads registry, policies, and gateway audit log read-only; owns only `hermes-platform_mission-control-state`; and talks to profile agents through their in-container `agent-chat-bridge.py` listeners on `8011/tcp`. It is not part of `memory-gateway`, does not join `hermes-platform-app-net` or `hermes-platform-mem-net`, and receives no OpenViking key, profile memory bearer token, Infisical machine identity credential, or Docker socket.
 
 **Subsequent state (2026-07-11):** D-014's “platform-net only” language now means no memory-network membership. Mission Control also joins the private `mission-control-ops-net` solely to submit exact requests to `operations-runner`; it still receives no Docker socket and does not join either memory network.
+
+**Subsequent state (2026-07-13):** The bridge's default prompt budget is now
+900 seconds so long security/tool turns can complete, while one-turn-per-profile
+serialization remains unchanged. The source is bind-mounted; running bridge
+processes adopt a changed default only after restart. Mission Control also
+surfaces per-agent pending-approval badges and uses the default profile bridge
+for report publication and LLM Wiki session handoff.
 
 **What Mission Control can do:**
 - Show profile roster, policy-loaded state, recent memory audit activity, tasks, schedules, docs, team, and office views.

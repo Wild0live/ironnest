@@ -86,7 +86,7 @@ These bit us during the first live deploy. Read before scripting Infisical opera
 
 ### Operational secret rotation
 
-For rotating any secret (per-profile bearer, admin token, OpenViking root_api_key, embedding API key, ttyd password):
+For rotating any active secret (per-profile bearer, admin token, OpenViking root_api_key, embedding API key):
 
 1. Generate new value: `openssl rand -hex 32` (bearer/admin keys) or `openssl rand -base64 30 | tr -d '/+='` (passwords).
 2. **Temporarily elevate** the `hermes-platform-machine` Machine Identity from Viewer → Admin in Infisical UI.
@@ -96,8 +96,14 @@ For rotating any secret (per-profile bearer, admin token, OpenViking root_api_ke
    - Bearer/admin token: `docker compose restart memory-gateway hermes-pf-<profile>`
    - OpenViking root_api_key: `docker compose restart openviking memory-gateway`
    - Embedding API key: `docker compose restart openviking-infisical-agent openviking`
-   - ttyd password: `docker compose restart hermes-platform-ttyd`
-6. Verify the new credential is loaded WITHOUT printing the value (hash-compare against the OLD known value; see `Bash` snippet in `docs/09-DEPLOYMENT-RUNBOOK.md`).
+6. Verify the new credential is loaded WITHOUT printing the value (hash-compare against the old known value where practical).
+
+`HERMES_TTYD_USERNAME` and `HERMES_TTYD_PASSWORD` are deliberately unset by
+the current ttyd startup command because Authelia consumes the `Authorization`
+header and its FIDO gate is the routed management boundary. The direct ttyd
+port remains localhost-only. Do not treat an old ttyd password in Infisical as
+an active control unless the startup command is explicitly changed and the
+ingress interaction is re-reviewed.
 
 ## Gateway env vars (set in docker-compose.yml)
 

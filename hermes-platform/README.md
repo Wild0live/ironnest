@@ -39,7 +39,9 @@ An on-demand IronNest stack at `D:\claude-workspace\platform\hermes-platform\`. 
 - **OpenViking** is unreachable from any Hermes container (network-segmented).
 - **Ollama** provides local `mxbai-embed-large` embeddings for OpenViking.
 - **Mission Control** at `https://mission.ironnest.local/` is the browser ops/chat/Task control plane. It is separate from `memory-gateway` and talks to profiles through token-gated in-container bridges.
+- **Approval attention is separate from presence.** Agent avatars keep their online/working/offline dot and add a shield/count when that profile has pending operation approvals.
 - **IronNest Tasks** are the governed workflow layer Mission Control builds on top of Hermes Kanban: triage goals can be decomposed, assigned to specialist profiles, run in the assignee's own container, and reviewed through logs, artifacts, Reports, Apps, QA, and security gates.
+- **Big Bert has a read-mostly LLM Wiki boundary.** Published wiki content is mounted read-only, only proposal drafts are writable, and the profile joins the external wiki network.
 - **Shared Hermes Kanban** lives on `hermes-platform_kanban-shared` at `/opt/kanban` in every profile container. It is the underlying cross-profile work board and must remain secret-free; it is not private memory.
 - **Bearer tokens in Infisical only.** Never in git, never on disk.
 
@@ -76,6 +78,8 @@ See [`docs/08-SECURITY-MODEL.md`](docs/08-SECURITY-MODEL.md) for the threat mode
 | `hermes-platform-openviking` | `platform/hermes-platform-openviking:0.1.0` | Long-term memory backend (volcengine/OpenViking) | none |
 | `hermes-platform-memory-gateway` | `platform/hermes-platform-memory-gateway:0.1.0` | Policy-enforcing front door (FastAPI) | `127.0.0.1:18080` |
 | `hermes-platform-mission-control` | `platform/hermes-platform-mission-control:0.1.0` | Browser ops/chat dashboard | `https://mission.ironnest.local/` |
+| `hermes-platform-artifact-apps` | `nginxinc/nginx-unprivileged:alpine` | Read-only task Apps origin | `https://apps.ironnest.local/` |
+| `hermes-platform-operations-runner` | `platform/hermes-platform-operations-runner:0.1.0` | Optional approval-gated Docker operation broker | none |
 | `hermes-platform-ttyd` | `platform/hermes-agent:v2026.6.19-patched` | terminal + Hermes dashboard sidecar | `127.0.0.1:8123`, `127.0.0.1:8124` |
 | `hermes-pf-default` | `platform/hermes-agent:v2026.6.19-patched` | default profile agent + chat bridge | — |
 | `hermes-pf-mark` | same | mark profile agent + chat bridge | — |
@@ -83,14 +87,15 @@ See [`docs/08-SECURITY-MODEL.md`](docs/08-SECURITY-MODEL.md) for the threat mode
 | `hermes-pf-qa` | same | qa (QA/verification) profile agent + chat bridge | — |
 | `hermes-pf-littlejohn` | same | littlejohn profile agent + chat bridge | — |
 | `hermes-pf-jaime` | same | jaime profile agent + chat bridge | — |
-| `hermes-pf-bigbert` | same | bigbert profile agent + chat bridge | — |
+| `hermes-pf-bigbert` | same | bigbert profile agent + bridge + read-mostly LLM Wiki role | — |
 | `hermes-pf-octo` | same | octo (platform-ops) profile agent + chat bridge | — |
+| `kali-mcp-littlejohn` | `platform/kali-mcp-littlejohn:2026.07.03` | Optional on-demand Kali MCP sidecar | none |
 
 ---
 
 ## Test suite
 
-178 pytest cases ship in `gateway/tests/`. Runtime <1 second.
+The current eight-profile gateway suite collects 337 pytest cases.
 
 ```bash
 docker run --rm -v "$(pwd):/work:ro" python:3.13-slim bash -c "
@@ -106,7 +111,7 @@ See [`docs/10-VALIDATION-AND-TESTING.md`](docs/10-VALIDATION-AND-TESTING.md) for
 
 ## Quick start
 
-Assumes `platform/bootstrap.sh` has run (always-on stacks healthy) and the `platform/hermes-agent:v2026.6.19-patched` image exists (`bash platform/hermes/build.sh`).
+Assumes `platform/bootstrap.sh` has run (always-on stacks healthy), the `platform/hermes-agent:v2026.6.19-patched` image exists (`bash platform/hermes/build.sh`), and the separate `D:\LLM Wiki` checkout/stack has created the external wiki network and Big Bert host paths listed in `spec/rebuild-checklist.yaml`.
 
 ```bash
 cd D:\claude-workspace\platform\hermes-platform
@@ -115,7 +120,7 @@ cd D:\claude-workspace\platform\hermes-platform
 cp .env.example .env
 # Edit .env
 
-# 2) Build openviking + memory-gateway + Mission Control images
+# 2) Build openviking + memory-gateway + Mission Control + operations-runner images
 bash build.sh
 
 # 3) Start the stack
@@ -181,7 +186,7 @@ hermes-platform/
 ├── policies/                                <profile>.policy.yaml
 ├── registry/profiles-registry.yaml
 ├── profile-template/                        templates for create-profile.sh
-├── scripts/                                 11 lifecycle/validation shell scripts
+├── scripts/                                 17 lifecycle/validation shell scripts
 ├── docs/                                    numbered architecture and operations docs
 └── spec/                                    8 machine-readable manifests
 ```

@@ -73,6 +73,18 @@ class MissionControlAdminSecurityTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 403)
         self.assertIn("re-enrolled", str(raised.exception.detail))
 
+    def test_legacy_security_keys_get_usb_transport_hint(self):
+        descriptor = main._credential_descriptor({"id": "usb-key"})
+        self.assertEqual(descriptor, {
+            "type": "public-key", "id": "usb-key", "transports": ["usb"],
+        })
+
+    def test_registered_transport_hints_are_sanitized(self):
+        descriptor = main._credential_descriptor({
+            "id": "key", "transports": ["USB", "hybrid", "unsupported", "usb"],
+        })
+        self.assertEqual(descriptor["transports"], ["usb", "hybrid"])
+
 
 if __name__ == "__main__":
     unittest.main()

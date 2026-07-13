@@ -146,11 +146,20 @@ invariants:
       explicit enrollment, protected control-plane exclusions, and Docker-socket
       exclusion independently. Destructive DELETE/kill operations remain bound
       to a fresh operation-specific FIDO assertion even during a session.
+      WebAuthn transport values are browser-picker metadata only; challenge,
+      signature, RP ID, origin, immutable operator ownership, and required user
+      verification remain authoritative.
     verified_by: mission-control/tests/test_admin_sessions.py; operations-runner/tests/test_admin_sessions.py
 
 dependencies:
-  external_networks:    [platform-net, platform-egress]
-  external_services:    [infisical, squid, adguard]
+  external_networks:    [platform-net, platform-egress, llm-wiki_wiki-net]
+  external_services:    [infisical, squid, adguard, wiki-service]
+  external_host_paths:
+    - D:/LLM Wiki/wiki
+    - D:/LLM Wiki/wiki/_review/proposals
+    - D:/LLM Wiki/ironnest/bigbert-wiki-instructions.md
+    - D:/LLM Wiki/ironnest/install-bigbert-wiki-role.py
+    - D:/LLM Wiki/sources/mission-control-reports
   external_images:      [platform/hermes-agent:v2026.6.19-patched, ollama/ollama:0.4.6, infisical/cli@sha256:dba406b35e5819632412c561bfa46e6185e04c6d76175dc82bf97c4ff53745d7]
   external_volumes_ro:  [hermes_hermes-data]  # ONLY read during migration
 
@@ -182,6 +191,9 @@ extension_points:
   - id: EP-MISSION-CONTROL
     description: Extend the browser ops dashboard through mission-control while keeping it separate from memory-gateway.
     docs: docs/02-SERVICES.md
+  - id: EP-LLM-WIKI
+    description: Big Bert reads the external wiki and writes only proposal drafts; Mission Control publishes reviewed reports through the default bridge.
+    docs: docs/01-ARCHITECTURE.md, docs/16-DECISION-LOG.md D-021
   - id: EP-KANBAN
     description: Extend shared work coordination through /opt/kanban and bridge-mediated structured Kanban actions.
     docs: docs/02-SERVICES.md, mission-control/KANBAN-PHASE1-PLAN.md
@@ -330,8 +342,9 @@ known_quirks:
       hermes-platform-ttyd is a management sidecar that mounts ALL profile
       volumes (default at /opt/data; others at /opt/data/profiles/<p>/). This
       is BY DESIGN — operators need cross-profile UI access. The agent
-      containers (hermes-pf-*) stay volume-isolated. Trust boundary: anyone
-      with the ttyd password gets full multi-profile filesystem access, but
+      containers (hermes-pf-*) stay volume-isolated. Direct ports are
+      localhost-only and routed access is Authelia-gated. Trust boundary:
+      anyone who reaches ttyd gets full multi-profile filesystem access, but
       NOT gateway-namespace bypass (gateway still enforces per-bearer-token).
     impacts: ["docker-compose.yml hermes-platform-ttyd", "docs/16-DECISION-LOG.md D-011"]
 
@@ -345,3 +358,12 @@ known_quirks:
       Mission Control itself should not get Docker socket access, OpenViking
       credentials, profile memory tokens, or membership in app-net/mem-net.
     impacts: ["mission-control/app/main.py", "agent-bridge/agent-chat-bridge.py", "docker-compose.yml mission-control"]
+
+  - id: Q19
+    area: agent-bridge-time-budget
+    description: |
+      agent-chat-bridge.py defaults AGENT_BRIDGE_TIMEOUT to 900 seconds so long
+      tool/security turns can finish. The source is bind-mounted, but the value
+      is read at Python process start; restart the bridge/profile to adopt a
+      changed default. Initialization and idle defaults are 150 and 900 seconds.
+    impacts: ["agent-bridge/agent-chat-bridge.py", "hermes-pf-* runtime processes"]

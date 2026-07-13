@@ -111,7 +111,7 @@ Restore is a manual operation (`platform/ops/restore.sh`); see the IronNest READ
 
 ## Recovering from a Rancher Desktop restart
 
-When Rancher Desktop is restarted (Windows reboot, manual quit, update), ALL 27 IronNest containers stop. To bring everything back:
+When Rancher Desktop is restarted (Windows reboot, manual quit, update), all running IronNest containers stop. The exact count changes as optional stacks and Compose profiles are enabled, so recover by stack rather than relying on a fixed container total:
 
 ```bash
 # 1. Bring up the always-on stacks
@@ -138,13 +138,13 @@ If autostart is enabled (Task Scheduler chains bootstrap.sh + start.sh per stack
 
 | Action | Command |
 |---|---|
-| Open terminal | https://127.0.0.1:8123 (basic-auth: `HERMES_TTYD_USERNAME` / `HERMES_TTYD_PASSWORD` from Infisical `/hermes-platform/default`) |
+| Open terminal directly | http://127.0.0.1:8123 (localhost-only; ttyd Basic Auth is disabled) |
+| Open terminal through ingress | https://hermes-platform.ironnest.local/ (Authelia FIDO gate) |
 | Open dashboard | http://127.0.0.1:8124 (no auth) |
 | Restart (after Infisical rotation) | `docker compose restart hermes-platform-ttyd` |
-| Rotate password | Generate new value → paste into Infisical `/hermes-platform/default → HERMES_TTYD_PASSWORD` → restart container. Confirm rotation via hash compare (do NOT print the new value): `docker exec hermes-platform-ttyd sh -c 'ps -ef \| grep -oE "--credential [^ ]+" \| sha256sum'` and verify the hash differs from the previous known value. |
 | Inspect cross-profile data | `docker exec hermes-platform-ttyd ls //opt/data/profiles/<profile>` (double slash defeats Git Bash MSYS mangling) |
 
-**Trust note:** the ttyd container mounts ALL profile volumes (`hermes-platform_data-{default,mark,steve,qa,littlejohn,jaime,bigbert,octo}`). Anyone with the ttyd password has full multi-profile filesystem access. The actual `hermes-pf-*` agent containers remain volume-isolated. See `docs/16-DECISION-LOG.md §D-011`.
+**Trust note:** the ttyd container mounts ALL profile volumes (`hermes-platform_data-{default,mark,steve,qa,littlejohn,jaime,bigbert,octo}`). The direct ports are deliberately localhost-only management escape hatches; the routed URLs are protected by Authelia. Anyone who reaches this management plane has full multi-profile filesystem access. The actual `hermes-pf-*` agent containers remain volume-isolated. See `docs/16-DECISION-LOG.md §D-011`.
 
 **Do NOT run `hermes gateway run` from the ttyd shell** — it would create a competing Telegram poller and 409-conflict with `hermes-pf-default`. ttyd is for `hermes dashboard` + interactive shell only.
 

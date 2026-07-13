@@ -1548,6 +1548,12 @@ menu {
 .conv-head-actions .ghost-btn { flex: 1; }
 
 .agent-picker { display: flex; flex-wrap: wrap; gap: 6px; }
+.agent-ava-wrap {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  line-height: 0;
+}
 .agent-ava {
   position: relative;
   padding: 0;
@@ -1586,6 +1592,49 @@ menu {
 .agent-ava.offline .ava {
   opacity: 0.45;
   filter: grayscale(0.6);
+}
+.agent-approval-badge {
+  position: absolute;
+  top: -5px;
+  right: -6px;
+  z-index: 2;
+  width: 20px;
+  height: 22px;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #fff;
+  line-height: 1;
+  filter: drop-shadow(0 0 1px var(--rail)) drop-shadow(0 0 4px rgba(228, 176, 79, 0.48));
+}
+.agent-approval-badge:hover {
+  border: 0;
+  transform: translateY(-1px);
+  filter: drop-shadow(0 0 1px var(--rail)) drop-shadow(0 0 6px rgba(228, 176, 79, 0.72));
+}
+.agent-approval-badge:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+.agent-approval-badge svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  fill: var(--amber);
+}
+.agent-approval-badge span {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding-bottom: 3px;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1;
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.55);
 }
 @keyframes busy-pulse {
   0%, 100% { opacity: 0.45; transform: scale(0.85); }
