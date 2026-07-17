@@ -300,9 +300,21 @@ def validate_factory_request(req: DockerRequest, state: dict[str, Any],
     elif resource == "containers/create" and req.method == "POST":
         validate_create(body, query)
         allowed = True
-    elif m := re.fullmatch(r"containers/([^/]+)/(start|stop|restart|exec)", resource):
+    elif m := re.fullmatch(r"containers/([^/]+)/(start|stop|restart)", resource):
+        if req.method == "POST":
+            if expected_target and m.group(1) != expected_target:
+                raise HTTPException(status_code=400, detail="Docker path target does not match approval target")
+            # Factory containers remain valid, while existing workloads must
+            # pass the same enrollment and protected-boundary checks used by
+            # Octo admin sessions. FIDO approval does not bypass eligibility.
+            if factory_name(m.group(1)):
+                require_unprotected_container(m.group(1))
+            else:
+                require_eligible_container(m.group(1))
+            allowed = True
+    elif m := re.fullmatch(r"containers/([^/]+)/exec", resource):
         if req.method == "POST" and factory_name(m.group(1)):
-            if m.group(2) == "exec" and not isinstance(body.get("Cmd"), list):
+            if not isinstance(body.get("Cmd"), list):
                 raise HTTPException(status_code=400, detail="exec creation requires a Cmd array")
             allowed = True
     elif m := re.fullmatch(r"containers/([^/]+)", resource):

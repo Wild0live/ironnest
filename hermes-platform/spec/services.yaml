@@ -5,7 +5,7 @@
 #   - external monitoring/observability tools
 #   - AI rebuild agents (spec/rebuild-checklist.yaml references this)
 #
-# Current as of 2026-07-13.
+# Current as of 2026-07-17.
 
 stack_name: hermes-platform
 stack_kind: on-demand
@@ -221,7 +221,7 @@ services:
     resources:
       cpus: "2.0"
       memory: 4G
-    notes: No host ports; only memory-gateway can call it.
+    notes: No host ports; memory-gateway is the sole application ingress. Ollama is a trusted co-resident backend that OpenViking calls for embeddings, not an agent-facing memory client.
 
   - name: memory-gateway
     container_name: hermes-platform-memory-gateway
@@ -267,7 +267,7 @@ services:
       - target: agent-chat bridge
         url_pattern: http://hermes-pf-<profile>:8011
         auth: MISSION_CONTROL_BRIDGE_TOKEN
-        features: [chat, token_streaming, file_downloads, soul_edit, model_switch, role_summary, kanban_proxy, manual_task_run, task_decompose, autodispatch_controls, report_publish_wiki, wiki_session_handoff]
+        features: [chat, token_streaming, sanitized_agent_activity, cron_catchup, trusted_operation_ack, file_downloads, soul_edit, model_switch, role_summary, kanban_proxy, manual_task_run, task_decompose, autodispatch_controls, report_publish_wiki, wiki_session_handoff]
       - target: operations-runner
         url_pattern: http://operations-runner:8091
         auth: OPERATIONS_RUNNER_TOKEN

@@ -73,6 +73,32 @@ class AdminRunnerSecurityTests(unittest.TestCase):
             main.validate_factory_request(request, {}, "eligible-app")
         self.assertEqual(raised.exception.status_code, 400)
 
+    def test_step_up_lifecycle_accepts_enrolled_existing_workload(self):
+        request = main.DockerRequest(
+            method="POST", path="/v1.47/containers/openclaw-gateway/stop", body={})
+        with patch.object(main, "require_eligible_container") as eligible:
+            method, endpoint, payload = main.validate_factory_request(
+                request, {}, "openclaw-gateway")
+        self.assertEqual((method, endpoint, payload),
+                         ("POST", "/v1.47/containers/openclaw-gateway/stop", b"{}"))
+        eligible.assert_called_once_with("openclaw-gateway")
+
+    def test_step_up_lifecycle_must_match_approved_target(self):
+        request = main.DockerRequest(
+            method="POST", path="/v1.47/containers/other-app/stop", body={})
+        with self.assertRaises(main.HTTPException) as raised:
+            main.validate_factory_request(request, {}, "eligible-app")
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_step_up_lifecycle_keeps_protected_workload_denied(self):
+        request = main.DockerRequest(
+            method="POST", path="/v1.47/containers/openclaw-infisical-agent/stop", body={})
+        denied = main.HTTPException(status_code=403, detail="container is protected")
+        with patch.object(main, "require_eligible_container", side_effect=denied):
+            with self.assertRaises(main.HTTPException) as raised:
+                main.validate_factory_request(request, {}, "openclaw-infisical-agent")
+        self.assertEqual(raised.exception.status_code, 403)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -32,10 +32,12 @@ contains:
 invariants:
   - id: I1
     description: |
-      OpenViking publishes NO host ports. It is reachable ONLY from the
-      memory-gateway container via the internal hermes-platform-mem-net
-      network. A successful curl from any hermes-pf-* container to
-      http://openviking:1933/ is a SECURITY REGRESSION.
+      OpenViking publishes NO host ports. Profile agents and Mission Control
+      can reach it ONLY through memory-gateway. Its internal
+      hermes-platform-mem-net peers are limited to memory-gateway and the
+      trusted Ollama embedding backend that OpenViking calls; Ollama is not an
+      agent-facing memory client. A successful curl from any hermes-pf-*
+      container to http://openviking:1933/ is a SECURITY REGRESSION.
     verified_by: scripts/healthcheck.sh, scripts/validate-isolation.sh
 
   - id: I2

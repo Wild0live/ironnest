@@ -103,6 +103,9 @@ services:
     ports:
       - "127.0.0.1:1514:1514"    # host agent ↔ manager
       - "127.0.0.1:1515:1515"    # host agent enrollment
+    depends_on:
+      wazuh.indexer:
+        condition: service_healthy
     environment:
       INDEXER_URL: "https://wazuh.indexer:9200"
       INDEXER_USERNAME: "admin"

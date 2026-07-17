@@ -98,10 +98,158 @@ _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 _TID_RE = re.compile(r"^t_[0-9a-f]+$")  # kanban task id shape, for artifact paths
 _MODEL_VALUE = re.compile(r"[^A-Za-z0-9._:\-/]")
 _PROVIDER_VALUE = re.compile(r"[^A-Za-z0-9._-]")
+_ACTIVITY_ID = re.compile(r"^[A-Za-z0-9._:-]{1,96}$")
+_ACTIVITY_SIMPLE_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,95}$")
+_ACTIVITY_SECRET = re.compile(
+    r"(?i)(?:^|[\\/._-])(?:\.env|secrets?|tokens?|credentials?|cookies?|passwords?|passwd|api[-_]?keys?)(?:$|[\\/._-])")
+_ACTIVITY_VALUE_SECRET = re.compile(
+    r"(?i)\b(api[-_]?key|token|password|passwd|secret|credential|cookie)\s*[:=]\s*([^\s,;]+)")
+_ACTIVITY_BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+\-/]+=*")
+_ACTIVITY_LONG_VALUE = re.compile(r"\b[A-Za-z0-9_\-]{40,}\b")
 _BUSY = threading.Lock()  # one turn at a time per profile (handler level)
 _CRON_CATCHUP_BUSY = threading.Lock()
 _ROLE_LOCK = threading.Lock()       # guards the in-flight flag below
 _role_inflight = {"running": False}  # at most one role-summary generation at a time
+
+
+_ACTIVITY_KIND_LABELS = {
+    "read": "Reading information",
+    "search": "Searching",
+    "edit": "Editing workspace",
+    "execute": "Running a tool",
+    "fetch": "Fetching information",
+    "think": "Planning",
+    "other": "Working",
+}
+
+
+def _activity_safe_text(value: object, limit: int = 160) -> str:
+    """Return short user-facing text with obvious credential values removed."""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+    text = " ".join(text.split())
+    text = _ACTIVITY_BEARER.sub("Bearer [redacted]", text)
+    text = _ACTIVITY_VALUE_SECRET.sub(lambda m: f"{m.group(1)}=[redacted]", text)
+    text = _ACTIVITY_LONG_VALUE.sub("[redacted]", text)
+    if len(text) > limit:
+        text = text[: max(0, limit - 1)].rstrip() + "…"
+    return text
+
+
+def _activity_safe_path(value: object) -> str:
+    """Expose only a bounded workspace-relative path or a non-sensitive basename."""
+    raw = str(value or "").strip().replace("\\", "/")
+    if not raw or "\x00" in raw or _ACTIVITY_SECRET.search(raw):
+        return ""
+    while "//" in raw:
+        raw = raw.replace("//", "/")
+    if raw.startswith("/opt/data/workspace/"):
+        rendered = raw[len("/opt/data/workspace/"):]
+    elif raw.startswith("/opt/shared/mine/"):
+        rendered = "shared/" + raw[len("/opt/shared/mine/"):]
+    elif not raw.startswith("/") and ".." not in raw.split("/"):
+        rendered = raw
+    else:
+        rendered = os.path.basename(raw.rstrip("/"))
+    if not rendered or rendered.startswith(".") or _ACTIVITY_SECRET.search(rendered):
+        return ""
+    parts = [part for part in rendered.split("/") if part and part not in {".", ".."}]
+    return _activity_safe_text("/".join(parts[-4:]), 140)
+
+
+def _activity_safe_detail(raw_input: object, locations: object = None) -> str:
+    """Derive one allowlisted detail without forwarding ACP rawInput/rawOutput."""
+    args = raw_input if isinstance(raw_input, dict) else {}
+    for key in ("path", "file_path", "filename"):
+        detail = _activity_safe_path(args.get(key))
+        if detail:
+            return detail
+    if isinstance(locations, list):
+        for location in locations[:3]:
+            if isinstance(location, dict):
+                detail = _activity_safe_path(location.get("path"))
+                if detail:
+                    return detail
+    for key in ("container", "container_name", "service", "task_id", "operation_id", "job_id"):
+        target = str(args.get(key) or "").strip()
+        if _ACTIVITY_SIMPLE_TARGET.fullmatch(target) and not _ACTIVITY_SECRET.search(target):
+            return target
+    url = str(args.get("url") or "").strip()
+    if url:
+        try:
+            host = urlsplit(url).hostname or ""
+        except ValueError:
+            host = ""
+        if host and _ACTIVITY_SIMPLE_TARGET.fullmatch(host):
+            return host
+    return ""
+
+
+def _activity_tool_label(kind: str, title: object) -> str:
+    """Map potentially sensitive ACP titles to fixed operator-facing labels."""
+    low = str(title or "").strip().lower()
+    prefixes = (
+        (("web search",), "Searching the web"),
+        (("search", "session search"), "Searching files"),
+        (("read", "skill view"), "Reading a file"),
+        (("write", "patch"), "Editing a file"),
+        (("terminal", "process", "python"), "Running a command"),
+        (("extract", "navigate", "browser"), "Using the browser"),
+        (("todo",), "Updating the plan"),
+        (("memory",), "Checking memory"),
+        (("delegate",), "Delegating work"),
+        (("cron",), "Managing a schedule"),
+        (("skill",), "Using a skill"),
+        (("generate image", "image"), "Generating an image"),
+    )
+    for names, label in prefixes:
+        if any(low.startswith(name) for name in names):
+            return label
+    return _ACTIVITY_KIND_LABELS.get(kind, "Working")
+
+
+def _activity_event_from_update(update: object, tools: dict[str, dict]) -> dict | None:
+    """Convert an ACP update to the narrow activity schema Mission Control trusts.
+
+    Raw thoughts, inputs, outputs, commands, queries, and content blocks never
+    leave this bridge. Mission Control performs a second allowlist pass.
+    """
+    if not isinstance(update, dict):
+        return None
+    update_type = str(update.get("sessionUpdate") or "")
+    if update_type == "agent_thought_chunk":
+        return None
+    if update_type == "plan":
+        entries = []
+        for item in update.get("entries") or []:
+            if not isinstance(item, dict):
+                continue
+            content = _activity_safe_text(item.get("content"), 140)
+            status = str(item.get("status") or "pending")
+            if content and status in {"pending", "in_progress", "completed"}:
+                entries.append({"content": content, "status": status})
+            if len(entries) >= 12:
+                break
+        return {"event": "plan", "label": f"Plan updated · {len(entries)} steps", "entries": entries}
+    if update_type not in {"tool_call", "tool_call_update"}:
+        return None
+    tool_id = str(update.get("toolCallId") or "")
+    if not _ACTIVITY_ID.fullmatch(tool_id):
+        return None
+    previous = tools.get(tool_id, {})
+    kind = str(update.get("kind") or previous.get("category") or "other")
+    if kind not in _ACTIVITY_KIND_LABELS:
+        kind = "other"
+    label = _activity_tool_label(kind, update.get("title") or previous.get("source_title"))
+    detail = _activity_safe_detail(update.get("rawInput"), update.get("locations")) or previous.get("detail", "")
+    status = str(update.get("status") or ("in_progress" if update_type == "tool_call" else previous.get("status", "in_progress")))
+    if status not in {"pending", "in_progress", "completed", "failed"}:
+        status = "in_progress"
+    event = {"event": "tool", "id": tool_id, "label": label,
+             "category": kind, "status": status}
+    if detail:
+        event["detail"] = detail
+    tools[tool_id] = {**event, "source_title": str(update.get("title") or previous.get("source_title") or "")}
+    return event
 
 
 def _read_soul() -> str:
@@ -555,49 +703,77 @@ def _cron_latest_expr_due(expr: str, now: datetime) -> datetime | None:
     try:
         from croniter import croniter
 
-        return croniter(expr, now).get_prev(datetime)
+        # croniter's get_prev() is exclusive of its base time.  Move the base
+        # forward by one microsecond so a fire exactly at a recovery window's
+        # end remains eligible.
+        return croniter(expr, now + timedelta(microseconds=1)).get_prev(datetime)
     except Exception:  # noqa: BLE001
         return None
 
 
-def _cron_missed_due_at(job: dict) -> str | None:
+def _cron_attempt_at(job: dict) -> datetime | None:
+    """Newest durable evidence that execution was attempted for this job."""
+    attempts = [_cron_parse_dt(job.get("last_run_at"))]
+    claim = job.get("fire_claim") if isinstance(job.get("fire_claim"), dict) else {}
+    attempts.append(_cron_parse_dt(claim.get("at")))
+    return max((attempt for attempt in attempts if attempt), default=None)
+
+
+def _cron_missed_due_at(job: dict, window_start: object = None,
+                        window_end: object = None) -> str | None:
     """Return the latest missed scheduled fire time for a job, or None.
 
     Hermes' built-in scheduler intentionally fast-forwards stale jobs after a
     short grace window. Mission Control catch-up uses this read-only detector
-    so a job that was missed while the PC was off can still be fired once.
+    so a job that was missed while the PC was off can still be fired once.  An
+    automatic recovery window is bounded by MC's last heartbeat and startup;
+    manual catch-up omits the bounds and retains the existing behavior.
     """
     if not job.get("enabled", True) or job.get("state") in {"paused", "completed"}:
         return None
 
-    now = datetime.now().astimezone()
+    start_dt = _cron_parse_dt(window_start)
+    end_dt = _cron_parse_dt(window_end) or datetime.now().astimezone()
     schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
     kind = schedule.get("kind")
     next_dt = _cron_parse_dt(job.get("next_run_at"))
     last_dt = _cron_parse_dt(job.get("last_run_at"))
-    due_dt: datetime | None = None
+    due_candidates: list[datetime] = []
 
-    if next_dt and next_dt <= now:
-        due_dt = next_dt
-    elif kind == "cron":
+    if next_dt and next_dt <= end_dt:
+        due_candidates.append(next_dt)
+    if kind == "cron":
         expr = str(schedule.get("expr") or "").strip()
-        due_dt = _cron_latest_expr_due(expr, now) if expr else None
-    elif kind == "interval" and last_dt:
+        latest = _cron_latest_expr_due(expr, end_dt) if expr else None
+        if latest:
+            due_candidates.append(latest)
+    elif kind == "interval":
         try:
             minutes = int(schedule.get("minutes") or 0)
         except (TypeError, ValueError):
             minutes = 0
         if minutes > 0:
             period = timedelta(minutes=minutes)
-            steps = int((now - last_dt).total_seconds() // period.total_seconds())
-            if steps > 0:
-                due_dt = last_dt + (period * steps)
+            anchor = last_dt or _cron_parse_dt(job.get("created_at"))
+            if anchor and anchor <= end_dt:
+                steps = int((end_dt - anchor).total_seconds() // period.total_seconds())
+                if steps > 0:
+                    due_candidates.append(anchor + (period * steps))
     elif kind == "once":
-        due_dt = _cron_parse_dt(schedule.get("run_at"))
+        run_at = _cron_parse_dt(schedule.get("run_at"))
+        if run_at and run_at <= end_dt:
+            due_candidates.append(run_at)
 
-    if not due_dt or due_dt > now:
+    if not due_candidates:
         return None
-    if last_dt and last_dt >= due_dt:
+    due_dt = max(due_candidates)
+    if due_dt > end_dt or (start_dt and due_dt <= start_dt):
+        return None
+    # last_run_at is written for success and failure.  fire_claim covers the
+    # narrower crash-after-claim case.  Either means an attempt existed, so the
+    # automatic recovery path must not run the occurrence again.
+    attempt_dt = _cron_attempt_at(job)
+    if attempt_dt and attempt_dt >= due_dt:
         return None
     return due_dt.isoformat()
 
@@ -623,7 +799,8 @@ def _cron_job_summary(job: dict, missed_due_at: str | None = None) -> dict:
     }
 
 
-def _run_cron_catchup(job_ref: str | None = None) -> dict:
+def _run_cron_catchup(job_ref: str | None = None, window_start: object = None,
+                      window_end: object = None) -> dict:
     if not _CRON_CATCHUP_BUSY.acquire(blocking=False):
         return {"ok": False, "error": "cron catch-up already running", "ran": [], "skipped": []}
     try:
@@ -631,7 +808,7 @@ def _run_cron_catchup(job_ref: str | None = None) -> dict:
         for job in _load_raw_cron_jobs():
             if job_ref and job_ref not in {str(job.get("id") or ""), str(job.get("name") or "")}:
                 continue
-            missed_due_at = _cron_missed_due_at(job)
+            missed_due_at = _cron_missed_due_at(job, window_start, window_end)
             summary = _cron_job_summary(job, missed_due_at)
             if missed_due_at:
                 candidates.append((job, summary))
@@ -2329,6 +2506,7 @@ class AcpAgent:
         self._notes: list[str] = []
         self._stream_q: "queue.Queue | None" = None  # active streaming turn sink
         self._active_id: int | None = None            # request id of the streaming turn
+        self._activity_tools: dict[str, dict] = {}     # sanitized ACP tool state for active turn
         self._io = threading.Lock()      # guards stdin writes + id/pending bookkeeping
         self._turn = threading.Lock()    # serializes whole turns on the process
 
@@ -2383,6 +2561,10 @@ class AcpAgent:
                             self._stream_q.put(("chunk", text))
                         else:
                             self._notes.append(text)
+                elif self._stream_q is not None:
+                    activity = _activity_event_from_update(upd, self._activity_tools)
+                    if activity is not None:
+                        self._stream_q.put(("activity", activity))
             elif mid is not None and "method" in msg:
                 # server -> client request: auto-approve permissions, refuse the rest
                 if msg["method"] == "session/request_permission":
@@ -2453,8 +2635,11 @@ class AcpAgent:
                     "stop": res.get("stopReason"), "mode": "acp"}
 
     def prompt_stream(self, conv: str, message: str, attachment_paths: list[str]):
-        """Generator yielding ("chunk", text) as tokens arrive, then a final
-        ("done", meta) or ("error", str). Serialized per profile via _turn."""
+        """Yield sanitized activity and answer chunks, then done/error.
+
+        Raw ACP thoughts, tool inputs, and tool outputs are deliberately not
+        exposed. Turns remain serialized per profile via ``_turn``.
+        """
         with self._turn:
             self._ensure()
             sid = self._session_for(conv)
@@ -2470,9 +2655,13 @@ class AcpAgent:
                 rid = self._next_id
             self._stream_q = q
             self._active_id = rid
+            self._activity_tools = {}
             started = time.time()
             assembled: list[str] = []  # full reply, to rewrite MEDIA: links at done
+            composing = False
             try:
+                yield ("activity", {"event": "status", "label": "Analyzing request",
+                                    "status": "in_progress"})
                 self._send({"jsonrpc": "2.0", "id": rid, "method": "session/prompt",
                             "params": {"sessionId": sid, "prompt": blocks}})
                 while True:
@@ -2482,8 +2671,14 @@ class AcpAgent:
                         yield ("error", f"turn exceeded {PROMPT_TIMEOUT}s")
                         return
                     if kind == "chunk":
+                        if not composing:
+                            composing = True
+                            yield ("activity", {"event": "status", "label": "Composing response",
+                                                "status": "in_progress"})
                         assembled.append(payload)
                         yield ("chunk", payload)
+                    elif kind == "activity":
+                        yield ("activity", payload)
                     else:  # done
                         if payload.get("error"):
                             yield ("error", str(payload["error"]))
@@ -2504,6 +2699,7 @@ class AcpAgent:
             finally:
                 self._stream_q = None
                 self._active_id = None
+                self._activity_tools = {}
                 self.last_used = time.time()
 
     def maybe_idle_shutdown(self) -> None:
@@ -2961,7 +3157,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(413, {"ok": False, "error": "bad or oversized body"})
                 return
             job_id = str(data.get("job_id") or "").strip() or None
-            result = _run_cron_catchup(job_id)
+            window_start = str(data.get("window_start") or "").strip() or None
+            window_end = str(data.get("window_end") or "").strip() or None
+            if bool(window_start) != bool(window_end):
+                self._json(400, {"ok": False, "error": "window_start and window_end are required together"})
+                return
+            if window_start:
+                start_dt = _cron_parse_dt(window_start)
+                end_dt = _cron_parse_dt(window_end)
+                if not start_dt or not end_dt or start_dt >= end_dt:
+                    self._json(400, {"ok": False, "error": "invalid cron recovery window"})
+                    return
+            result = _run_cron_catchup(job_id, window_start, window_end)
             self._json(200 if result.get("ok") else 409, result)
             return
         if self.path not in ("/chat", "/chat/stream"):
@@ -3001,6 +3208,8 @@ class Handler(BaseHTTPRequestHandler):
                     for kind, payload in AGENT.prompt_stream(conv, message, paths):
                         if kind == "chunk":
                             self._sse({"type": "chunk", "text": payload})
+                        elif kind == "activity":
+                            self._sse({"type": "activity", **payload})
                         elif kind == "done":
                             self._sse({"type": "done", **payload})
                         else:

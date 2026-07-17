@@ -101,7 +101,7 @@ Three concentric trust tiers.
 
 **Tier B — the policy kernel.** A single `memory-gateway` container running FastAPI. It is dual-homed on `hermes-platform-app-net` (incoming from Hermes) and `hermes-platform-mem-net` (outgoing to OpenViking). It authenticates incoming requests via a bearer-token map fetched from Infisical, evaluates each request against `policies/<profile>.policy.yaml` (deny-first), audits every decision to a JSONL log, and forwards the request to OpenViking only on `allow`. Adapter logic in `gateway/app/openviking_client.py` translates the logical namespaces (`viking://shared/**`, `viking://profiles/<p>/**`) onto OpenViking's native `viking://resources/` tree.
 
-**Tier C — the memory.** The `openviking` container runs `openviking-server` from upstream `volcengine/OpenViking`. It listens on port 1933 inside `hermes-platform-mem-net`. The container publishes no host ports. The only thing on its network is the memory-gateway.
+**Tier C — the memory.** The `openviking` container runs `openviking-server` from upstream `volcengine/OpenViking`. It listens on port 1933 inside `hermes-platform-mem-net` and publishes no host ports. That internal network contains only OpenViking, `memory-gateway`, and the trusted Ollama embedding backend that OpenViking calls. Memory Gateway is the sole application ingress; profile agents and Mission Control have no direct route to OpenViking.
 
 ## One conversation, end to end
 

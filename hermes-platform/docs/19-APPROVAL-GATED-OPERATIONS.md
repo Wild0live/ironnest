@@ -11,10 +11,12 @@ The runner supports two approval-gated operation classes:
 
 - Profile lifecycle: `start`, `stop`, and `restart` for the eight listed
   `hermes-pf-*` gateways and any other explicitly configured container.
-- Factory Docker requests: pull an explicitly allowlisted image, create named
-  `factory-*` containers, start/stop/restart them, create and start exec
+- Exact FIDO-approved Docker requests: pull an explicitly allowlisted image,
+  create named `factory-*` containers, start/stop/restart factory containers or
+  explicitly Octo-enrolled existing workloads, create and start factory exec
   sessions, create `factory-*` networks, and connect/disconnect factory
-  containers from factory networks.
+  containers from factory networks. Existing workloads still pass protected
+  name/label and Docker-socket-holder checks at the runner.
 
 Each factory request retains its exact HTTP method, Docker API path, and JSON
 body in the approval record. The runner rejects all other Docker endpoints. It
@@ -105,7 +107,26 @@ when configured.
 1. `POST /api/operations/requests` creates a proposal; Docker is untouched.
 2. `POST /api/operations/{id}/approve` requires the approving operator name
    and sends the exact, single-use request to the private runner network.
-3. `GET /api/operations` shows the request ledger.
+3. `POST /api/operations/{id}/reject` lets the authenticated Authelia operator
+   terminally reject a pending request without a FIDO ceremony and without
+   contacting either runner. The rejection remains visible in the thread and
+   ledger with operator attribution.
+4. `GET /api/operations` shows the request ledger.
+
+### Conversation feedback
+
+Chat-originated proposals are bound to the exact conversation when the agent
+cites the returned `op-...` ID. Mission Control persists idempotent lifecycle
+events for requested, executing, completed, failed, rejected, and expired states
+and refreshes the active transcript during operation polling. A proposal that
+cannot be correlated within the configured grace period goes to a dedicated
+`Approvals` conversation; it is never attached to an arbitrary recent chat.
+
+After FIDO verification and after completed/failed terminal outcomes, Mission
+Control also prompts the same profile bridge with a trusted no-tools event so
+Hermes can acknowledge the state naturally. This callback is best-effort and
+cannot approve, execute, retry, or delay the operation. The persisted Mission
+Control lifecycle message remains the authoritative result.
 
 Example factory-container proposal (`target` is the audit label):
 
@@ -183,6 +204,12 @@ shows `!`, the exact count, or `9+`; selecting it opens the pending Approvals
 view filtered to that agent and clears stale search/risk/archive filters. The
 indicator is derived from the live operations ledger and disappears when the
 requests leave the pending state.
+
+Pending cards in the Approvals ledger and agent thread show **Reject** beside
+the FIDO approval action. Rejecting is a deny-only transition and therefore
+does not grant a capability or require key touch; it still requires the browser
+session to be revalidated directly with Authelia. Only `pending_approval` may
+become `rejected`, and a rejected request cannot later enter the runner path.
 
 ## Octo ten-minute admin session
 
@@ -288,6 +315,18 @@ FIDO approval through the allowlisted remediation ID
 `software-vulnerability-remediation-v1`. This is not raw PowerShell execution:
 the submitted script is operator-review text, while the local Windows runner
 executes only fixed `winget` command shapes from structured JSON.
+
+The mounted `request-host-operation.py` helper accepts only
+`cis-windows-top5-v1` and `software-vulnerability-remediation-v1`; the software
+lane requires a structured payload file. Product-specific invented IDs such as
+`windows-vscode-remediation-v1` are rejected before Mission Control creates an
+approval request. Install the authored guidance into Little John's persistent
+skill directory with:
+
+```powershell
+docker cp authored-skills/littlejohn/security/software-vulnerability-remediation hermes-pf-littlejohn:/opt/data/skills/security/
+docker exec -u root hermes-pf-littlejohn chown -R hermes:hermes /opt/data/skills/security/software-vulnerability-remediation
+```
 
 Payload shape:
 

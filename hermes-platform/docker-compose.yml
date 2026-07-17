@@ -462,6 +462,14 @@ services:
       MISSION_CONTROL_POLICIES_DIR:  "/etc/hermes-platform/policies"
       MISSION_CONTROL_AUDIT_LOG:     "/var/log/gateway/audit.log"
       MISSION_CONTROL_STATE_FILE:    "/var/lib/mission-control/state.json"
+      # Record a durable MC heartbeat and, after a restart, automatically fire
+      # only the newest unattempted occurrence per schedule from the offline
+      # interval. Calls still enter each profile's normal governed cron path.
+      MISSION_CONTROL_CRON_AUTO_CATCHUP: "true"
+      MISSION_CONTROL_CRON_RECOVERY_HEARTBEAT_SECONDS: "30"
+      MISSION_CONTROL_CRON_RECOVERY_RETRY_SECONDS: "30"
+      MISSION_CONTROL_CRON_RECOVERY_STARTUP_DELAY_SECONDS: "10"
+      MISSION_CONTROL_CRON_CATCHUP_TIMEOUT_SECONDS: "1200"
       # Optional bearer gate on writes. Unset = Authelia FIDO gate is the auth
       # boundary (writes allowed for any authenticated operator session).
       MISSION_CONTROL_ADMIN_TOKEN:   "${MISSION_CONTROL_ADMIN_TOKEN:-}"

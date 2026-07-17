@@ -114,6 +114,13 @@ Operational posture:
 
 `hermes-platform-mission-control` is a standalone FastAPI dashboard at `https://mission.ironnest.local/` through Traefik + Authelia. It is the IronNest Task control plane over Hermes Kanban: operators create goals, orchestrate decomposition, route work to specialists, run assigned tasks, inspect logs/artifacts, publish Reports, preview Apps, and keep security/QA work visible. It is deliberately separate from `memory-gateway`: it holds no OpenViking key, profile token, Infisical credential, or Docker socket. It joins `platform-net` for ingress/profile bridges and the internal `mission-control-ops-net` only for exact requests to `operations-runner`.
 
+Agent chat streams final-answer tokens plus a sanitized Agent Activity timeline
+derived from ACP plan and tool lifecycle events. Profile bridges discard raw
+thoughts, commands, inputs, outputs, prompts, and memory payloads; Mission
+Control independently allowlists the remaining fields and persists only a
+bounded per-turn milestone summary. Compact, Standard, and Detailed are
+presentation choices, not permission or reasoning-disclosure modes.
+
 Mounted inputs:
 
 - `registry/profiles-registry.yaml` read-only, to discover profile names and container names.

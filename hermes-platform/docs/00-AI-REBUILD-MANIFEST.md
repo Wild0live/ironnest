@@ -9,7 +9,7 @@
 
 1. **OpenViking** (https://github.com/volcengine/OpenViking) as the long-term context database for AI agents.
 2. **Ollama** as the local embedding service for OpenViking (`mxbai-embed-large`).
-3. **Memory Gateway** — a FastAPI service that is the ONLY thing allowed to talk to OpenViking. It enforces a deny-first policy from `policies/<profile>.policy.yaml` and audits every request.
+3. **Memory Gateway** — a FastAPI service that is the ONLY application ingress allowed to call OpenViking. It enforces a deny-first policy from `policies/<profile>.policy.yaml` and audits every request. The only other container on OpenViking's internal network is the trusted Ollama embedding backend that OpenViking calls; it is not an agent-facing memory client.
 4. **Per-profile Hermes containers** — `hermes-pf-<profile>` — one per profile, each mounting its own named volume so no profile's data is reachable from another profile's container.
 5. **`ironnest_gateway` Hermes memory provider** — an in-process provider mounted into every `hermes-pf-*` container. It performs automatic recall before answers and stores completed turns afterward by calling Memory Gateway only.
 6. **Mission Control** — a standalone FastAPI/browser dashboard at `https://mission.ironnest.local/` for profile health, IronNest Tasks, schedules, chat, file downloads, SOUL.md edits, model switching, embedded terminal access, and operator-bound WebAuthn approvals. Agent avatars retain their health/work dot and add a separate shield/count when that profile has pending approvals. Mission Control is not part of the memory policy kernel.
@@ -57,7 +57,7 @@ Service counts use one definition everywhere: **15 core services** start without
 
 These appear in `spec/system.manifest.yaml` and are non-negotiable:
 
-- **I1**  OpenViking publishes NO host ports. It is reachable ONLY from `memory-gateway` via `hermes-platform-mem-net` (internal:true).
+- **I1**  OpenViking publishes NO host ports. Profile agents and Mission Control can reach it ONLY through `memory-gateway`. Its internal `hermes-platform-mem-net` peers are limited to `memory-gateway` and the trusted Ollama embedding backend that OpenViking calls.
 - **I2**  Every memory access goes through `memory-gateway`. No hermes-pf-* container has direct access to OpenViking.
 - **I3**  Per-profile DATA volumes are NOT shared. `hermes-pf-mark` mounts only `hermes-platform_data-mark` at `/opt/data`. Scoped exception (D-013): the host-bind shared artifact tree at `/opt/shared` IS cross-agent readable by design — own slice rw at `/opt/shared/mine`, whole tree ro at `/opt/shared/all`. This applies to `/opt/shared` ONLY; `/opt/data` isolation is unchanged.
 - **I4**  Bearer tokens never appear in this repo. Tokens live in Infisical at `/hermes-platform/`.

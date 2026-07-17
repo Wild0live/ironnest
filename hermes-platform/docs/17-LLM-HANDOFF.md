@@ -19,7 +19,7 @@ A multi-profile Hermes runtime fronted by a policy-enforcing memory gateway in f
 
 ## The invariants again
 
-1. OpenViking publishes no host ports.
+1. OpenViking publishes no host ports. Profile agents and Mission Control reach it only through `memory-gateway`; Ollama is the sole trusted co-resident backend because OpenViking calls it for embeddings.
 2. Every memory access goes through the gateway.
 3. Per-profile volumes are not shared.
 4. Bearer tokens never appear in the repo.
@@ -245,7 +245,7 @@ If all green, you're free to make changes. If not, fix the regressions before ad
 
 ## What to NEVER do
 
-- Add a new container to `hermes-platform-mem-net` other than `openviking` and `memory-gateway`.
+- Add a new container to `hermes-platform-mem-net` other than the existing `openviking`, `memory-gateway`, and trusted Ollama embedding backend.
 - Replace `ironnest_gateway` with direct OpenViking access, or remove its startup selection without providing an equivalent gateway-backed Hermes lifecycle provider.
 - Mount more than one `hermes-platform_data-<profile>` volume into a single container.
 - Write a bearer token, API key, or Telegram token into ANY file in the repo.

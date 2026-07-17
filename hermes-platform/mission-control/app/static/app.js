@@ -9,6 +9,7 @@ const state = {
 const TERMINAL_STORE_KEY = "mc.terminalTarget";
 const CHAT_PROFILE_STORE_KEY = "mc.chatProfile";
 const CHAT_CONV_STORE_KEY = "mc.chatActiveConv";
+const CHAT_ACTIVITY_MODE_STORE_KEY = "mc.chatActivityMode";
 const DEFAULT_TERMINAL_TARGET = {
   id: "platform",
   kind: "platform",
@@ -42,7 +43,7 @@ const kanban = {
   tasks: [], loaded: false, showArchived: false, drawerId: null, activeColumn: null,
   orchPlans: {}, collapsedGroups: loadKanbanCollapsedGroups(), selected: new Set(), health: null,
 };
-const operations = { requests: [], targets: [], enabled: false, selected: null, view: "pending", search: "", requester: "", risk: "", includeArchived: false };
+const operations = { requests: [], targets: [], enabled: false, selected: null, view: "pending", search: "", requester: "", risk: "", includeArchived: false, operator: null };
 const octoAdmin = { active: null, timer: null };
 const systemSettings = { webauthn: null, loaded: false };
 const cronCatchup = { running: false };
@@ -74,6 +75,41 @@ function token() {
 function headers() {
   const adminToken = token();
   return adminToken ? { Authorization: `Bearer ${adminToken}`, "Content-Type": "application/json" } : { "Content-Type": "application/json" };
+}
+
+// A Mission Control tab can stay open for days while the image is rebuilt
+// underneath it. Poll the static validators so the operator is told when the
+// already-loaded JavaScript/CSS is stale. Reload automatically only while the
+// page is hidden and there is no in-progress turn or unsent chat draft.
+let uiAssetSignature = null;
+let uiUpdatePending = false;
+
+async function currentUiAssetSignature() {
+  const response = await fetch("/api/ui-version", { cache: "no-store" });
+  if (!response.ok) throw new Error("UI asset check failed");
+  const data = await response.json();
+  return String(data.version || "");
+}
+
+function canReloadForUiUpdate() {
+  const draft = $("#messageInput")?.value?.trim();
+  const dialogOpen = !!document.querySelector("dialog[open]");
+  return document.visibilityState === "hidden" && !draft && !dialogOpen &&
+    !Object.values(chat.busyProfiles || {}).some(Boolean);
+}
+
+async function checkForUiUpdate() {
+  try {
+    const signature = await currentUiAssetSignature();
+    if (uiAssetSignature === null) {
+      uiAssetSignature = signature;
+      return;
+    }
+    if (signature === uiAssetSignature) return;
+    uiUpdatePending = true;
+    if (canReloadForUiUpdate()) window.location.reload();
+    else setSync("Mission Control update available — refresh this page to load it");
+  } catch (err) { /* a transient asset check must never disrupt operations */ }
 }
 
 function b64uToBytes(value) {
@@ -244,10 +280,12 @@ function approvalStatusClass(status) {
 function approvalStatusLabel(item, fallbackStatus = "") {
   const status = item?.status || fallbackStatus || "unknown";
   const approver = item?.approved_by ? displayName(item.approved_by) : "";
+  const rejecter = item?.rejected_by_name || (item?.rejected_by ? displayName(item.rejected_by) : "");
   if (status === "pending_approval" || status === "requested") return "Waiting for FIDO approval";
   if (status === "executing") return approver ? `Approved by ${approver} · executing` : "Approved · executing";
   if (status === "executed") return approver ? `Completed · approved by ${approver}` : "Completed";
   if (status === "failed") return approver ? `Failed · approved by ${approver}` : "Failed";
+  if (status === "rejected") return rejecter ? `Rejected by ${rejecter}` : "Rejected";
   if (status === "expired") return "Expired";
   return status.replace(/_/g, " ");
 }
@@ -258,7 +296,7 @@ function chatApprovalControl(approvalId, fallbackStatus = "") {
   const status = item?.status || fallbackStatus || "unknown";
   if (status === "pending_approval" || status === "requested") {
     return {
-      html: `<button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(approvalId)}">Approve here with FIDO</button>`,
+      html: `<span class="chat-approval-actions"><button type="button" class="chat-reject-btn" data-chat-reject="${escapeHtml(approvalId)}">Reject</button><button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(approvalId)}">Approve here with FIDO</button></span>`,
       className: "",
     };
   }
@@ -286,7 +324,7 @@ function renderOperations() {
     const names = [...new Set(operations.requests.map((item) => item.requested_by).filter(Boolean))].sort();
     requesterFilter.innerHTML = `<option value="">All agents</option>${names.map((name) => `<option value="${escapeHtml(name)}"${operations.requester === name ? " selected" : ""}>${escapeHtml(displayName(name))}</option>`).join("")}`;
   }
-  const terminal = new Set(["executed", "failed", "expired", "unknown"]);
+  const terminal = new Set(["executed", "failed", "rejected", "expired", "unknown"]);
   let shown = operations.requests.filter((item) => {
     const status = item.status || "";
     if (operations.view === "pending" && status !== "pending_approval") return false;
@@ -300,7 +338,10 @@ function renderOperations() {
   });
   const card = (item) => {
     const pendingAction = item.status === "pending_approval"
-      ? `<button type="button" class="approval-execute" data-operation-approve="${escapeHtml(item.id)}">Approve &amp; execute</button>` : "";
+      ? `<span class="approval-action-buttons"><button type="button" class="approval-reject" data-operation-reject="${escapeHtml(item.id)}">Reject</button><button type="button" class="approval-execute" data-operation-approve="${escapeHtml(item.id)}">Approve &amp; execute</button></span>` : "";
+    const handledBy = item.rejected_by
+      ? `<small>Rejected by ${escapeHtml(item.rejected_by_name || item.rejected_by)}</small>`
+      : item.approved_by ? `<small>Approved by ${escapeHtml(item.approved_by_name || item.approved_by)}</small>` : "";
     const details = item.docker_request
       ? `<p class="approval-detail"><code>${escapeHtml(item.docker_request.method)} ${escapeHtml(item.docker_request.path)}</code></p>` : "";
     const remediation = item.remediation_id
@@ -314,7 +355,7 @@ function renderOperations() {
     return `<article class="approval-card">
       <div class="approval-card-main"><div class="approval-card-title"><span class="approval-requester-avatar">${avatarHtml(item.requested_by || "__you", 34)}</span><div><strong>${escapeHtml(displayName(item.requested_by || "Operator"))} requests ${escapeHtml(operationLabel(item.action))}</strong><p><code>${escapeHtml(item.target)}</code> · ${escapeHtml(operationTime(item.created_at))}</p></div></div>
       <p class="approval-reason">${escapeHtml(item.reason)}</p>${details}${script}${filesystem}</div>
-      <div class="approval-card-actions"><span class="approval-status ${escapeHtml(item.status)}">${escapeHtml(item.status.replaceAll("_", " "))}</span>${pendingAction}${item.approved_by ? `<small>Approved by ${escapeHtml(item.approved_by)}</small>` : ""}</div>
+      <div class="approval-card-actions"><span class="approval-status ${escapeHtml(item.status)}">${escapeHtml(item.status.replaceAll("_", " "))}</span>${pendingAction}${handledBy}</div>
     </article>`;
   };
   // Collapse repeated historical requests for the same agent/action/target;
@@ -326,6 +367,7 @@ function renderOperations() {
   } else list.innerHTML = shown.map(card).join("");
   if (!list.innerHTML) list.innerHTML = `<p class="empty">${operations.view === "pending" ? "No approvals are waiting." : "No approvals match this view."}</p>`;
   list.querySelectorAll("[data-operation-approve]").forEach((button) => button.addEventListener("click", () => openOperationApproval(button.dataset.operationApprove)));
+  list.querySelectorAll("[data-operation-reject]").forEach((button) => button.addEventListener("click", () => rejectOperationNow(button.dataset.operationReject, "approvals")));
 }
 
 async function loadOperations() {
@@ -334,9 +376,15 @@ async function loadOperations() {
     operations.requests = data.requests || [];
     operations.targets = data.targets || [];
     operations.enabled = !!data.enabled;
+    operations.operator = data.operator || operations.operator || null;
     operations.webauthn = data.approval_webauthn || operations.webauthn || null;
     if (!systemSettings.webauthn && data.approval_webauthn) {
       systemSettings.webauthn = data.approval_webauthn;
+    }
+    const operatorMode = savedActivityMode();
+    if (chat.activityMode !== operatorMode) {
+      chat.activityMode = operatorMode;
+      syncActivityModeControl();
     }
   } catch (err) {
     operations.requests = [];
@@ -346,7 +394,15 @@ async function loadOperations() {
   renderOperations();
   renderAgentPicker();
   if ($("#view-settings")?.classList.contains("active")) renderSystemSettings();
-  if ($("#view-agent")?.classList.contains("active")) renderChat({ preserveScroll: true });
+  if ($("#view-agent")?.classList.contains("active")) {
+    const profile = currentProfile();
+    const conv = currentConv();
+    if (profile && conv && !chat.busyProfiles[profile]) {
+      await loadConvHistory(conv, true, true);
+    } else {
+      renderChat({ preserveScroll: true });
+    }
+  }
 }
 
 function renderSystemSettings() {
@@ -643,6 +699,37 @@ async function approveOperationWithFidoNow(id, source = "chat") {
 
 async function openChatApproval(id) {
   await approveOperationWithFidoNow(id, "chat");
+}
+
+async function rejectOperationNow(id, source = "chat") {
+  let item = operations.requests.find((request) => request.id === id);
+  if (!item) {
+    await loadOperations();
+    item = operations.requests.find((request) => request.id === id);
+  }
+  if (!item) { setSync("That approval is no longer available"); return; }
+  if (item.status !== "pending_approval") { setSync("That approval is no longer pending"); return; }
+  const summary = `${operationLabel(item.action)} ${item.target}`;
+  if (!window.confirm(`Reject ${summary}? This operation will not execute.`)) return;
+  try {
+    const rejecter = approvalOperatorName();
+    await api(`/api/operations/${encodeURIComponent(item.id)}/reject`, {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ note: source === "chat" ? "Rejected directly from Mission Control chat thread." : "Rejected from Mission Control Approvals." }),
+    });
+    item.status = "rejected";
+    item.rejected_by = rejecter;
+    item.rejected_by_name = rejecter;
+    item.rejected_at = new Date().toISOString();
+    renderOperations();
+    if ($("#view-agent")?.classList.contains("active")) renderChat({ preserveScroll: true });
+    setSync("Operation rejected — it will not execute");
+    await loadOperations();
+  } catch (err) {
+    setSync(`Rejection failed: ${err.message || err}`);
+    await loadOperations();
+  }
 }
 
 const approvalTabs = $("#approvalTabs");
@@ -3305,7 +3392,10 @@ if (_wikiReload) _wikiReload.addEventListener("click", () => {
   });
 });
 
-$("#refreshBtn").addEventListener("click", () => { loadState(); loadKanban(); loadOperations(); });
+$("#refreshBtn").addEventListener("click", () => {
+  if (uiUpdatePending) { window.location.reload(); return; }
+  loadState(); loadKanban(); loadOperations();
+});
 $("#offlineRetryBtn").addEventListener("click", () => { loadState(); loadKanban(); loadOperations(); });
 $("#addScheduleBtn").addEventListener("click", () => $("#scheduleDialog").showModal());
 $("#cronCatchupBtn").addEventListener("click", catchUpMissedCron);
@@ -3494,6 +3584,7 @@ const chat = {
   agentInfo: {},     // profile -> {model, soul_summary} from the bridge
   health: {},        // profile -> bool (bridge reachable); undefined = unknown
   mcpHealth: {},     // profile -> {summary, servers[]} from live MCP health polling
+  activityMode: "standard", // compact | standard | detailed, scoped to operator
 };
 
 function agentColor(name) {
@@ -3582,6 +3673,27 @@ const CHAT_HINT = `<p class="chat-hint">Pick an agent and start chatting. Turns 
 function currentProfile() { return chat.profile || null; }
 function currentConv() { return chat.activeConv[currentProfile()] || null; }
 function convKey(profile, convId) { return `${profile || ""}::${convId || ""}`; }
+function activityOperatorKey() {
+  return String(operations.operator?.subject || "browser").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80) || "browser";
+}
+function activityModeStoreKey() { return `${CHAT_ACTIVITY_MODE_STORE_KEY}.${activityOperatorKey()}`; }
+function savedActivityMode() {
+  try {
+    const value = localStorage.getItem(activityModeStoreKey()) || localStorage.getItem(CHAT_ACTIVITY_MODE_STORE_KEY) || "standard";
+    return ["compact", "standard", "detailed"].includes(value) ? value : "standard";
+  } catch (e) { return "standard"; }
+}
+function saveActivityMode(mode) {
+  if (!["compact", "standard", "detailed"].includes(mode)) return;
+  try {
+    localStorage.setItem(activityModeStoreKey(), mode);
+    localStorage.setItem(CHAT_ACTIVITY_MODE_STORE_KEY, mode); // migration/default before identity loads
+  } catch (e) { /* storage unavailable */ }
+}
+function syncActivityModeControl() {
+  const control = $("#activityMode");
+  if (control && control.value !== chat.activityMode) control.value = chat.activityMode;
+}
 function savedChatProfile() {
   try { return localStorage.getItem(CHAT_PROFILE_STORE_KEY) || ""; } catch (e) { return ""; }
 }
@@ -3941,11 +4053,11 @@ async function loadConversations(profile, force) {
   } catch (err) { /* ignore — chat still usable */ }
 }
 
-async function loadConvHistory(convId) {
+async function loadConvHistory(convId, force = false, preserveScroll = false) {
   if (!convId) { renderChat(); return; }
   const profile = currentProfile();
   const key = convKey(profile, convId);
-  if (chat.loadedHist[key]) { renderChat(); return; }
+  if (chat.loadedHist[key] && !force) { renderChat(); return; }
   chat.loadedHist[key] = true;
   try {
     const data = await api(`/api/agent/${encodeURIComponent(profile)}/conversations/${encodeURIComponent(convId)}/history`);
@@ -3962,7 +4074,7 @@ async function loadConvHistory(convId) {
   } catch (err) {
     chat.transcripts[key] = chat.transcripts[key] || [];
   }
-  if (convId === currentConv()) renderChat();
+  if (convId === currentConv()) renderChat({ preserveScroll });
 }
 
 function convTitleOf(profile, convId) {
@@ -4207,6 +4319,89 @@ const UPLOAD_RE = /\.mission-control-uploads\/([A-Za-z0-9._-]+)/;
 // bare upload path, optionally prefixed with sandbox:/media:/file: and absolute
 const UPLOAD_PATH_RE = /(?:sandbox:|media:|file:)?\/?opt\/data\/\.mission-control-uploads\/([A-Za-z0-9._-]+)/gi;
 
+function applyActivityEvent(activity, event) {
+  if (!activity || !event) return;
+  activity.updated_at = new Date().toISOString();
+  if (event.event === "status") {
+    activity.phase = event.label || "Working";
+    return;
+  }
+  if (event.event === "plan") {
+    activity.plan = Array.isArray(event.entries) ? event.entries.slice(0, 12) : [];
+    activity.phase = event.label || "Plan updated";
+    return;
+  }
+  if (event.event !== "tool" || !event.id) return;
+  const milestones = activity.milestones = activity.milestones || [];
+  const existing = milestones.find((item) => item.id === event.id);
+  const next = {
+    id: event.id,
+    label: event.label || "Working",
+    category: event.category || "other",
+    status: event.status || "in_progress",
+  };
+  if (event.detail) next.detail = event.detail;
+  if (existing) Object.assign(existing, next);
+  else milestones.push(next);
+  if (milestones.length > 16) milestones.splice(0, milestones.length - 16);
+  activity.tool_count = milestones.length;
+  activity.phase = next.status === "failed" ? `${next.label} failed` : next.label;
+}
+
+function activityElapsed(activity) {
+  const explicit = Number(activity?.elapsed_s);
+  if (Number.isFinite(explicit) && explicit >= 0) return explicit;
+  const start = Date.parse(activity?.started_at || "");
+  const end = activity?.status === "running" ? Date.now() : Date.parse(activity?.completed_at || "");
+  if (Number.isFinite(start) && Number.isFinite(end) && end >= start) return Math.round((end - start) / 100) / 10;
+  return null;
+}
+
+function activitySummaryLabel(activity) {
+  const status = activity?.status || "completed";
+  const elapsed = activityElapsed(activity);
+  const time = elapsed === null ? "" : ` in ${elapsed.toFixed(elapsed < 10 ? 1 : 0)}s`;
+  const count = Number(activity?.tool_count ?? activity?.milestones?.length ?? 0);
+  const tools = count ? ` · ${count} tool${count === 1 ? "" : "s"}` : "";
+  if (status === "running") return `${activity.phase || "Working"}${tools}`;
+  if (status === "failed") return `Failed${time}${tools}`;
+  if (status === "interrupted") return `Interrupted${time}${tools}`;
+  return `Completed${time}${tools}`;
+}
+
+function activityStatusIcon(status) {
+  if (status === "completed") return "✓";
+  if (status === "failed") return "!";
+  if (status === "pending") return "○";
+  return "●";
+}
+
+function activityHtml(activity) {
+  if (!activity) return "";
+  const mode = chat.activityMode || "standard";
+  const summary = activitySummaryLabel(activity);
+  const status = activity.status || "completed";
+  if (mode === "compact") {
+    return `<div class="agent-activity compact ${escapeHtml(status)}" role="status" aria-live="polite"><span>${activityStatusIcon(status)}</span>${escapeHtml(summary)}</div>`;
+  }
+  const milestones = Array.isArray(activity.milestones) ? activity.milestones : [];
+  const plan = Array.isArray(activity.plan) ? activity.plan : [];
+  const planHtml = plan.length ? `<ol class="activity-plan">${plan.map((item) =>
+    `<li class="${escapeHtml(item.status || "pending")}"><span>${activityStatusIcon(item.status)}</span>${escapeHtml(item.content || "Plan step")}</li>`).join("")}</ol>` : "";
+  const toolsHtml = milestones.length ? `<div class="activity-tools">${milestones.map((item) => {
+    const line = `<span class="activity-state">${activityStatusIcon(item.status)}</span><span>${escapeHtml(item.label || "Working")}</span>`;
+    if (!item.detail) return `<div class="activity-tool ${escapeHtml(item.status || "in_progress")}">${line}</div>`;
+    if (mode === "detailed") return `<div class="activity-tool ${escapeHtml(item.status || "in_progress")}">${line}<code>${escapeHtml(item.detail)}</code></div>`;
+    return `<details class="activity-tool ${escapeHtml(item.status || "in_progress")}"><summary>${line}</summary><code>${escapeHtml(item.detail)}</code></details>`;
+  }).join("")}</div>` : "";
+  const empty = (!planHtml && !toolsHtml) ? `<p class="activity-empty">${escapeHtml(activity.phase || "No tool activity recorded.")}</p>` : "";
+  const open = status === "running" || mode === "detailed" ? " open" : "";
+  return `<details class="agent-activity ${escapeHtml(status)}"${open}>
+    <summary><span class="activity-pulse" aria-hidden="true"></span><strong>Agent activity</strong><span>${escapeHtml(summary)}</span></summary>
+    <div class="activity-body">${planHtml}${toolsHtml}${empty}</div>
+  </details>`;
+}
+
 function dlLink(profile, name, label) {
   const href = `/api/agent/${encodeURIComponent(profile)}/file/${encodeURIComponent(name)}`;
   return `<a class="dl-link" href="${href}" download="${escapeHtml(name)}">${escapeHtml(label || name)} ↓</a>`;
@@ -4227,7 +4422,10 @@ function renderChat(options = {}) {
   }
   const agentMeta = `${avatarHtml(profile, 22)}<span>${escapeHtml(displayName(profile))}</span>`;
   const messagesHtml = msgs.map((m) => {
-    if (m.role === "thinking" || (m.role === "agent" && m.streaming && !m.text)) {
+    // Activity-aware turns must render immediately, before the first answer
+    // token. Keep the legacy dots only for older callers that have no
+    // structured activity state attached.
+    if (m.role === "thinking" || (m.role === "agent" && m.streaming && !m.text && !m.activity)) {
       return `<div class="msg agent"><span class="meta">${agentMeta}</span><span class="thinking-dots"><span></span><span></span><span></span></span></div>`;
     }
     const cls = m.role === "user" ? "user" : m.role === "error" ? "error" : m.role === "system" ? "system" : "agent";
@@ -4235,6 +4433,7 @@ function renderChat(options = {}) {
     const youMeta = `<button type="button" class="you-ava-btn" title="Click to change your icon">${avatarHtml("__you", 22)}</button><button type="button" class="you-name-btn" title="Click to rename">${escapeHtml(youName)}</button>`;
     const metaInner = m.role === "agent" ? agentMeta
       : m.role === "user" ? youMeta
+      : m.role === "system" && m.approval_id ? `${agentMeta}<span>operation update</span>`
       : `<span>${escapeHtml(m.role === "system" ? "command" : "error")}</span>`;
     const atts = (m.attachments || []).map((a) =>
       (a.mime || "").startsWith("image/") && a.content_b64
@@ -4252,8 +4451,8 @@ function renderChat(options = {}) {
           .map((id) => operations.requests.find((item) => item.id === id && item.status === "pending_approval"))
           .filter(Boolean) : [];
     const referencedActions = referenced.length ? `<div class="chat-inline-approvals">${referenced.map((item) =>
-      `<button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(item.id)}">Approve ${escapeHtml(operationLabel(item.action))} with FIDO</button>`).join("")}</div>` : "";
-    return `<div class="msg ${cls}${approvalControl.className}"><span class="meta">${metaInner}${timeHtml}</span><div class="md-body msg-md">${renderMarkdown(m.text, profile)}</div>${approvalControl.html}${referencedActions}${cursor}${atts}</div>`;
+      `<span class="chat-approval-actions"><button type="button" class="chat-reject-btn" data-chat-reject="${escapeHtml(item.id)}">Reject</button><button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(item.id)}">Approve ${escapeHtml(operationLabel(item.action))} with FIDO</button></span>`).join("")}</div>` : "";
+    return `<div class="msg ${cls}${approvalControl.className}"><span class="meta">${metaInner}${timeHtml}</span>${activityHtml(m.activity)}<div class="md-body msg-md">${renderMarkdown(m.text, profile)}</div>${approvalControl.html}${referencedActions}${cursor}${atts}</div>`;
   }).join("");
   const pendingApprovals = operations.requests.filter((item) =>
     item.status === "pending_approval" && item.requested_by === profile && item.conversation_id === convId);
@@ -4264,7 +4463,7 @@ function renderChat(options = {}) {
   const approvalPanel = pendingApprovals.length ? `<section class="chat-approval-panel">
     <div class="chat-approval-panel-title">🛡️ Pending approvals in this thread <span>${pendingApprovals.length}</span></div>
     <p class="chat-approval-hint">${escapeHtml(approvalKeyHint)}</p>
-    ${pendingApprovals.map((item) => `<div class="chat-approval-row"><div><strong>${escapeHtml(operationLabel(item.action))}</strong><p>${escapeHtml(item.target)} · ${escapeHtml(item.reason)}</p></div><button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(item.id)}">Approve with FIDO</button></div>`).join("")}
+    ${pendingApprovals.map((item) => `<div class="chat-approval-row"><div><strong>${escapeHtml(operationLabel(item.action))}</strong><p>${escapeHtml(item.target)} · ${escapeHtml(item.reason)}</p></div><span class="chat-approval-actions"><button type="button" class="chat-reject-btn" data-chat-reject="${escapeHtml(item.id)}">Reject</button><button type="button" class="chat-approval-btn" data-chat-approval="${escapeHtml(item.id)}">Approve with FIDO</button></span></div>`).join("")}
   </section>` : "";
   log.innerHTML = messagesHtml + approvalPanel;
   if (preserveScroll) log.scrollTop = oldScrollTop;
@@ -4324,6 +4523,10 @@ async function fallbackChat(profile, convId, text, attachments, agentMsg) {
     agentMsg.streaming = false;
     if (resp.ok && data.ok) {
       agentMsg.text = data.reply || "(empty reply)";
+      agentMsg.activity.status = "completed";
+      agentMsg.activity.phase = "Completed";
+      agentMsg.activity.completed_at = new Date().toISOString();
+      if (Number.isFinite(Number(data.elapsed_s))) agentMsg.activity.elapsed_s = Number(data.elapsed_s);
       if (data.approval_id) {
         agentMsg.approval_id = data.approval_id;
         agentMsg.approval_status = "requested";
@@ -4331,11 +4534,15 @@ async function fallbackChat(profile, convId, text, attachments, agentMsg) {
     } else {
       agentMsg.role = "error";
       agentMsg.text = data.error || `request failed (HTTP ${resp.status})`;
+      agentMsg.activity.status = "failed";
+      agentMsg.activity.completed_at = new Date().toISOString();
     }
   } catch (err) {
     agentMsg.streaming = false;
     agentMsg.role = "error";
     agentMsg.text = String(err);
+    agentMsg.activity.status = "failed";
+    agentMsg.activity.completed_at = new Date().toISOString();
   }
   if (convId === currentConv()) renderChat();
   return "done";
@@ -4360,6 +4567,7 @@ async function streamTurn(profile, convId, text, attachments, agentMsg, schedule
   let buf = "";
   let streamError = null;
   let sawData = false;
+  let sawDone = false;
   for (;;) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -4374,9 +4582,15 @@ async function streamTurn(profile, convId, text, attachments, agentMsg, schedule
         let evt;
         try { evt = JSON.parse(t.slice(5).trim()); } catch { continue; }
         sawData = true;
-        if (evt.type === "chunk") { agentMsg.text += evt.text; scheduleRender(); }
+        if (evt.type === "activity") { applyActivityEvent(agentMsg.activity, evt); scheduleRender(); }
+        else if (evt.type === "chunk") { agentMsg.text += evt.text; scheduleRender(); }
         else if (evt.type === "done") {
+          sawDone = true;
           agentMsg.streaming = false;
+          agentMsg.activity.status = "completed";
+          agentMsg.activity.phase = "Completed";
+          agentMsg.activity.completed_at = new Date().toISOString();
+          if (Number.isFinite(Number(evt.elapsed_s))) agentMsg.activity.elapsed_s = Number(evt.elapsed_s);
           // Bridge sends a rewritten reply when it turned a MEDIA: directive into
           // a download link — swap it in so the message renders the real link.
           if (evt.reply) agentMsg.text = evt.reply;
@@ -4393,10 +4607,16 @@ async function streamTurn(profile, convId, text, attachments, agentMsg, schedule
   if (!sawData) return await fallbackChat(profile, convId, text, attachments, agentMsg);
   if (streamError) {
     if (/busy/i.test(streamError) && !agentMsg.text) return "busy";
+    agentMsg.activity.status = "failed";
+    agentMsg.activity.completed_at = new Date().toISOString();
     if (!agentMsg.text) { agentMsg.role = "error"; agentMsg.text = streamError; }
     else agentMsg.text += `\n\n[stream error: ${streamError}]`;
     if (convId === currentConv()) renderChat();
     return "done";
+  }
+  if (!sawDone && agentMsg.activity.status === "running") {
+    agentMsg.activity.status = "interrupted";
+    agentMsg.activity.completed_at = new Date().toISOString();
   }
   if (!agentMsg.text) agentMsg.text = "(empty reply)";
   if (convId === currentConv()) renderChat();
@@ -4448,7 +4668,10 @@ async function executeTurn(profile, convId, text, attachments) {
   chat.busyProfiles[profile] = true;
   updateSendButton();
   updateBusyIndicators();
-  const agentMsg = { role: "agent", text: "", streaming: true, ts: new Date().toISOString() };
+  const startedAt = new Date().toISOString();
+  const agentMsg = { role: "agent", text: "", streaming: true, ts: startedAt,
+    activity: { version: 1, status: "running", started_at: startedAt,
+      phase: "Connecting to agent", tool_count: 0, milestones: [], plan: [] } };
   pushMsg(convId, agentMsg);
 
   let renderScheduled = false;
@@ -4472,6 +4695,8 @@ async function executeTurn(profile, convId, text, attachments) {
       // agent is occupied by an earlier turn — keep the thinking state and retry
       agentMsg.streaming = true;
       agentMsg.text = "";
+      agentMsg.activity.status = "running";
+      agentMsg.activity.phase = "Waiting for the previous turn";
       if (convId === currentConv()) renderChat();
       await new Promise((r) => setTimeout(r, 3000));
     }
@@ -4608,6 +4833,15 @@ async function maybeAutoTitle(profile, convId) {
 }
 
 $("#chatForm").addEventListener("submit", (e) => { e.preventDefault(); sendChat(); });
+$("#activityMode").addEventListener("change", (e) => {
+  const mode = e.currentTarget.value;
+  if (!["compact", "standard", "detailed"].includes(mode)) return;
+  chat.activityMode = mode;
+  saveActivityMode(mode);
+  renderChat({ preserveScroll: true });
+});
+chat.activityMode = savedActivityMode();
+syncActivityModeControl();
 $("#convSearch").addEventListener("input", onSearchInput);
 $("#newConvBtn").addEventListener("click", newConv);
 $("#convRenameBtn").addEventListener("click", () => renameConv());
@@ -4671,6 +4905,7 @@ if (_chatLogEl) {
   _chatLogEl.addEventListener("click", async (e) => {
     const youName = (chat.agentMeta["__you"] || {}).label || "you";
     const approval = e.target.closest("[data-chat-approval]");
+    const rejection = e.target.closest("[data-chat-reject]");
     if (approval) {
       if (approval.dataset.submitting === "1") return;
       approval.dataset.submitting = "1";
@@ -4680,6 +4915,17 @@ if (_chatLogEl) {
       } finally {
         approval.dataset.submitting = "0";
         approval.disabled = false;
+      }
+    }
+    else if (rejection) {
+      if (rejection.dataset.submitting === "1") return;
+      rejection.dataset.submitting = "1";
+      rejection.disabled = true;
+      try {
+        await rejectOperationNow(rejection.dataset.chatReject, "chat");
+      } finally {
+        rejection.dataset.submitting = "0";
+        rejection.disabled = false;
       }
     }
     else if (e.target.closest(".you-ava-btn")) openAvatarEditor("__you", youName);
@@ -4965,6 +5211,7 @@ loadCron();
 loadKanban();
 loadOperations();
 loadOctoAdminSession();
+checkForUiUpdate();
 setInterval(loadState, 15000);
 setInterval(() => updateFreshnessStatus(), 15000);
 setInterval(loadAgentsHealth, 15000);
@@ -4972,6 +5219,7 @@ setInterval(loadUsage, 30000);
 setInterval(() => { if ($("#view-tasks").classList.contains("active")) loadKanban(); }, 15000);
 setInterval(() => { if ($("#view-calendar").classList.contains("active")) loadCron(); }, 30000);
 setInterval(loadOperations, 15000);
+setInterval(checkForUiUpdate, 30000);
 
 // Return to the view the operator was last on (Overview is the HTML default).
 try {

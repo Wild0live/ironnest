@@ -4,6 +4,120 @@ Architectural choices made during the design of hermes-platform v0.1.0. Each ent
 
 ---
 
+## D-025 — Mission Control exposes structured activity, not raw chain-of-thought
+
+**Date:** 2026-07-17
+**Status:** accepted
+
+**Decision:** Translate the existing Hermes ACP `plan`, `tool_call`, and
+`tool_call_update` notifications into a narrow Agent Activity event schema in
+each profile bridge. Raw `agent_thought_chunk` content, ACP `rawInput`,
+`rawOutput`, commands, queries, prompts, memory payloads, and unrestricted tool
+content are discarded before the event leaves the profile container. Mission
+Control applies a second independent allowlist before relaying activity to the
+browser.
+
+During a turn the browser shows an expandable activity timeline alongside the
+existing final-answer token stream. On completion Mission Control stores only a
+bounded sanitized summary: final state, elapsed time, tool categories/counts,
+allowlisted workspace-relative filenames or service/task identifiers, and the
+latest bounded plan. High-frequency status updates and raw ACP messages are not
+stored. Display is globally available for all profiles and defaults to
+Standard; each authenticated operator can choose Compact, Standard, or
+Detailed presentation without changing the server-side redaction boundary.
+
+**Rationale:** Operators need evidence that long tool-capable turns are making
+progress, but raw model reasoning is neither a reliable causal explanation nor
+a safe operational record. Structured runtime events are attributable and
+cross-provider, reuse the deployed SSE path, and do not require globally
+enabling `display.show_reasoning`. Double allowlisting limits the blast radius
+of a compromised or malformed profile bridge.
+
+**Impacts:** `agent-bridge/agent-chat-bridge.py`,
+`mission-control/app/main.py`, `mission-control/app/static/index.html`,
+`mission-control/app/static/app.js`, `mission-control/app/static/styles.css`,
+and focused bridge/Mission Control activity tests.
+
+---
+
+## D-024 — Missed cron recovery is bounded by MC's durable offline window
+
+**Date:** 2026-07-17
+**Status:** accepted
+
+**Decision:** Mission Control persists a heartbeat in its private state volume. On every later startup it treats the interval from the last heartbeat to the new startup time as an offline recovery window. For every configured profile, MC asks the existing token-gated bridge to select at most the newest due occurrence for each enabled schedule inside that window and run it once through Hermes' normal cron path. A first deployment initializes the heartbeat without replaying historical stale jobs.
+
+**Attempt semantics:** `last_run_at` counts whether the prior run succeeded or failed. A persisted `fire_claim.at` also counts as an attempt when the process crashed after claiming but before recording a terminal result. Automatic recovery runs only when neither record covers the newest due occurrence. Older occurrences of the same schedule inside the window are superseded.
+
+**Failure isolation:** The pending window and per-profile completion set are durable. Unreachable profile bridges remain pending and are retried; profiles that already completed the window are not called again. Heartbeats continue independently while catch-up work runs, so a long scheduled job does not widen a later offline interval.
+
+**Security boundary:** Automatic recovery calls the same per-profile bridge endpoint and `claim_job_for_fire` / `run_one_job` path as manual catch-up. It adds no Docker access, host mount, privileged credential, approval bypass, allowlist exception, or cross-profile execution authority. Mission Control remains outside the memory policy kernel under D-014.
+
+**Rejected alternatives:** replaying every stale occurrence (duplicate/noise risk), treating failed runs as unattempted (unbounded retry risk), using current time without an offline boundary (would catch runtime scheduler failures outside the request), and placing host shutdown authority or Docker control in Mission Control.
+
+**Impacts:** `mission-control/app/main.py`, `agent-bridge/agent-chat-bridge.py`, `docker-compose.yml`, and focused cron-recovery tests.
+
+---
+
+## D-023 — Approval feedback is a durable control-plane event with a non-authoritative agent acknowledgement
+
+**Date:** 2026-07-14
+**Status:** accepted
+
+**Decision:** Bind an agent-created operation to the exact Mission Control
+conversation when the agent cites its `op-...` ID, persist idempotent lifecycle
+events in that conversation, and refresh the active transcript while operation
+status is polled. After FIDO verification and after a successful or failed
+terminal result, Mission Control also sends a trusted, no-tools event to the
+same profile bridge so Hermes can acknowledge the outcome naturally. The
+deterministic lifecycle event remains authoritative and visible even if the
+agent is busy, offline, or fails to answer.
+
+Unbound proposals receive a short correlation grace period and then move to a
+dedicated `Approvals` conversation instead of being attached to an arbitrary
+recent chat. Agent acknowledgements are idempotent by operation/event ID and do
+not block approval, runner dispatch, or terminal-state persistence.
+
+**Rationale:** FIDO verification and runner state are security facts and must
+not depend on an LLM response. Operators still benefit from the requesting
+agent understanding and explaining those facts in its own voice. Separating the
+durable control-plane record from the best-effort natural reply gives both
+reliability and conversational continuity without granting the agent new
+authority.
+
+**Impacts:** `mission-control/app/main.py`,
+`mission-control/app/static/app.js`, `mission-control/tests/test_admin_sessions.py`,
+and `docs/19-APPROVAL-GATED-OPERATIONS.md`.
+
+---
+
+## D-022 — Pending approvals support an authenticated terminal rejection
+
+**Date:** 2026-07-13
+**Status:** accepted
+
+**Decision:** Show a destructive-styled **Reject** action beside FIDO approval
+in Mission Control approval cards and agent threads. Rejection requires a
+browser session revalidated directly with Authelia, records the operator and
+timestamp, mirrors the result into the requesting thread, and transitions only
+`pending_approval` requests to the terminal `rejected` state. It does not
+contact `operations-runner` or the Windows host queue and does not require a
+FIDO assertion.
+
+**Rationale:** Approval grants a privileged capability and therefore retains
+operation-bound FIDO step-up. Rejection grants no capability; requiring a key
+touch to deny work would add friction without strengthening the execution
+boundary. A persisted terminal state is safer and clearer than silently hiding
+or deleting the request, because the operator and requesting agent retain an
+auditable outcome and a rejected request cannot later execute.
+
+**Impacts:** `mission-control/app/main.py`,
+`mission-control/app/static/app.js`, `mission-control/app/static/styles.css`,
+`mission-control/tests/test_admin_sessions.py`, and
+`docs/19-APPROVAL-GATED-OPERATIONS.md`.
+
+---
+
 ## D-021 — Big Bert receives a read-mostly LLM Wiki boundary, not general host access
 
 **Date:** 2026-07-13
@@ -225,7 +339,13 @@ IronNest's localhost-only posture and OpenViking/memory-gateway invariants.
 **Date:** 2026-05-23
 **Status:** accepted
 
-**Decision:** `hermes-platform-mem-net` (`internal:true`, holds only openviking + memory-gateway) and `hermes-platform-app-net` (`internal:true`, holds memory-gateway + all hermes-pf-*). Memory-gateway is the only dual-homed service.
+**Decision:** `hermes-platform-mem-net` (`internal:true`) and `hermes-platform-app-net` (`internal:true`, holds memory-gateway + all hermes-pf-*). Memory-gateway is the only service dual-homed across those two networks.
+
+**Subsequent deployment state:** D-010 added containerized Ollama to
+`hermes-platform-mem-net` as OpenViking's trusted embedding backend. The
+current mem-net members are exactly OpenViking, memory-gateway, and Ollama.
+Ollama is not on app-net and is not an agent-facing memory client; profile
+agents and Mission Control still have no direct route to OpenViking.
 
 **Alternative:** Single internal network with everyone joined; rely on gateway policy + bearer-token auth.
 
@@ -292,6 +412,12 @@ Invariant I3 (per-profile volume isolation) was designed for the AGENT container
 
 **Why the chosen approach:** matches the legacy `hermes/hermes-ttyd` UX pattern (which is what users are already trained on), centralizes the management plane to one URL, and the kernel-level isolation that matters most (agent ↔ agent) is preserved.
 
+**Deployment note:** Fresh loopback ports `127.0.0.1:8123` and
+`127.0.0.1:8124` were chosen instead of mutating the legacy ttyd container or
+immediately reusing `7682`/`9119`; Rancher Desktop's stale forwarding state
+made the old mappings hang during transition. This preserved rollback while
+the platform sidecar was verified.
+
 **Concurrent-write caveat:** the ttyd mounts the same `hermes-platform-data-default` volume as `hermes-pf-default`. Hermes uses SQLite WAL + file locks for `state.db`, `gateway.lock` etc., so single-writer/multi-reader access works. The risk case is a user running `hermes gateway run` from the ttyd shell, which would create a competing Telegram poller (409 Conflict against `hermes-pf-default`). Mitigation: shell motd warns against it; future enhancement could chroot the ttyd shell or wrap `hermes` with a guard.
 
 ---
@@ -349,23 +475,6 @@ Invariant I3 (per-profile volume isolation) was designed for the AGENT container
 **Decision:** Memory gateway + all hermes-pf-* containers use the in-process `with-infisical` wrapper (same pattern as the legacy `hermes/` stack). OpenViking uses an infisical-agent sidecar that renders to `/secrets/.env`.
 
 **Rationale:** OpenViking's startup reads a config file (it needs to write `[embedding]` API keys to disk to start the server). The wrapper pattern is process-env-only; for OpenViking we need file-on-disk, which is the sidecar's job. This pattern split matches IronNest's existing convention (memory note `project_rancher_openclaw`).
-
----
-
-## D-011 — Platform UI gets its own ttyd/dashboard sidecar
-
-**Date:** 2026-05-23
-**Status:** accepted
-
-**Decision:** Add `hermes-platform-ttyd` as the browser terminal and Hermes dashboard sidecar for the platform. It mounts `hermes-platform_data-default` at `/opt/data` and the other profile volumes under `/opt/data/profiles/<profile>`, not the legacy shared `hermes_hermes-data` volume, and publishes fresh local ports `127.0.0.1:8123` (ttyd) and `127.0.0.1:8124` (dashboard).
-
-**Alternatives:**
-- A1: Repoint the existing legacy `hermes-ttyd` container directly to the new platform volume.
-- A2: Publish the platform UI on the old `127.0.0.1:7682` and `127.0.0.1:9119` ports immediately.
-
-**Rationale:** A1 mutates the old stack and weakens rollback. A2 was tested live, but Rancher Desktop's existing port-forward entries for those old ports kept hanging when another container tried to take them over. Fresh ports verified cleanly while preserving the old UI as a fallback during transition.
-
-**Trust implication:** This sidecar is a management plane and can see all platform profile volumes. This does not weaken the runtime profile isolation invariant because no `hermes-pf-*` agent container receives another profile's volume.
 
 ---
 

@@ -3,6 +3,9 @@
 from __future__ import annotations
 import argparse, json, os, sys, urllib.error, urllib.request
 
+ALLOWED_REMEDIATIONS = {"cis-windows-top5-v1", "software-vulnerability-remediation-v1"}
+SOFTWARE_REMEDIATION_ID = "software-vulnerability-remediation-v1"
+
 p = argparse.ArgumentParser()
 p.add_argument("title")
 p.add_argument("--script-file", required=True)
@@ -22,6 +25,19 @@ if a.remediation_payload_file:
             payload = json.load(fh)
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f"cannot read remediation payload: {exc}") from exc
+remediation = a.remediation_id.strip()
+if remediation not in ALLOWED_REMEDIATIONS:
+    allowed = ", ".join(sorted(ALLOWED_REMEDIATIONS))
+    raise SystemExit(
+        f"remediation-id is not supported; use one of: {allowed}. "
+        "For software such as VS Code, use software-vulnerability-remediation-v1 "
+        "with --remediation-payload-file."
+    )
+if remediation == SOFTWARE_REMEDIATION_ID and not isinstance(payload, dict):
+    raise SystemExit(
+        "software-vulnerability-remediation-v1 requires --remediation-payload-file "
+        "with 1-10 structured winget package actions"
+    )
 url, token = os.environ.get("MC_HOST_OPERATIONS_URL", "http://mission-control:8080").rstrip("/"), os.environ.get("MC_HOST_OPERATIONS_SUBMIT_TOKEN", "")
 if not token:
     try:
@@ -31,7 +47,7 @@ if not token:
 if not url or not token or not script.strip() or len(script) > 60_000:
     raise SystemExit("host operation is not configured or plan is invalid")
 body_obj = {"action":"host_powershell", "target":a.title, "reason":a.reason,
-            "script":script, "remediation_id":a.remediation_id.strip(),
+            "script":script, "remediation_id":remediation,
             "risk":a.risk}
 if payload is not None:
     body_obj["remediation_payload"] = payload

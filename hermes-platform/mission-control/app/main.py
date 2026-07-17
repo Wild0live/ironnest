@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import io
 import json
+import logging
 import os
 import re
 import shlex
@@ -32,6 +33,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -53,6 +55,20 @@ POLICIES_DIR = Path(os.environ.get("MISSION_CONTROL_POLICIES_DIR",
 AUDIT_LOG = Path(os.environ.get("MISSION_CONTROL_AUDIT_LOG", "/var/log/gateway/audit.log"))
 STATE_FILE = Path(os.environ.get("MISSION_CONTROL_STATE_FILE",
                                  "/var/lib/mission-control/state.json"))
+CRON_RECOVERY_STATE_FILE = Path(os.environ.get(
+    "MISSION_CONTROL_CRON_RECOVERY_STATE_FILE",
+    str(STATE_FILE.parent / "cron-recovery.json")))
+CRON_AUTO_CATCHUP_ENABLED = os.environ.get(
+    "MISSION_CONTROL_CRON_AUTO_CATCHUP", "true").strip().lower() not in {
+        "0", "false", "no", "off"}
+CRON_RECOVERY_HEARTBEAT_SECONDS = max(5, int(os.environ.get(
+    "MISSION_CONTROL_CRON_RECOVERY_HEARTBEAT_SECONDS", "30")))
+CRON_RECOVERY_RETRY_SECONDS = max(5, int(os.environ.get(
+    "MISSION_CONTROL_CRON_RECOVERY_RETRY_SECONDS", "30")))
+CRON_RECOVERY_STARTUP_DELAY_SECONDS = max(0, int(os.environ.get(
+    "MISSION_CONTROL_CRON_RECOVERY_STARTUP_DELAY_SECONDS", "10")))
+CRON_CATCHUP_TIMEOUT = max(30, int(os.environ.get(
+    "MISSION_CONTROL_CRON_CATCHUP_TIMEOUT_SECONDS", "1200")))
 ADMIN_TOKEN = os.environ.get("MISSION_CONTROL_ADMIN_TOKEN", "").strip()
 AUTHELIA_VERIFY_URL = os.environ.get(
     "MISSION_CONTROL_AUTHELIA_VERIFY_URL", "http://authelia:9091/api/authz/forward-auth").strip()
@@ -64,6 +80,34 @@ BRIDGE_TOKEN = os.environ.get("MISSION_CONTROL_BRIDGE_TOKEN", "").strip()
 BRIDGE_PORT = int(os.environ.get("AGENT_BRIDGE_PORT", "8011"))
 BRIDGE_TIMEOUT = int(os.environ.get("AGENT_BRIDGE_PROXY_TIMEOUT", "270"))
 MCP_HEALTH_TIMEOUT = float(os.environ.get("MISSION_CONTROL_MCP_HEALTH_TIMEOUT", "12"))
+AGENT_OPERATION_ACKS_ENABLED = os.environ.get(
+    "MISSION_CONTROL_AGENT_OPERATION_ACKS", "true").strip().lower() not in {
+        "0", "false", "no", "off"}
+OPERATION_CONVERSATION_BIND_GRACE = int(os.environ.get(
+    "MISSION_CONTROL_OPERATION_BIND_GRACE_SECONDS", "120"))
+
+_ACTIVITY_EVENT_TYPES = frozenset({"status", "tool", "plan"})
+_ACTIVITY_TOOL_STATUS = frozenset({"pending", "in_progress", "completed", "failed"})
+_ACTIVITY_CATEGORIES = frozenset({"read", "search", "edit", "execute", "fetch", "think", "other"})
+_ACTIVITY_TOOL_LABELS = {
+    "read": "Reading information", "search": "Searching", "edit": "Editing workspace",
+    "execute": "Running a tool", "fetch": "Fetching information", "think": "Planning",
+    "other": "Working",
+}
+_ACTIVITY_ALLOWED_TOOL_LABELS = frozenset({
+    *_ACTIVITY_TOOL_LABELS.values(), "Searching the web", "Searching files",
+    "Reading a file", "Editing a file", "Running a command", "Using the browser",
+    "Updating the plan", "Checking memory", "Delegating work", "Managing a schedule",
+    "Using a skill", "Generating an image",
+})
+_ACTIVITY_STATUS_LABELS = frozenset({"Analyzing request", "Composing response"})
+_ACTIVITY_SAFE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,96}$")
+_ACTIVITY_SAFE_DETAIL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/ ()-]{0,139}$")
+_ACTIVITY_SENSITIVE = re.compile(
+    r"(?i)(?:^|[\\/._-])(?:\.env|secrets?|tokens?|credentials?|cookies?|passwords?|passwd|api[-_]?keys?)(?:$|[\\/._-])")
+_ACTIVITY_VALUE_SECRET = re.compile(
+    r"(?i)\b(api[-_]?key|token|password|passwd|secret|credential|cookie)\s*[:=]\s*([^\s,;]+)")
+_ACTIVITY_LONG_VALUE = re.compile(r"\b[A-Za-z0-9_\-]{40,}\b")
 
 # Optional, deliberately narrow lifecycle authority.  When either value is
 # absent, the Operations API remains disabled.  The token is shared only with
@@ -102,12 +146,12 @@ APPROVAL_WEBAUTHN_ORIGINS = frozenset(item.strip() for item in os.environ.get(
 APPROVAL_WEBAUTHN_TIMEOUT_MS = int(os.environ.get("APPROVAL_WEBAUTHN_TIMEOUT_MS", "60000"))
 APPROVAL_WEBAUTHN_CHALLENGE_TTL = int(os.environ.get("APPROVAL_WEBAUTHN_CHALLENGE_TTL_SECONDS", "120"))
 # A transport hint narrows the browser's native passkey picker; it is not an
-# authorization control.  The assertion remains cryptographically verified and
-# user verification is still mandatory below.  USB is the safe fallback for
-# approval keys enrolled before browsers exposed getTransports().
+# authorization control. The assertion remains cryptographically verified and
+# user verification is still mandatory below. Legacy credentials without
+# captured metadata omit the hint so Windows can discover them over USB or NFC.
 APPROVAL_WEBAUTHN_FALLBACK_TRANSPORTS = tuple(
     item.strip().lower() for item in os.environ.get(
-        "APPROVAL_WEBAUTHN_FALLBACK_TRANSPORTS", "usb").split(",")
+        "APPROVAL_WEBAUTHN_FALLBACK_TRANSPORTS", "").split(",")
     if item.strip().lower() in {"usb", "nfc", "ble", "internal", "hybrid"}
 )
 WEBAUTHN_TRANSPORTS = frozenset({"usb", "nfc", "ble", "internal", "hybrid"})
@@ -135,6 +179,7 @@ AGENT_TERMINAL_URL_PATTERN = os.environ.get("MISSION_CONTROL_AGENT_TERMINAL_URL_
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 _STORE_LOCK = threading.Lock()
+_LOG = logging.getLogger("uvicorn.error")
 
 TaskStatus = Literal["backlog", "active", "waiting", "done"]
 TaskPriority = Literal["low", "normal", "high", "critical"]
@@ -194,6 +239,9 @@ class OperationRequestCreate(BaseModel):
     target: str = Field(..., min_length=1, max_length=128)
     reason: str = Field(..., min_length=3, max_length=1000)
     requested_by: str = Field(default="operator", min_length=1, max_length=80)
+    # Optional source chat. Scoped proposal endpoints validate this against the
+    # authenticated requester's existing Mission Control conversations.
+    conversation_id: str | None = Field(default=None, max_length=64)
     # Only used for docker_api. The exact request is retained with the approval
     # record, so an approver sees what will reach the Docker daemon.
     method: Literal["POST", "DELETE"] | None = None
@@ -218,6 +266,10 @@ class OperationApproval(BaseModel):
     approved_by: str = Field(..., min_length=1, max_length=80)
     note: str = Field(default="", max_length=500)
     webauthn: dict[str, Any] | None = None
+
+
+class OperationRejection(BaseModel):
+    note: str = Field(default="", max_length=500)
 
 
 class WebAuthnRegistrationStart(BaseModel):
@@ -840,6 +892,97 @@ def _att_meta(attachments: Any) -> list[dict[str, str]]:
     return out
 
 
+def _activity_safe_text(value: object, limit: int = 160) -> str:
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+    text = " ".join(text.split())
+    text = _ACTIVITY_VALUE_SECRET.sub(lambda m: f"{m.group(1)}=[redacted]", text)
+    text = _ACTIVITY_LONG_VALUE.sub("[redacted]", text)
+    if len(text) > limit:
+        text = text[: max(0, limit - 1)].rstrip() + "…"
+    return text
+
+
+def _safe_activity_event(payload: object) -> dict[str, Any] | None:
+    """Second allowlist boundary for activity supplied by a profile bridge."""
+    if not isinstance(payload, dict):
+        return None
+    event_type = str(payload.get("event") or "")
+    if event_type not in _ACTIVITY_EVENT_TYPES:
+        return None
+    if event_type == "status":
+        label = str(payload.get("label") or "")
+        if label not in _ACTIVITY_STATUS_LABELS:
+            return None
+        return {"event": "status", "label": label, "status": "in_progress"}
+    if event_type == "plan":
+        entries: list[dict[str, str]] = []
+        for item in payload.get("entries") or []:
+            if not isinstance(item, dict):
+                continue
+            content = _activity_safe_text(item.get("content"), 140)
+            status = str(item.get("status") or "pending")
+            if content and status in {"pending", "in_progress", "completed"}:
+                entries.append({"content": content, "status": status})
+            if len(entries) >= 12:
+                break
+        return {"event": "plan", "label": f"Plan updated · {len(entries)} steps",
+                "entries": entries}
+
+    tool_id = str(payload.get("id") or "")
+    if not _ACTIVITY_SAFE_ID.fullmatch(tool_id):
+        return None
+    category = str(payload.get("category") or "other")
+    if category not in _ACTIVITY_CATEGORIES:
+        category = "other"
+    status = str(payload.get("status") or "in_progress")
+    if status not in _ACTIVITY_TOOL_STATUS:
+        status = "in_progress"
+    label = str(payload.get("label") or "")
+    if label not in _ACTIVITY_ALLOWED_TOOL_LABELS:
+        label = _ACTIVITY_TOOL_LABELS[category]
+    event: dict[str, Any] = {
+        "event": "tool", "id": tool_id, "label": label,
+        "category": category, "status": status,
+    }
+    detail = str(payload.get("detail") or "").strip()
+    if (detail and _ACTIVITY_SAFE_DETAIL.fullmatch(detail)
+            and not _ACTIVITY_SENSITIVE.search(detail)):
+        event["detail"] = detail
+    return event
+
+
+def _activity_summary(events: list[dict[str, Any]], status: str, started_at: str,
+                      elapsed_s: object = None) -> dict[str, Any]:
+    """Collapse live activity into a durable, sanitized per-turn summary."""
+    tools: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    plan: list[dict[str, str]] = []
+    for event in events:
+        if event.get("event") == "plan":
+            plan = list(event.get("entries") or [])[:12]
+        elif event.get("event") == "tool":
+            tool_id = str(event.get("id") or "")
+            if not tool_id:
+                continue
+            if tool_id not in tools:
+                order.append(tool_id)
+            tools[tool_id] = {key: event[key] for key in
+                              ("label", "category", "status", "detail") if key in event}
+    milestones = [tools[tool_id] for tool_id in order[-16:]]
+    summary: dict[str, Any] = {
+        "version": 1, "status": status, "started_at": started_at,
+        "completed_at": _now(), "tool_count": len(tools),
+        "milestones": milestones, "plan": plan,
+    }
+    try:
+        seconds = round(float(elapsed_s), 1)
+    except (TypeError, ValueError):
+        seconds = None
+    if seconds is not None and 0 <= seconds <= BRIDGE_TIMEOUT + 60:
+        summary["elapsed_s"] = seconds
+    return summary
+
+
 def list_conversations(profile: str) -> list[dict[str, Any]]:
     with _HIST_LOCK:
         convs = _read_json(_index_path(profile)).get("conversations", [])
@@ -1123,6 +1266,17 @@ async def healthz() -> JSONResponse:
     return JSONResponse(content={"ok": True})
 
 
+@router.get("/api/ui-version")
+async def ui_version() -> JSONResponse:
+    """Cheap cache validator for long-lived Mission Control browser tabs."""
+    parts = []
+    for filename in ("app.js", "styles.css"):
+        stat_result = (STATIC_DIR / filename).stat()
+        parts.append(f"{filename}:{stat_result.st_mtime_ns}:{stat_result.st_size}")
+    return JSONResponse(content={"version": "|".join(parts)},
+                        headers={"Cache-Control": "no-store"})
+
+
 # Always-revalidate so a freshly-built UI is never masked by a stale browser
 # cache (the page ships no asset versioning). ETag/Last-Modified still make the
 # revalidation cheap (304 when unchanged).
@@ -1393,6 +1547,7 @@ def agent_chat(profile: str, req: AgentChat) -> JSONResponse:
                 conv_append(profile, conv, user_entry, autotitle=title)
                 if payload.get("ok") and payload.get("reply"):
                     conv_append(profile, conv, {"role": "agent", "text": payload["reply"], "ts": _now()})
+                    _bind_operation_references(profile, conv, payload["reply"])
             return JSONResponse(status_code=resp.status, content=payload)
     except urllib.error.HTTPError as exc:
         try:
@@ -1453,6 +1608,7 @@ def agent_chat_stream(profile: str, req: AgentChat) -> StreamingResponse:
             yield f"data: {json.dumps({'type': 'error', 'error': f'bridge unreachable: {exc}'})}\n\n"
             return
         assembled: list[str] = []
+        activity_events: list[dict[str, Any]] = []
         flags = {"user": False, "agent": False}
 
         def save_user():
@@ -1465,18 +1621,25 @@ def agent_chat_stream(profile: str, req: AgentChat) -> StreamingResponse:
                 if not line:
                     continue
                 text = line.decode("utf-8", "replace")
-                yield text
                 s = text.strip()
                 if not s.startswith("data:"):
+                    yield text
                     continue
                 try:
                     evt = json.loads(s[5:].strip())
                 except json.JSONDecodeError:
                     continue
                 etype = evt.get("type")
-                if etype == "chunk":
+                if etype == "activity":
+                    safe_event = _safe_activity_event(evt)
+                    if safe_event is not None:
+                        save_user()
+                        activity_events.append(safe_event)
+                        yield f"data: {json.dumps({'type': 'activity', **safe_event})}\n\n"
+                elif etype == "chunk":
                     save_user()  # turn is really proceeding now
                     assembled.append(evt.get("text", ""))
+                    yield text
                 elif etype == "done":
                     save_user()
                     # The bridge sends a rewritten `reply` when it turned a
@@ -1485,21 +1648,32 @@ def agent_chat_stream(profile: str, req: AgentChat) -> StreamingResponse:
                     final = evt.get("reply") or "".join(assembled) or "(empty reply)"
                     conv_append(profile, conv, {"role": "agent",
                                                 "text": final,
-                                                "ts": _now()})
+                                                "ts": _now(),
+                                                "activity": _activity_summary(
+                                                    activity_events, "completed",
+                                                    user_entry["ts"], evt.get("elapsed_s"))})
+                    _bind_operation_references(profile, conv, final)
                     flags["agent"] = True
+                    yield text
                 elif etype == "error":
                     err = evt.get("error", "stream error")
                     if "busy" in err.lower():
                         # transient: agent occupied by another turn; client retries.
                         # Persist NOTHING so the message isn't duplicated on retry.
+                        yield text
                         continue
                     save_user()
-                    conv_append(profile, conv, {"role": "error", "text": err, "ts": _now()})
+                    conv_append(profile, conv, {"role": "error", "text": err, "ts": _now(),
+                                                "activity": _activity_summary(
+                                                    activity_events, "failed", user_entry["ts"])})
                     flags["agent"] = True
+                    yield text
         finally:
             resp.close()
             if flags["user"] and not flags["agent"] and assembled:  # client disconnected mid-stream
-                conv_append(profile, conv, {"role": "agent", "text": "".join(assembled), "ts": _now()})
+                conv_append(profile, conv, {"role": "agent", "text": "".join(assembled),
+                                            "ts": _now(), "activity": _activity_summary(
+                                                activity_events, "interrupted", user_entry["ts"])})
 
     return StreamingResponse(relay(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -1617,6 +1791,81 @@ def usage() -> JSONResponse:
 _CRON_TTL = 30
 _cron_cache: dict[str, Any] = {"ts": 0.0, "data": None}
 _cron_lock = threading.Lock()
+_cron_recovery_state_lock = threading.RLock()
+_cron_recovery_stop = threading.Event()
+_cron_recovery_threads: list[threading.Thread] = []
+
+
+def _cron_recovery_default_state() -> dict[str, Any]:
+    return {"version": 1, "last_seen_at": None, "pending_windows": []}
+
+
+def _read_cron_recovery_state_unlocked() -> dict[str, Any]:
+    try:
+        data = json.loads(CRON_RECOVERY_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _cron_recovery_default_state()
+    if not isinstance(data, dict):
+        return _cron_recovery_default_state()
+    data.setdefault("version", 1)
+    data.setdefault("last_seen_at", None)
+    data.setdefault("pending_windows", [])
+    if not isinstance(data["pending_windows"], list):
+        data["pending_windows"] = []
+    return data
+
+
+def _write_cron_recovery_state_unlocked(data: dict[str, Any]) -> None:
+    CRON_RECOVERY_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CRON_RECOVERY_STATE_FILE.with_suffix(CRON_RECOVERY_STATE_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, CRON_RECOVERY_STATE_FILE)
+
+
+def _parse_recovery_time(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _prepare_cron_recovery(started_at: str | None = None) -> dict[str, Any]:
+    """Persist one offline window without replaying history on first install."""
+    started_at = started_at or _now()
+    started_dt = _parse_recovery_time(started_at)
+    profile_names = sorted({str(p.get("name") or "") for p in _profiles() if p.get("name")})
+    with _cron_recovery_state_lock:
+        state = _read_cron_recovery_state_unlocked()
+        previous = _parse_recovery_time(state.get("last_seen_at"))
+        if previous and started_dt and previous < started_dt:
+            window = {
+                "id": f"recovery-{uuid.uuid4().hex[:12]}",
+                "window_start": previous.isoformat().replace("+00:00", "Z"),
+                "window_end": started_dt.isoformat().replace("+00:00", "Z"),
+                "target_profiles": profile_names,
+                "profiles_initialized": bool(profile_names),
+                "completed_profiles": [],
+                "created_at": started_at,
+            }
+            state["pending_windows"].append(window)
+        # On the first deployment there is no previous heartbeat, so this
+        # initializes recovery without retroactively firing old stale jobs.
+        state["last_seen_at"] = started_at
+        state["last_startup_at"] = started_at
+        _write_cron_recovery_state_unlocked(state)
+        return state
+
+
+def _record_cron_recovery_heartbeat(at: str | None = None) -> None:
+    with _cron_recovery_state_lock:
+        state = _read_cron_recovery_state_unlocked()
+        state["last_seen_at"] = at or _now()
+        _write_cron_recovery_state_unlocked(state)
 
 
 def _fetch_agent_cron(p: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
@@ -1632,9 +1881,16 @@ def _fetch_agent_cron(p: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
         return p["name"], None
 
 
-def _post_agent_cron_catchup(p: dict[str, Any], job_id: str | None = None) -> tuple[str, dict[str, Any]]:
+def _post_agent_cron_catchup(p: dict[str, Any], job_id: str | None = None,
+                             window_start: str | None = None,
+                             window_end: str | None = None) -> tuple[str, dict[str, Any]]:
     host = p.get("container_name") or f"hermes-pf-{p['name']}"
-    payload = json.dumps({"job_id": job_id} if job_id else {}).encode("utf-8")
+    body: dict[str, Any] = {}
+    if job_id:
+        body["job_id"] = job_id
+    if window_start and window_end:
+        body.update(window_start=window_start, window_end=window_end)
+    payload = json.dumps(body).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if BRIDGE_TOKEN:
         headers["Authorization"] = f"Bearer {BRIDGE_TOKEN}"
@@ -1645,7 +1901,7 @@ def _post_agent_cron_catchup(p: dict[str, Any], job_id: str | None = None) -> tu
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=BRIDGE_TIMEOUT) as r:
+        with urllib.request.urlopen(req, timeout=CRON_CATCHUP_TIMEOUT) as r:
             return p["name"], json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         try:
@@ -1720,6 +1976,122 @@ def schedules_cron_catchup(req: CronCatchUp, _: None = Depends(require_admin)) -
         "ran": ran,
         "skipped": skipped,
     })
+
+
+def _update_cron_recovery_window(window_id: str, *, target_profiles: list[str] | None = None,
+                                 completed_profiles: list[str] | None = None) -> None:
+    with _cron_recovery_state_lock:
+        state = _read_cron_recovery_state_unlocked()
+        windows = state.get("pending_windows", [])
+        window = next((item for item in windows if item.get("id") == window_id), None)
+        if window is None:
+            return
+        if target_profiles is not None:
+            window["target_profiles"] = sorted(set(target_profiles))
+            window["profiles_initialized"] = True
+        if completed_profiles:
+            completed = set(window.get("completed_profiles") or [])
+            completed.update(completed_profiles)
+            window["completed_profiles"] = sorted(completed)
+        targets = set(window.get("target_profiles") or [])
+        completed = set(window.get("completed_profiles") or [])
+        if window.get("profiles_initialized") and targets.issubset(completed):
+            state["pending_windows"] = [item for item in windows if item.get("id") != window_id]
+            state["last_catchup_at"] = _now()
+            state["last_catchup_window"] = {
+                "window_start": window.get("window_start"),
+                "window_end": window.get("window_end"),
+                "profiles": sorted(targets),
+            }
+        _write_cron_recovery_state_unlocked(state)
+
+
+def _process_cron_recovery_windows() -> None:
+    with _cron_recovery_state_lock:
+        state = _read_cron_recovery_state_unlocked()
+        pending = [dict(item) for item in state.get("pending_windows", []) if isinstance(item, dict)]
+    if not pending:
+        return
+
+    profiles = _profiles()
+    profiles_by_name = {str(p.get("name") or ""): p for p in profiles if p.get("name")}
+    if not profiles_by_name:
+        return
+
+    # Process windows oldest-first. Each bridge independently selects only the
+    # newest due occurrence per schedule inside that exact offline interval.
+    for window in pending:
+        window_id = str(window.get("id") or "")
+        if not window_id:
+            continue
+        targets = list(window.get("target_profiles") or [])
+        if not window.get("profiles_initialized"):
+            targets = sorted(profiles_by_name)
+            _update_cron_recovery_window(window_id, target_profiles=targets)
+        completed = set(window.get("completed_profiles") or [])
+        todo = [profiles_by_name[name] for name in targets
+                if name not in completed and name in profiles_by_name]
+        if not todo:
+            _update_cron_recovery_window(window_id)
+            continue
+        succeeded: list[str] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(todo))) as executor:
+            futures = [executor.submit(
+                _post_agent_cron_catchup, profile, None,
+                str(window.get("window_start") or ""),
+                str(window.get("window_end") or "")) for profile in todo]
+            for future in concurrent.futures.as_completed(futures):
+                profile, payload = future.result()
+                if payload.get("ok"):
+                    succeeded.append(profile)
+                else:
+                    _LOG.warning("automatic cron recovery for %s will retry: %s",
+                                 profile, payload.get("error", "bridge unavailable"))
+        _update_cron_recovery_window(window_id, completed_profiles=succeeded)
+
+
+def _cron_recovery_heartbeat_loop() -> None:
+    while not _cron_recovery_stop.wait(CRON_RECOVERY_HEARTBEAT_SECONDS):
+        try:
+            _record_cron_recovery_heartbeat()
+        except OSError as exc:
+            _LOG.warning("could not persist cron recovery heartbeat: %s", exc)
+
+
+def _cron_recovery_worker_loop() -> None:
+    if _cron_recovery_stop.wait(CRON_RECOVERY_STARTUP_DELAY_SECONDS):
+        return
+    while not _cron_recovery_stop.is_set():
+        try:
+            _process_cron_recovery_windows()
+        except Exception as exc:  # noqa: BLE001 — retry without taking MC down
+            _LOG.exception("automatic cron recovery failed and will retry: %s", exc)
+        if _cron_recovery_stop.wait(CRON_RECOVERY_RETRY_SECONDS):
+            return
+
+
+def _start_cron_recovery() -> None:
+    if not CRON_AUTO_CATCHUP_ENABLED:
+        return
+    _cron_recovery_stop.clear()
+    _prepare_cron_recovery()
+    _cron_recovery_threads.clear()
+    for target, name in (
+            (_cron_recovery_heartbeat_loop, "mc-cron-heartbeat"),
+            (_cron_recovery_worker_loop, "mc-cron-recovery")):
+        thread = threading.Thread(target=target, name=name, daemon=True)
+        thread.start()
+        _cron_recovery_threads.append(thread)
+
+
+def _stop_cron_recovery() -> None:
+    if not CRON_AUTO_CATCHUP_ENABLED:
+        return
+    _cron_recovery_stop.set()
+    for thread in list(_cron_recovery_threads):
+        thread.join(timeout=5)
+    _cron_recovery_threads.clear()
+    _record_cron_recovery_heartbeat()
 
 
 @router.get("/api/agent/{profile}/file/{name}")
@@ -3346,30 +3718,191 @@ def _operation_view(item: dict[str, Any]) -> dict[str, Any]:
     return dict(item)
 
 
+_OPERATION_REF = re.compile(r"\bop-[a-f0-9]{32}\b", re.IGNORECASE)
+_OPERATION_ACK_EVENTS = frozenset({"executing", "executed", "failed"})
+_OPERATION_ACK_LOCK = threading.Lock()
+_OPERATION_ACK_INFLIGHT: set[str] = set()
+
+
+def _operation_event_id(item: dict[str, Any], event: str) -> str:
+    return f"{item.get('id', 'operation')}:{event}"
+
+
+def _operation_result_summary(item: dict[str, Any]) -> str:
+    result = item.get("result")
+    if isinstance(result, dict):
+        for key in ("error", "summary", "message"):
+            value = str(result.get(key) or "").strip()
+            if value:
+                return " ".join(value.split())[:800]
+        if item.get("status") == "executed":
+            docker_status = result.get("docker_status")
+            return (f"The governed runner completed the operation"
+                    f" (Docker status {docker_status})." if docker_status is not None
+                    else "The governed runner completed the operation successfully.")
+    return "No additional result detail was recorded."
+
+
+def _operation_ack_prompt(item: dict[str, Any], event: str) -> str:
+    action = str(item.get("action", "operation")).replace("_", " ")
+    target = str(item.get("target", "local system"))
+    operation_id = str(item.get("id", "operation"))
+    if event == "executing":
+        fact = "The operator's FIDO approval was cryptographically verified and the operation is now executing."
+        instruction = "Acknowledge the approval and clearly say completion has not been confirmed yet."
+    elif event == "executed":
+        fact = f"The governed operation completed successfully. Result: {_operation_result_summary(item)}"
+        instruction = "Acknowledge completion and summarize the outcome."
+    else:
+        fact = f"The approved governed operation failed. Result: {_operation_result_summary(item)}"
+        instruction = "Acknowledge the failure, state the recorded reason, and do not claim the requested change succeeded."
+    return (
+        "[Trusted Mission Control operation event]\n"
+        f"Operation: {operation_id}\nAction: {action}\nTarget: {target}\n{fact}\n\n"
+        f"{instruction} Reply naturally in your persona in 1-3 concise sentences. "
+        "Do not call tools, retry, submit another operation, or ask for another approval in this acknowledgement."
+    )
+
+
+def _history_has_operation_event(profile: str, conv: str, event_id: str,
+                                 *, acknowledgement: bool | None = None) -> bool:
+    for message in conv_history(profile, conv):
+        if message.get("operation_event_id") != event_id:
+            continue
+        if acknowledgement is None or bool(message.get("operation_ack")) == acknowledgement:
+            return True
+    return False
+
+
+def _deliver_operation_agent_ack(item: dict[str, Any], event: str, event_id: str) -> None:
+    delivered = False
+    profile = str(item.get("requested_by") or "")
+    conv = str(item.get("conversation_id") or "")
+    try:
+        if _history_has_operation_event(profile, conv, event_id, acknowledgement=True):
+            delivered = True
+            return
+        profile_info = next((p for p in _profiles() if p.get("name") == profile), None)
+        if not profile_info:
+            return
+        host = profile_info.get("container_name") or f"hermes-pf-{profile}"
+        body = json.dumps({"message": _operation_ack_prompt(item, event),
+                           "session": conv, "attachments": []}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if BRIDGE_TOKEN:
+            headers["Authorization"] = f"Bearer {BRIDGE_TOKEN}"
+        request = urllib.request.Request(f"http://{host}:{BRIDGE_PORT}/chat",
+                                         data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(request, timeout=BRIDGE_TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        reply = str(payload.get("reply") or "").strip() if payload.get("ok") else ""
+        if not reply or _history_has_operation_event(profile, conv, event_id, acknowledgement=True):
+            return
+        conv_append(profile, conv, {"role": "agent", "text": reply, "ts": _now(),
+                                    "approval_id": item.get("id"),
+                                    "approval_status": event,
+                                    "operation_event_id": event_id,
+                                    "operation_ack": True})
+        delivered = True
+    except Exception:  # noqa: BLE001 — deterministic event remains authoritative
+        return
+    finally:
+        with _OPERATION_ACK_LOCK:
+            _OPERATION_ACK_INFLIGHT.discard(event_id)
+        if delivered:
+            latest = _read_store()
+            saved = next((x for x in latest.get("operations", [])
+                          if x.get("id") == item.get("id")), None)
+            if saved is not None:
+                _schedule_next_operation_agent_ack(saved)
+
+
+def _schedule_next_operation_agent_ack(item: dict[str, Any]) -> None:
+    if not AGENT_OPERATION_ACKS_ENABLED or not item.get("conversation_id"):
+        return
+    profile = str(item.get("requested_by") or "")
+    conv = str(item.get("conversation_id") or "")
+    for event in item.get("operation_events", []):
+        if event not in _OPERATION_ACK_EVENTS:
+            continue
+        event_id = _operation_event_id(item, event)
+        if _history_has_operation_event(profile, conv, event_id, acknowledgement=True):
+            continue
+        with _OPERATION_ACK_LOCK:
+            if event_id in _OPERATION_ACK_INFLIGHT:
+                return
+            _OPERATION_ACK_INFLIGHT.add(event_id)
+        snapshot = dict(item)
+        if isinstance(item.get("result"), dict):
+            snapshot["result"] = dict(item["result"])
+        threading.Thread(target=_deliver_operation_agent_ack,
+                         args=(snapshot, event, event_id), daemon=True).start()
+        return
+
+
+def _ensure_operation_agent_acks(items: list[dict[str, Any]]) -> None:
+    for item in items:
+        _schedule_next_operation_agent_ack(item)
+
+
 def _notify_operation_thread(item: dict[str, Any], event: str) -> None:
-    """Mirror approval lifecycle events into the requester's agent chat."""
+    """Persist one idempotent lifecycle event and queue a natural agent reply."""
     profile = str(item.get("requested_by") or "")
     if not profile or profile not in {p.get("name") for p in _profiles()}:
         return
-    conv = item.get("conversation_id")
+    conv = str(item.get("conversation_id") or "")
     if not conv:
-        convs = [c for c in list_conversations(profile) if not c.get("archived")]
-        conv = convs[0]["id"] if convs else create_conversation(profile, "Approvals")["id"]
-        item["conversation_id"] = conv
+        return
     action = str(item.get("action", "operation")).replace("_", " ")
     target = str(item.get("target", "local system"))
+    detail = _operation_result_summary(item)
     messages = {
         "requested": f"🛡️ Approval requested: {action} for {target}. Review and approve it here in this chat with your FIDO key.",
         "executing": f"✅ FIDO approval granted: {action} for {target} is now executing.",
         "executed": f"✅ Approved action completed: {action} for {target}.",
-        "failed": f"⚠️ Approved action failed: {action} for {target}. Review the operation details in this thread or the Approvals ledger.",
+        "rejected": f"❌ Approval rejected: {action} for {target} will not execute.",
+        "failed": f"⚠️ Approved action failed: {action} for {target}. {detail}",
         "expired": f"⌛ Approval expired: {action} for {target}. Submit a fresh request if it is still needed.",
     }
     text = messages.get(event)
-    if text:
+    if not text:
+        return
+    event_id = _operation_event_id(item, event)
+    events = item.setdefault("operation_events", [])
+    if event not in events:
+        events.append(event)
+    if not _history_has_operation_event(profile, conv, event_id, acknowledgement=False):
         conv_append(profile, conv, {"role": "system", "text": text, "ts": _now(),
                                     "approval_id": item.get("id"), "approval_status": event,
-                                    "approval_action": action, "approval_target": target})
+                                    "approval_action": action, "approval_target": target,
+                                    "operation_event_id": event_id})
+    _schedule_next_operation_agent_ack(item)
+
+
+def _bind_operation_references(profile: str, conv: str, reply: str) -> None:
+    """Bind proposal IDs explicitly cited by an agent to this exact chat."""
+    operation_ids = {match.lower() for match in _OPERATION_REF.findall(reply or "")}
+    if not operation_ids or not any(c.get("id") == conv for c in list_conversations(profile)):
+        return
+    store = _read_store()
+    changed = False
+    for item in store.get("operations", []):
+        if str(item.get("id", "")).lower() not in operation_ids:
+            continue
+        if item.get("requested_by") != profile or item.get("conversation_id"):
+            continue
+        item["conversation_id"] = conv
+        item["conversation_binding"] = "agent-reply"
+        _notify_operation_thread(item, "requested")
+        changed = True
+    if changed:
+        _write_store(store)
+
+
+def _fallback_approvals_conversation(profile: str) -> str:
+    existing = next((c for c in list_conversations(profile)
+                     if c.get("title") == "Approvals" and not c.get("archived")), None)
+    return str((existing or create_conversation(profile, "Approvals"))["id"])
 
 
 def _reconcile_host_operations(store: dict[str, Any]) -> None:
@@ -3396,7 +3929,7 @@ def _reconcile_host_operations(store: dict[str, Any]) -> None:
 def _maintain_operations(store: dict[str, Any]) -> None:
     """Archive terminal approvals after 30 days; retain audit evidence 180 days."""
     now = datetime.now(timezone.utc)
-    terminal = {"executed", "failed", "expired", "unknown"}
+    terminal = {"executed", "failed", "rejected", "expired", "unknown"}
     kept: list[dict[str, Any]] = []
     changed = False
     for item in store.get("operations", []):
@@ -3605,13 +4138,26 @@ def operations_list(operator: dict[str, str] = Depends(require_admin)) -> JSONRe
     backfilled = False
     for item in store.get("operations", []):
         if item.get("status") == "pending_approval" and not item.get("conversation_id"):
-            _notify_operation_thread(item, "requested")
-            backfilled = True
+            try:
+                created = datetime.fromisoformat(str(item.get("created_at", "")).replace("Z", "+00:00"))
+                age = (datetime.now(timezone.utc) - created).total_seconds()
+            except (TypeError, ValueError):
+                age = OPERATION_CONVERSATION_BIND_GRACE
+            if age >= OPERATION_CONVERSATION_BIND_GRACE:
+                profile = str(item.get("requested_by") or "")
+                if profile in {p.get("name") for p in _profiles()}:
+                    item["conversation_id"] = _fallback_approvals_conversation(profile)
+                    item["conversation_binding"] = "approvals-fallback"
+                    _notify_operation_thread(item, "requested")
+                    backfilled = True
     if backfilled:
         _write_store(store)
     items = sorted(store.get("operations", []), key=lambda x: x.get("created_at", ""), reverse=True)
+    _ensure_operation_agent_acks(items)
     creds = _operator_webauthn_credentials(store, operator)
     return JSONResponse(content={"enabled": _operations_enabled(),
+                                 "operator": {"subject": operator["subject"],
+                                              "name": operator.get("name", operator["subject"])},
                                  "actions": ["start", "stop", "restart", "docker_api", "host_powershell", "host_filesystem"],
                                  "targets": sorted(_operation_targets()),
                                  "archive_after_days": OPERATIONS_ARCHIVE_AFTER_DAYS,
@@ -3628,6 +4174,11 @@ def _create_operation_request(req: OperationRequestCreate, requested_by: str | N
     if not _operations_enabled():
         raise HTTPException(status_code=503, detail="operations runner is not configured")
     effective_requester = (requested_by or req.requested_by).strip()
+    requested_conversation = (conversation_id or req.conversation_id or "").strip()
+    if requested_conversation:
+        if effective_requester not in {p.get("name") for p in _profiles()} or not any(
+                c.get("id") == requested_conversation for c in list_conversations(effective_requester)):
+            raise HTTPException(status_code=400, detail="conversation_id is not an existing requester conversation")
     if req.action not in ("docker_api", "host_powershell", "host_filesystem") and not _operation_target_allowed(req.target):
         raise HTTPException(status_code=400, detail="target is not approved for lifecycle operations")
     if req.action == "docker_api" and (not req.method or not req.path):
@@ -3648,8 +4199,9 @@ def _create_operation_request(req: OperationRequestCreate, requested_by: str | N
         "status": "pending_approval", "created_at": _now(), "approved_at": None,
         "approved_by": None, "approval_note": "", "result": None,
     }
-    if conversation_id:
-        item["conversation_id"] = conversation_id
+    if requested_conversation:
+        item["conversation_id"] = requested_conversation
+        item["conversation_binding"] = "explicit"
     if req.action == "docker_api":
         item["docker_request"] = {"method": req.method, "path": req.path,
                                   "body": req.body or {}}
@@ -3666,9 +4218,22 @@ def _create_operation_request(req: OperationRequestCreate, requested_by: str | N
         item["risk"] = req.risk
     store = _read_store()
     store.setdefault("operations", []).append(item)
-    _notify_operation_thread(item, "requested")
+    if item.get("conversation_id"):
+        _notify_operation_thread(item, "requested")
     _write_store(store)
     return item
+
+
+def _runner_rejection(exc: urllib.error.HTTPError) -> dict[str, str]:
+    detail = ""
+    try:
+        body = exc.read().decode("utf-8", "replace")
+        payload = json.loads(body)
+        detail = str(payload.get("detail") or payload.get("error") or "").strip()
+    except (OSError, ValueError, AttributeError):
+        detail = ""
+    suffix = f": {' '.join(detail.split())[:500]}" if detail else ""
+    return {"error": f"runner rejected request ({exc.code}){suffix}"}
 
 
 def _execute_preapproved_lifecycle(req: OperationRequestCreate, requested_by: str) -> dict[str, Any]:
@@ -3728,7 +4293,7 @@ def _execute_preapproved_lifecycle(req: OperationRequestCreate, requested_by: st
         item["result"] = payload.get("result", payload)
     except urllib.error.HTTPError as exc:
         item["status"] = "failed"
-        item["result"] = {"error": f"runner rejected request ({exc.code})"}
+        item["result"] = _runner_rejection(exc)
     except (OSError, ValueError, urllib.error.URLError) as exc:
         item["status"] = "unknown"
         item["result"] = {"error": f"runner response unavailable: {exc}"}
@@ -3860,7 +4425,7 @@ def operations_approve(operation_id: str, approval: OperationApproval,
         item["result"] = payload.get("result", payload)
     except urllib.error.HTTPError as exc:
         item["status"] = "failed"
-        item["result"] = {"error": f"runner rejected request ({exc.code})"}
+        item["result"] = _runner_rejection(exc)
     except (OSError, ValueError, urllib.error.URLError) as exc:
         item["status"] = "unknown"
         item["result"] = {"error": f"runner response unavailable: {exc}"}
@@ -3870,5 +4435,34 @@ def operations_approve(operation_id: str, approval: OperationApproval,
                         content={"ok": item["status"] == "executed", "request": _operation_view(item)})
 
 
-app = FastAPI(title="Hermes Mission Control", version="0.1.0")
+@router.post("/api/operations/{operation_id}/reject")
+def operations_reject(operation_id: str, rejection: OperationRejection,
+                      operator: dict[str, str] = Depends(require_admin)) -> JSONResponse:
+    """Deny a pending request without granting or contacting a runner."""
+    store = _read_store()
+    item = next((x for x in store.get("operations", []) if x.get("id") == operation_id), None)
+    if item is None:
+        raise HTTPException(status_code=404, detail="operation request not found")
+    if item.get("status") != "pending_approval":
+        raise HTTPException(status_code=409, detail="operation request is no longer pending")
+    item["status"] = "rejected"
+    item["rejected_at"] = _now()
+    item["rejected_by"] = operator["subject"]
+    item["rejected_by_name"] = operator.get("name", operator["subject"])
+    item["rejection_note"] = rejection.note.strip()
+    _notify_operation_thread(item, "rejected")
+    _write_store(store)
+    return JSONResponse(content={"ok": True, "request": _operation_view(item)})
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    _start_cron_recovery()
+    try:
+        yield
+    finally:
+        _stop_cron_recovery()
+
+
+app = FastAPI(title="Hermes Mission Control", version="0.1.0", lifespan=lifespan)
 app.include_router(router)
